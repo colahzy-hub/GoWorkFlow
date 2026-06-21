@@ -14,3 +14,4 @@
 *.fbx binary
 *.zip binary
 go_workflow_extension/go_workflow/special_presets/arkit形态键工作流参考_images/*.gif filter=lfs diff=lfs merge=lfs -text
+release_packages/*.zip filter=lfs diff=lfs merge=lfs -text

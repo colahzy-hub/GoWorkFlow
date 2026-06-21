@@ -29,6 +29,7 @@ bworkflow_modules/
 # Put public downloadable zips in GitHub Releases instead of Git history.
 version_history/
 *.zip
+!release_packages/*.zip
 
 # Temporary scraped/generated ARKit reference data
 tmp_*
