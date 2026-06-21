@@ -1,0 +1,47 @@
+核心注意功能：
+严格按以上 6 轮顺序输出，每轮下分若干用例，结构清晰
+每个用例仅保留：用例名称 + 逐行列出「形态键名 = 数值」
+对称键默认左右同值，单侧场景明确标注左右
+不添加任何额外解释、注意事项、校验标准
+一、涉及形态键范围
+眼部 + 眉部：browInnerUp、browDownLeft、browDownRight、browOuterUpLeft、browOuterUpRight、eyeBlinkLeft、eyeBlinkRight、eyeLookUpLeft、eyeLookUpRight、eyeLookDownLeft、eyeLookDownRight、eyeLookInLeft、eyeLookInRight、eyeLookOutLeft、eyeLookOutRight、eyeSquintLeft、eyeSquintRight、eyeWideLeft、eyeWideRight
+嘴部 + 下颌：mouthOpen、mouthClose、mouthSmileLeft、mouthSmileRight、mouthFrownLeft、mouthFrownRight、mouthLeft、mouthRight、mouthUpperUpLeft、mouthUpperUpRight、mouthLowerDownLeft、mouthLowerDownRight、mouthStretchLeft、mouthStretchRight、mouthDimpleLeft、mouthDimpleRight、mouthPressLeft、mouthPressRight、mouthShrugUpper、mouthShrugLower、mouthPucker、mouthFunnel、jawOpen、jawForward、jawLeft、jawRight
+辅助脸颊：cheekSquintLeft、cheekSquintRight
+二、分轮验证框架（强度递进，共 6 轮）
+第 1 轮：单键基础极值验证
+目标：确认单个形态键本身形变准确，作为所有混合测试的底层基准
+生成规则：以上列出的所有形态键逐个单独测试，数值统一设为 1.0，其余所有键保持 0
+第 2 轮：同部位内部组合验证
+目标：先验证眼部内部、嘴部内部的多键混合效果，排除局部形变冲突
+生成规则：
+眼部分组：同功能键叠加，包含抬眉组合、全闭眼组合、四向眼球转向组合、瞪眼 + 眯眼组合、单侧眉眼全功能组合，每组 2-4 个键，0.5 半值、1.0 满值各做一组
+嘴部分组：同功能键叠加，包含张嘴组合、完整微笑组合、撇嘴组合、噘嘴组合、单侧嘴部全功能组合，每组 3-5 个键，0.5 半值、1.0 满值各做一组
+第 3 轮：眼嘴同向协同混合（低→高强度）
+目标：同情绪、同运动方向的眼嘴联动，模拟真实自然表情的叠加效果
+生成规则：每组同时包含眼部 2-4 键 + 嘴部 3-6 键 + 对应脸颊辅助键，按情绪分类，分半值、满值两档强度
+愉悦类：抬眉 + 眯眼 + 嘴角上扬 + 脸颊抬起，覆盖微笑、大笑、开心等不同程度
+愤怒类：皱眉 + 眼睑紧绷 + 嘴角下压 + 牙关紧咬，覆盖不满、愤怒、暴怒等不同程度
+惊讶类：挑眉 + 瞪眼 + 张嘴 + 下颌下落，覆盖诧异、吃惊、震惊等不同程度
+悲伤类：眉头内抬 + 眼睑下垂 + 嘴角下拉，覆盖失落、难过、痛哭等不同程度
+同向运动类：眼球左看 + 嘴角左移、眼球右看 + 嘴角右移、眼球上看 + 嘴角上抬等方向一致的联动
+第 4 轮：眼嘴反向拮抗混合（高强度冲突）
+目标：反向情绪、反向形变的极限叠加，测试混合容错性，排查形变冲突与顶点畸变
+生成规则：每组同时包含反向作用的眼部键 + 嘴部键，全部拉满到 1.0，制造强形变冲突
+情绪反向：闭眼沉睡 + 张嘴大笑、瞪眼暴怒 + 噘嘴委屈、挑眉惊讶 + 抿嘴隐忍
+形变反向：眼睑完全闭合 + 嘴巴张到最大 + 下颌前伸、眼睛瞪到极限 + 嘴唇紧抿到极限、眼球向上看 + 嘴角向下压到极限
+左右交叉冲突：左眼单眨满值 + 右嘴角上扬满值、右眼单眨满值 + 左嘴角上扬满值、左眉下压满值 + 右嘴角上扬满值
+第 5 轮：多维度复合混合
+目标：同时叠加情绪、转向、开合多个维度形变，最大程度模拟真实面捕的复杂输入信号
+生成规则：每组叠加 3 个以上维度，包含情绪类眼嘴键 + 眼球转向键 + 下颌位移键 + 单侧偏移键，数值统一取 0.7-1.0 区间
+大笑 + 眼球左上看 + 下颌左移
+愤怒 + 眼球右下看 + 下颌前伸
+惊讶 + 眼球上翻 + 嘴角右移
+抿嘴强忍 + 眯眼 + 眼球左右扫视组合
+单侧完整表情 + 对侧眼球转向组合
+第 6 轮：极限压力堆叠测试
+目标：无逻辑极端叠加，测试模型极限稳定性，模拟面捕异常信号下的表现
+生成规则：
+全量堆叠：眼部所有形态键同时设为 1.0 + 嘴部所有形态键同时设为 1.0
+单侧极限：左半脸所有眼嘴键拉满 1.0，右半脸所有眼嘴键保持 0；反之亦然
+随机混合：随机抽取 8-12 个眼嘴形态键，全部赋值 0.8-1.0，生成 5 组不同随机组合
+极端大形变叠加：张嘴最大 + 下颌前伸 + 鼓腮 + 瞪眼 + 挑眉全部同时满值

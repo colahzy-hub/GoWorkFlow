@@ -1,0 +1,11 @@
+schema_version = "1.0.0"
+id = "go_workflow"
+version = "0.6.20"
+name = "Go工作流 / Go Workflow"
+tagline = "工作流 N 面板筛选与脚本模块管理"
+maintainer = "OpenAI Codex"
+type = "add-on"
+blender_version_min = "3.6.0"
+license = [
+  "SPDX:GPL-3.0-or-later",
+]

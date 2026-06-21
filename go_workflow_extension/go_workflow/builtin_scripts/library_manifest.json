@@ -1,0 +1,39 @@
+[
+  {
+    "name": "口型生成（Go Workflow 面板版）",
+    "description": "Go Workflow 自定义面板版口型生成，可直接在工作流里选择是否先用 ARKit 形态键合成 AA/OH/CH，再生成 VRChat / MMD 口型。",
+    "tags": "go_workflow_builtin,viseme,mmd,arkit,口型,自定义面板",
+    "use_custom_panel": true,
+    "panel_title": "口型生成 / AA-OH-CH",
+    "panel_description": "在 Go Workflow 模块面板中生成口型，支持先用 ARKit 源键生成 AA/OH/CH，再继续生成目标口型。",
+    "script_file": "viseme_generator_module.py",
+    "script_path_mode": "embedded",
+    "ai_doc": "Go Workflow 模块。必须定义 run(context, scene, workflow, module)。目标物体需要是带形态键的网格。自定义面板提供 AA/OH/CH 键名、是否先用 ARKit 形态键合成 AA/OH/CH、VRChat/MMD 目标、覆盖开关和强度参数。启用 ARKit 预生成时，会先按内置 ARKit 配方生成或覆盖 AA/OH/CH，再继续生成口型。"
+  },
+  {
+    "name": "ARKit 形态键合成",
+    "description": "用已有 ARKit / Perfect Sync 形态键合成目标形态键，可切换 VRM / MMD 目标集、常规 / 激进混合率，并支持 csv/txt 混合表导入导出与随预设内嵌保存。",
+    "tags": "go_workflow_builtin,arkit,shape-key,合成,vrm,mmd",
+    "use_custom_panel": true,
+    "panel_title": "ARKit 形态键合成",
+    "panel_description": "可切换 VRM 基础或 MMD 部分目标键，并把 csv/txt 混合系数表导入到当前工作流模块，随 .goworkflow 一起导出。",
+    "script_file": "arkit_shape_synthesis.py",
+    "script_path_mode": "embedded",
+    "replace": {
+      "__TARGET_SET__": "VRM_BASIC",
+      "__PROFILE__": "CONSERVATIVE"
+    },
+    "ai_doc": "Go Workflow 模块。需要目标网格已有 ARKit / Perfect Sync 形态键；支持 VRM/MMD 目标集切换、常规/激进混合率，以及 csv/txt 混合表导入到模块内嵌配置后随 .goworkflow 导出。"
+  },
+  {
+    "name": "形态键鉴定",
+    "description": "扫描当前物体形态键中哪些相对其 relative_key 完全无位移并标记为空形态键；找不到 relative_key 时回退 Basis。支持列表点击切换当前形态键，并在编辑模式里选出当前活动形态键相对参考键发生位移的顶点。",
+    "tags": "go_workflow_builtin,shape-key,inspector,空形态键,编辑模式,自定义面板",
+    "use_custom_panel": true,
+    "panel_title": "形态键鉴定",
+    "panel_description": "刷新空形态键列表，按 relative_key/Basis 规则识别空键；点击可同步切换当前形态键，并可在编辑模式选择与参考键不同的顶点。",
+    "script_file": "shape_key_inspector_module.py",
+    "script_path_mode": "embedded",
+    "ai_doc": "Go Workflow 模块。用于检查目标网格的形态键列表，优先以 relative_key 为参考判断当前键每个点的相对位移是否近似为 0；找不到 relative_key 时回退 Basis。命中后缓存为空形态键列表；支持点击列表项切换当前活动形态键，支持在编辑模式把当前活动形态键相对参考键发生变化的顶点选出来。面板参数包括目标物体、空键搜索和列表显示上限。"
+  }
+]

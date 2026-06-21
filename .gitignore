@@ -1,0 +1,50 @@
+# Python / Blender runtime cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Blender backup / autosave / test scene files
+*.blend1
+*.blend2
+*.blend@
+*.autosave.blend
+
+# Local IDE / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local test and recovered work directories
+clean_panels/
+recovered_old/
+tmp_recover/
+tools/
+bworkflow_modules/
+工作流保存/
+全面混合验证表情参考/
+
+# Packaging and historical build outputs.
+# Put public downloadable zips in GitHub Releases instead of Git history.
+version_history/
+*.zip
+
+# Temporary scraped/generated ARKit reference data
+tmp_*
+_arkit_state_test.json
+_viewer_test_state.*
+tmp_viewer_state.json
+import_test.py
+codex重置.py
+口型生成.py
+预设*.bworkflow
+合成键预设/111.csv
+
+# Local binary test assets
+*.fbx
+*.blend
+
+# One-off screenshots / UI references kept outside the source release
+image.png
+ui参考.png

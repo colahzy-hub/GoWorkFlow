@@ -1,0 +1,910 @@
+{
+  "meta": {
+    "title": "ARKit 52 BlendShapes 本地化参考",
+    "source_url": "https://hinzka.hatenablog.com/entry/2020/06/15/072929",
+    "source_note": "原网页命令行抓取受限；当前数据以 ARKit 52 标准项为基础，结合本地化整理补全，后续可继续补图与逐项细节。",
+    "version": "1.0.0",
+    "image_folder": "参考资料/arkit_52_images",
+    "special_preset_type": "arkit_52_reference"
+  },
+  "items": [
+    {
+      "id": "brow_down_left",
+      "shape_key": "BrowDownLeft",
+      "name_en": "BrowDownLeft",
+      "name_zh": "左眉下压",
+      "name_bilingual": "左眉下压 / BrowDownLeft",
+      "category": "眉毛",
+      "summary": "压低左侧眉毛，用于皱眉、受压、警觉等表情。",
+      "tips": [
+        "注意眉头到眉峰的连续压缩。",
+        "不要只移动眉毛贴线，要带动眉弓体积。"
+      ],
+      "notes": [
+        "可与 BrowInnerUp、EyeSquintLeft 联动检查。"
+      ],
+      "image_hint": "brow_down_left.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "brow_down_right",
+      "shape_key": "BrowDownRight",
+      "name_en": "BrowDownRight",
+      "name_zh": "右眉下压",
+      "name_bilingual": "右眉下压 / BrowDownRight",
+      "category": "眉毛",
+      "summary": "压低右侧眉毛，用于右侧不对称皱眉和压迫感。",
+      "tips": [
+        "检查右眉头与额头褶皱方向。",
+        "避免只压眉尾，导致假表情。"
+      ],
+      "notes": [],
+      "image_hint": "brow_down_right.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "brow_inner_up",
+      "shape_key": "BrowInnerUp",
+      "name_en": "BrowInnerUp",
+      "name_zh": "眉内侧上提",
+      "name_bilingual": "眉内侧上提 / BrowInnerUp",
+      "category": "眉毛",
+      "summary": "抬高双眉内侧，常见于悲伤、委屈、惊讶前奏。",
+      "tips": [
+        "重点检查眉头与额头中心区的拉伸。",
+        "内侧抬起时额头中部通常会有轻微鼓起。"
+      ],
+      "notes": [],
+      "image_hint": "brow_inner_up.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "brow_outer_up_left",
+      "shape_key": "BrowOuterUpLeft",
+      "name_en": "BrowOuterUpLeft",
+      "name_zh": "左眉外侧上提",
+      "name_bilingual": "左眉外侧上提 / BrowOuterUpLeft",
+      "category": "眉毛",
+      "summary": "抬高左眉外侧，常用于疑惑、夸张、挑眉。",
+      "tips": [
+        "眉尾上提要带动眼眶上缘过渡。",
+        "避免只折一小段眉曲线。"
+      ],
+      "notes": [],
+      "image_hint": "brow_outer_up_left.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "brow_outer_up_right",
+      "shape_key": "BrowOuterUpRight",
+      "name_en": "BrowOuterUpRight",
+      "name_zh": "右眉外侧上提",
+      "name_bilingual": "右眉外侧上提 / BrowOuterUpRight",
+      "category": "眉毛",
+      "summary": "抬高右眉外侧，适合右侧挑眉和非对称表情。",
+      "tips": [
+        "重点看右眉尾到太阳穴的弧线。",
+        "和上眼睑高度一起核对。"
+      ],
+      "notes": [],
+      "image_hint": "brow_outer_up_right.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "cheek_puff",
+      "shape_key": "CheekPuff",
+      "name_en": "CheekPuff",
+      "name_zh": "鼓腮",
+      "name_bilingual": "鼓腮 / CheekPuff",
+      "category": "脸颊",
+      "summary": "双颊鼓起，形成含气或鼓嘴状态。",
+      "tips": [
+        "脸颊体积应整体外鼓。",
+        "注意鼻翼与法令纹不要被挤坏。"
+      ],
+      "notes": [],
+      "image_hint": "cheek_puff.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "cheek_squint_left",
+      "shape_key": "CheekSquintLeft",
+      "name_en": "CheekSquintLeft",
+      "name_zh": "左脸颊挤压",
+      "name_bilingual": "左脸颊挤压 / CheekSquintLeft",
+      "category": "脸颊",
+      "summary": "左脸颊上挤，常见于笑和眯眼。",
+      "tips": [
+        "重点观察苹果肌与眼下脂肪。",
+        "通常会和 EyeSquintLeft、MouthSmileLeft 一起出现。"
+      ],
+      "notes": [],
+      "image_hint": "cheek_squint_left.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "cheek_squint_right",
+      "shape_key": "CheekSquintRight",
+      "name_en": "CheekSquintRight",
+      "name_zh": "右脸颊挤压",
+      "name_bilingual": "右脸颊挤压 / CheekSquintRight",
+      "category": "脸颊",
+      "summary": "右脸颊上挤，常见于笑和眯眼。",
+      "tips": [
+        "看右侧眼下和嘴角上方的体积堆叠。",
+        "不要只抬皮而不抬肉。"
+      ],
+      "notes": [],
+      "image_hint": "cheek_squint_right.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "eye_blink_left",
+      "shape_key": "EyeBlinkLeft",
+      "name_en": "EyeBlinkLeft",
+      "name_zh": "左眼闭合",
+      "name_bilingual": "左眼闭合 / EyeBlinkLeft",
+      "category": "眼部",
+      "summary": "左眼完整闭合。",
+      "tips": [
+        "上眼睑主导闭合，下眼睑轻微上抬。",
+        "注意闭眼后眼球接触感。"
+      ],
+      "notes": [
+        "Blender 形态键名称建议与英文完全一致。"
+      ],
+      "image_hint": "eye_blink_left.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "eye_blink_right",
+      "shape_key": "EyeBlinkRight",
+      "name_en": "EyeBlinkRight",
+      "name_zh": "右眼闭合",
+      "name_bilingual": "右眼闭合 / EyeBlinkRight",
+      "category": "眼部",
+      "summary": "右眼完整闭合。",
+      "tips": [
+        "检查上下眼睑接触线的形状。",
+        "眼角折叠需要自然。"
+      ],
+      "notes": [
+        "Blender 形态键名称建议与英文完全一致。"
+      ],
+      "image_hint": "eye_blink_right.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "eye_look_down_left",
+      "shape_key": "EyeLookDownLeft",
+      "name_en": "EyeLookDownLeft",
+      "name_zh": "左眼下视",
+      "name_bilingual": "左眼下视 / EyeLookDownLeft",
+      "category": "眼部",
+      "summary": "左眼下视对应的眼睑形变。",
+      "tips": [
+        "这是眼部附带形变，不只是转动眼球。",
+        "重点看上眼睑压低感。"
+      ],
+      "notes": [
+        "适合与眼球骨骼转动配合。"
+      ],
+      "image_hint": "eye_look_down_left.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "eye_look_down_right",
+      "shape_key": "EyeLookDownRight",
+      "name_en": "EyeLookDownRight",
+      "name_zh": "右眼下视",
+      "name_bilingual": "右眼下视 / EyeLookDownRight",
+      "category": "眼部",
+      "summary": "右眼下视对应的眼睑形变。",
+      "tips": [
+        "检查上眼睑覆盖量。",
+        "不要只转眼球而忽略眼皮。"
+      ],
+      "notes": [],
+      "image_hint": "eye_look_down_right.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "eye_look_in_left",
+      "shape_key": "EyeLookInLeft",
+      "name_en": "EyeLookInLeft",
+      "name_zh": "左眼内视",
+      "name_bilingual": "左眼内视 / EyeLookInLeft",
+      "category": "眼部",
+      "summary": "左眼向内看时的眼睑附带形变。",
+      "tips": [
+        "注意内眼角压缩。",
+        "与眼球转向保持一致。"
+      ],
+      "notes": [],
+      "image_hint": "eye_look_in_left.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "eye_look_in_right",
+      "shape_key": "EyeLookInRight",
+      "name_en": "EyeLookInRight",
+      "name_zh": "右眼内视",
+      "name_bilingual": "右眼内视 / EyeLookInRight",
+      "category": "眼部",
+      "summary": "右眼向内看时的眼睑附带形变。",
+      "tips": [
+        "重点检查鼻侧眼角压缩。",
+        "别让瞳孔走位和眼皮形变脱节。"
+      ],
+      "notes": [],
+      "image_hint": "eye_look_in_right.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "eye_look_out_left",
+      "shape_key": "EyeLookOutLeft",
+      "name_en": "EyeLookOutLeft",
+      "name_zh": "左眼外视",
+      "name_bilingual": "左眼外视 / EyeLookOutLeft",
+      "category": "眼部",
+      "summary": "左眼向外看时的眼睑附带形变。",
+      "tips": [
+        "看外眼角拉伸与眼白暴露。",
+        "不要只做球体转向。"
+      ],
+      "notes": [],
+      "image_hint": "eye_look_out_left.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "eye_look_out_right",
+      "shape_key": "EyeLookOutRight",
+      "name_en": "EyeLookOutRight",
+      "name_zh": "右眼外视",
+      "name_bilingual": "右眼外视 / EyeLookOutRight",
+      "category": "眼部",
+      "summary": "右眼向外看时的眼睑附带形变。",
+      "tips": [
+        "检查外眼角拉伸感。",
+        "眼睑不要跟不上眼球方向。"
+      ],
+      "notes": [],
+      "image_hint": "eye_look_out_right.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "eye_look_up_left",
+      "shape_key": "EyeLookUpLeft",
+      "name_en": "EyeLookUpLeft",
+      "name_zh": "左眼上视",
+      "name_bilingual": "左眼上视 / EyeLookUpLeft",
+      "category": "眼部",
+      "summary": "左眼上视对应的眼睑形变。",
+      "tips": [
+        "下眼睑略压，上眼睑适当抬起。",
+        "注意露白程度。"
+      ],
+      "notes": [],
+      "image_hint": "eye_look_up_left.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "eye_look_up_right",
+      "shape_key": "EyeLookUpRight",
+      "name_en": "EyeLookUpRight",
+      "name_zh": "右眼上视",
+      "name_bilingual": "右眼上视 / EyeLookUpRight",
+      "category": "眼部",
+      "summary": "右眼上视对应的眼睑形变。",
+      "tips": [
+        "检查上眼睑提升与下眼睑贴合。",
+        "不要做成单纯惊讶眼。"
+      ],
+      "notes": [],
+      "image_hint": "eye_look_up_right.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "eye_squint_left",
+      "shape_key": "EyeSquintLeft",
+      "name_en": "EyeSquintLeft",
+      "name_zh": "左眼眯起",
+      "name_bilingual": "左眼眯起 / EyeSquintLeft",
+      "category": "眼部",
+      "summary": "左眼略眯，常见于强笑、警惕、狐疑。",
+      "tips": [
+        "重点是上下眼睑同时向中间压缩。",
+        "配合左脸颊挤压更自然。"
+      ],
+      "notes": [],
+      "image_hint": "eye_squint_left.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "eye_squint_right",
+      "shape_key": "EyeSquintRight",
+      "name_en": "EyeSquintRight",
+      "name_zh": "右眼眯起",
+      "name_bilingual": "右眼眯起 / EyeSquintRight",
+      "category": "眼部",
+      "summary": "右眼略眯，适合不对称表情。",
+      "tips": [
+        "观察上眼睑压低与下眼睑抬高平衡。",
+        "不要误做成眨眼。"
+      ],
+      "notes": [],
+      "image_hint": "eye_squint_right.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "eye_wide_left",
+      "shape_key": "EyeWideLeft",
+      "name_en": "EyeWideLeft",
+      "name_zh": "左眼睁大",
+      "name_bilingual": "左眼睁大 / EyeWideLeft",
+      "category": "眼部",
+      "summary": "左眼睁大，常用于惊讶、紧张。",
+      "tips": [
+        "上眼睑上提为主，下眼睑略下拉。",
+        "避免直接做成圆眼卡通感。"
+      ],
+      "notes": [],
+      "image_hint": "eye_wide_left.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "eye_wide_right",
+      "shape_key": "EyeWideRight",
+      "name_en": "EyeWideRight",
+      "name_zh": "右眼睁大",
+      "name_bilingual": "右眼睁大 / EyeWideRight",
+      "category": "眼部",
+      "summary": "右眼睁大，常用于惊讶、警觉。",
+      "tips": [
+        "保留眼皮厚度与眼眶结构。",
+        "和眉毛上提关系要一起检查。"
+      ],
+      "notes": [],
+      "image_hint": "eye_wide_right.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "jaw_forward",
+      "shape_key": "JawForward",
+      "name_en": "JawForward",
+      "name_zh": "下颌前伸",
+      "name_bilingual": "下颌前伸 / JawForward",
+      "category": "下颌",
+      "summary": "下巴与下颌整体向前突出。",
+      "tips": [
+        "重点是下巴体块整体前送。",
+        "检查嘴唇厚度与牙弓位置。"
+      ],
+      "notes": [],
+      "image_hint": "jaw_forward.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "jaw_left",
+      "shape_key": "JawLeft",
+      "name_en": "JawLeft",
+      "name_zh": "下颌左偏",
+      "name_bilingual": "下颌左偏 / JawLeft",
+      "category": "下颌",
+      "summary": "下颌整体向左偏移。",
+      "tips": [
+        "不是嘴角左拉，而是整块下颌位移。",
+        "观察下巴中心线偏移。"
+      ],
+      "notes": [],
+      "image_hint": "jaw_left.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "jaw_open",
+      "shape_key": "JawOpen",
+      "name_en": "JawOpen",
+      "name_zh": "张嘴",
+      "name_bilingual": "张嘴 / JawOpen",
+      "category": "下颌",
+      "summary": "下颌下落，形成开口。",
+      "tips": [
+        "开口优先是旋转+少量平移感。",
+        "不要只把下唇拉下。"
+      ],
+      "notes": [
+        "常作为嘴部相关形态的基底。"
+      ],
+      "image_hint": "jaw_open.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "jaw_right",
+      "shape_key": "JawRight",
+      "name_en": "JawRight",
+      "name_zh": "下颌右偏",
+      "name_bilingual": "下颌右偏 / JawRight",
+      "category": "下颌",
+      "summary": "下颌整体向右偏移。",
+      "tips": [
+        "重点是颏部中心线和牙列偏移。",
+        "不要误做成单侧笑。"
+      ],
+      "notes": [],
+      "image_hint": "jaw_right.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "mouth_close",
+      "shape_key": "MouthClose",
+      "name_en": "MouthClose",
+      "name_zh": "闭口",
+      "name_bilingual": "闭口 / MouthClose",
+      "category": "嘴部",
+      "summary": "在开颌基础上重新让上下唇闭合。",
+      "tips": [
+        "这是带下颌关系的闭口，不等于静止口型。",
+        "重点是嘴唇接触线。"
+      ],
+      "notes": [],
+      "image_hint": "mouth_close.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "mouth_dimple_left",
+      "shape_key": "MouthDimpleLeft",
+      "name_en": "MouthDimpleLeft",
+      "name_zh": "左嘴角酒窝收缩",
+      "name_bilingual": "左嘴角酒窝收缩 / MouthDimpleLeft",
+      "category": "嘴部",
+      "summary": "左嘴角向内收，形成酒窝/口角凹陷。",
+      "tips": [
+        "嘴角不是单纯拉后，而是略向内嵌。",
+        "看口角周围皮肉折叠。"
+      ],
+      "notes": [],
+      "image_hint": "mouth_dimple_left.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "mouth_dimple_right",
+      "shape_key": "MouthDimpleRight",
+      "name_en": "MouthDimpleRight",
+      "name_zh": "右嘴角酒窝收缩",
+      "name_bilingual": "右嘴角酒窝收缩 / MouthDimpleRight",
+      "category": "嘴部",
+      "summary": "右嘴角向内收，形成酒窝/口角凹陷。",
+      "tips": [
+        "关注口角与颊部连接处。",
+        "不要只缩一条边线。"
+      ],
+      "notes": [],
+      "image_hint": "mouth_dimple_right.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "mouth_frown_left",
+      "shape_key": "MouthFrownLeft",
+      "name_en": "MouthFrownLeft",
+      "name_zh": "左嘴角下撇",
+      "name_bilingual": "左嘴角下撇 / MouthFrownLeft",
+      "category": "嘴部",
+      "summary": "左侧嘴角下压，形成难过、不满、厌恶感。",
+      "tips": [
+        "注意嘴角向下而不是向外。",
+        "法令纹和下巴沟会受影响。"
+      ],
+      "notes": [],
+      "image_hint": "mouth_frown_left.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "mouth_frown_right",
+      "shape_key": "MouthFrownRight",
+      "name_en": "MouthFrownRight",
+      "name_zh": "右嘴角下撇",
+      "name_bilingual": "右嘴角下撇 / MouthFrownRight",
+      "category": "嘴部",
+      "summary": "右侧嘴角下压，形成不悦或悲伤。",
+      "tips": [
+        "注意嘴角下拉时嘴唇厚度变化。",
+        "不要和 JawOpen 混淆。"
+      ],
+      "notes": [],
+      "image_hint": "mouth_frown_right.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "mouth_funnel",
+      "shape_key": "MouthFunnel",
+      "name_en": "MouthFunnel",
+      "name_zh": "嘴部收拢成筒",
+      "name_bilingual": "嘴部收拢成筒 / MouthFunnel",
+      "category": "嘴部",
+      "summary": "上下唇整体向前收拢成圆筒状。",
+      "tips": [
+        "重点是口轮匝肌整体前收。",
+        "不要只把唇边缩小。"
+      ],
+      "notes": [
+        "与 MouthPucker 相近，但 Funnel 更偏整体筒状。"
+      ],
+      "image_hint": "mouth_funnel.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "mouth_left",
+      "shape_key": "MouthLeft",
+      "name_en": "MouthLeft",
+      "name_zh": "嘴部整体左偏",
+      "name_bilingual": "嘴部整体左偏 / MouthLeft",
+      "category": "嘴部",
+      "summary": "嘴部整体向左偏移。",
+      "tips": [
+        "注意上下唇中心线一起偏。",
+        "不要做成单嘴角拉扯。"
+      ],
+      "notes": [],
+      "image_hint": "mouth_left.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "mouth_lower_down_left",
+      "shape_key": "MouthLowerDownLeft",
+      "name_en": "MouthLowerDownLeft",
+      "name_zh": "左下唇下拉",
+      "name_bilingual": "左下唇下拉 / MouthLowerDownLeft",
+      "category": "嘴部",
+      "summary": "左侧下唇下拉，露出下齿趋势更强。",
+      "tips": [
+        "重点看下唇红边拉长。",
+        "可配合 JawOpen 微量使用。"
+      ],
+      "notes": [],
+      "image_hint": "mouth_lower_down_left.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "mouth_lower_down_right",
+      "shape_key": "MouthLowerDownRight",
+      "name_en": "MouthLowerDownRight",
+      "name_zh": "右下唇下拉",
+      "name_bilingual": "右下唇下拉 / MouthLowerDownRight",
+      "category": "嘴部",
+      "summary": "右侧下唇下拉。",
+      "tips": [
+        "检查右下唇体积被拉薄的程度。",
+        "避免只拉角点。"
+      ],
+      "notes": [],
+      "image_hint": "mouth_lower_down_right.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "mouth_press_left",
+      "shape_key": "MouthPressLeft",
+      "name_en": "MouthPressLeft",
+      "name_zh": "左嘴唇压紧",
+      "name_bilingual": "左嘴唇压紧 / MouthPressLeft",
+      "category": "嘴部",
+      "summary": "左侧嘴唇压紧，形成咬唇或憋住表情的趋势。",
+      "tips": [
+        "重点看嘴唇厚度被压扁。",
+        "上下唇接触要更紧。"
+      ],
+      "notes": [],
+      "image_hint": "mouth_press_left.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "mouth_press_right",
+      "shape_key": "MouthPressRight",
+      "name_en": "MouthPressRight",
+      "name_zh": "右嘴唇压紧",
+      "name_bilingual": "右嘴唇压紧 / MouthPressRight",
+      "category": "嘴部",
+      "summary": "右侧嘴唇压紧。",
+      "tips": [
+        "注意右侧口角不要意外上扬。",
+        "适合和 MouthShrugLower 配合检查。"
+      ],
+      "notes": [],
+      "image_hint": "mouth_press_right.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "mouth_pucker",
+      "shape_key": "MouthPucker",
+      "name_en": "MouthPucker",
+      "name_zh": "噘嘴",
+      "name_bilingual": "噘嘴 / MouthPucker",
+      "category": "嘴部",
+      "summary": "嘴唇向前噘出并收拢。",
+      "tips": [
+        "唇体应向前突出。",
+        "比 MouthFunnel 更偏嘴唇前凸。"
+      ],
+      "notes": [],
+      "image_hint": "mouth_pucker.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "mouth_right",
+      "shape_key": "MouthRight",
+      "name_en": "MouthRight",
+      "name_zh": "嘴部整体右偏",
+      "name_bilingual": "嘴部整体右偏 / MouthRight",
+      "category": "嘴部",
+      "summary": "嘴部整体向右偏移。",
+      "tips": [
+        "嘴唇中心线和人中终点一起检查。",
+        "不要简化成嘴角单拉。"
+      ],
+      "notes": [],
+      "image_hint": "mouth_right.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "mouth_roll_lower",
+      "shape_key": "MouthRollLower",
+      "name_en": "MouthRollLower",
+      "name_zh": "下唇内卷",
+      "name_bilingual": "下唇内卷 / MouthRollLower",
+      "category": "嘴部",
+      "summary": "下唇向内收卷，像把下唇含进去。",
+      "tips": [
+        "不是单纯缩小，而是翻卷进去。",
+        "检查唇红边可见面积。"
+      ],
+      "notes": [],
+      "image_hint": "mouth_roll_lower.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "mouth_roll_upper",
+      "shape_key": "MouthRollUpper",
+      "name_en": "MouthRollUpper",
+      "name_zh": "上唇内卷",
+      "name_bilingual": "上唇内卷 / MouthRollUpper",
+      "category": "嘴部",
+      "summary": "上唇向内收卷。",
+      "tips": [
+        "注意人中与上唇峰结构。",
+        "避免把上唇直接压扁。"
+      ],
+      "notes": [],
+      "image_hint": "mouth_roll_upper.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "mouth_shrug_lower",
+      "shape_key": "MouthShrugLower",
+      "name_en": "MouthShrugLower",
+      "name_zh": "下唇上耸",
+      "name_bilingual": "下唇上耸 / MouthShrugLower",
+      "category": "嘴部",
+      "summary": "下唇向上抬起并收紧。",
+      "tips": [
+        "常带有嘴唇紧张感。",
+        "适合检查下巴区域被挤压的感觉。"
+      ],
+      "notes": [],
+      "image_hint": "mouth_shrug_lower.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "mouth_shrug_upper",
+      "shape_key": "MouthShrugUpper",
+      "name_en": "MouthShrugUpper",
+      "name_zh": "上唇上耸",
+      "name_bilingual": "上唇上耸 / MouthShrugUpper",
+      "category": "嘴部",
+      "summary": "上唇上提并收紧。",
+      "tips": [
+        "会影响鼻下区域长度。",
+        "注意不要做成纯露龈笑。"
+      ],
+      "notes": [],
+      "image_hint": "mouth_shrug_upper.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "mouth_smile_left",
+      "shape_key": "MouthSmileLeft",
+      "name_en": "MouthSmileLeft",
+      "name_zh": "左嘴角上扬",
+      "name_bilingual": "左嘴角上扬 / MouthSmileLeft",
+      "category": "嘴部",
+      "summary": "左侧嘴角上扬，形成半边笑。",
+      "tips": [
+        "重点看嘴角往斜上后方走。",
+        "脸颊会被带起。"
+      ],
+      "notes": [],
+      "image_hint": "mouth_smile_left.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "mouth_smile_right",
+      "shape_key": "MouthSmileRight",
+      "name_en": "MouthSmileRight",
+      "name_zh": "右嘴角上扬",
+      "name_bilingual": "右嘴角上扬 / MouthSmileRight",
+      "category": "嘴部",
+      "summary": "右侧嘴角上扬。",
+      "tips": [
+        "观察右苹果肌配合。",
+        "不要只拉一条边界线。"
+      ],
+      "notes": [],
+      "image_hint": "mouth_smile_right.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "mouth_stretch_left",
+      "shape_key": "MouthStretchLeft",
+      "name_en": "MouthStretchLeft",
+      "name_zh": "左嘴角横向拉伸",
+      "name_bilingual": "左嘴角横向拉伸 / MouthStretchLeft",
+      "category": "嘴部",
+      "summary": "左侧嘴角向外横拉。",
+      "tips": [
+        "比 Smile 更平、更横向。",
+        "适合惊吓、紧张、咧嘴。"
+      ],
+      "notes": [],
+      "image_hint": "mouth_stretch_left.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "mouth_stretch_right",
+      "shape_key": "MouthStretchRight",
+      "name_en": "MouthStretchRight",
+      "name_zh": "右嘴角横向拉伸",
+      "name_bilingual": "右嘴角横向拉伸 / MouthStretchRight",
+      "category": "嘴部",
+      "summary": "右侧嘴角向外横拉。",
+      "tips": [
+        "注意唇线被横向拉薄。",
+        "嘴角不一定明显上扬。"
+      ],
+      "notes": [],
+      "image_hint": "mouth_stretch_right.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "mouth_upper_up_left",
+      "shape_key": "MouthUpperUpLeft",
+      "name_en": "MouthUpperUpLeft",
+      "name_zh": "左上唇上提",
+      "name_bilingual": "左上唇上提 / MouthUpperUpLeft",
+      "category": "嘴部",
+      "summary": "左侧上唇向上提起。",
+      "tips": [
+        "会露出左上牙龈趋势。",
+        "与 NoseSneerLeft 常有关系。"
+      ],
+      "notes": [],
+      "image_hint": "mouth_upper_up_left.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "mouth_upper_up_right",
+      "shape_key": "MouthUpperUpRight",
+      "name_en": "MouthUpperUpRight",
+      "name_zh": "右上唇上提",
+      "name_bilingual": "右上唇上提 / MouthUpperUpRight",
+      "category": "嘴部",
+      "summary": "右侧上唇向上提起。",
+      "tips": [
+        "看右侧唇峰到鼻翼的拉扯。",
+        "避免单点折角。"
+      ],
+      "notes": [],
+      "image_hint": "mouth_upper_up_right.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "nose_sneer_left",
+      "shape_key": "NoseSneerLeft",
+      "name_en": "NoseSneerLeft",
+      "name_zh": "左鼻翼上提",
+      "name_bilingual": "左鼻翼上提 / NoseSneerLeft",
+      "category": "鼻部",
+      "summary": "左侧鼻翼上提，常伴随嫌弃、厌恶表情。",
+      "tips": [
+        "鼻翼和上唇会互相影响。",
+        "注意鼻孔形状变化。"
+      ],
+      "notes": [],
+      "image_hint": "nose_sneer_left.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "nose_sneer_right",
+      "shape_key": "NoseSneerRight",
+      "name_en": "NoseSneerRight",
+      "name_zh": "右鼻翼上提",
+      "name_bilingual": "右鼻翼上提 / NoseSneerRight",
+      "category": "鼻部",
+      "summary": "右侧鼻翼上提。",
+      "tips": [
+        "检查鼻翼边缘和法令纹起点。",
+        "适合与 MouthUpperUpRight 联动。"
+      ],
+      "notes": [],
+      "image_hint": "nose_sneer_right.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    },
+    {
+      "id": "tongue_out",
+      "shape_key": "TongueOut",
+      "name_en": "TongueOut",
+      "name_zh": "吐舌",
+      "name_bilingual": "吐舌 / TongueOut",
+      "category": "舌头",
+      "summary": "舌头向外伸出。",
+      "tips": [
+        "如果没有舌头模型或形态键，需要单独处理。",
+        "注意与 JawOpen 的配合。"
+      ],
+      "notes": [
+        "很多角色没有这项，需要允许缺失。"
+      ],
+      "image_hint": "tongue_out.png",
+      "image_local_path": "",
+      "source": "arkit_52_localized"
+    }
+  ]
+}
