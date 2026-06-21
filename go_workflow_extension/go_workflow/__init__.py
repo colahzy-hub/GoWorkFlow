@@ -65,6 +65,7 @@ CURRENT_WORKFLOW_PRESET_KIND = "active_workflow"
 PRESET_FILE_EXTENSION = ".goworkflow"
 PRESET_FILE_FILTER = "*.goworkflow"
 LEGACY_PRESET_FILE_FILTER = "*.bworkflow"
+GITHUB_REPOSITORY_URL = "https://github.com/colahzy-hub/GoWorkFlow"
 WORKFLOW_SWITCHER_COLUMNS = 4
 AI_DOC_MAX_CHARS = 6200
 AI_DOC_DESCRIPTION_MAX_CHARS = 900
@@ -10213,7 +10214,10 @@ def draw_preset_editor(layout, state):
 def draw_script_library_editor(layout, state):
     workflow = get_active_workflow(state)
     box = layout.column(align=True)
-    box.label(text="脚本库", icon="FILE_SCRIPT")
+    header = box.row(align=True)
+    header.label(text="脚本库", icon="FILE_SCRIPT")
+    github = header.operator("wm.url_open", text="GitHub主页", icon="URL")
+    github.url = GITHUB_REPOSITORY_URL
     box.label(text="把常用脚本先存起来，下次切到别的工作流也能直接复用。")
     if workflow is not None and workflow.modules:
         box.label(text=f"当前可保存来源: {workflow.name} / {workflow.modules[clamp_index(workflow.active_module_index, len(workflow.modules))].name}", icon="INFO")
