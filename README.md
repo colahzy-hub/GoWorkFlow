@@ -35,6 +35,13 @@ go_workflow_extension/
    └─ ...
 ```
 
+如果从源码仓库克隆，请先安装并启用 Git LFS：
+
+```powershell
+git lfs install
+git clone https://github.com/colahzy-hub/GoWorkFlow.git
+```
+
 ## 开发说明
 
 - 主插件代码位于 `go_workflow_extension/go_workflow/`。
@@ -48,4 +55,3 @@ go_workflow_extension/
 插件 manifest 当前声明为 `GPL-3.0-or-later`。
 
 ARKit 参考媒体和文档整理内容如来自外部资料，请在发布页保留来源说明和必要署名。
-
