@@ -1,14 +1,14 @@
 bl_info = {
     "name": "Go工作流 / Go Workflow",
     "author": "OpenAI Codex",
-    "version": (0, 6, 20),
+    "version": (0, 7, 2),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Go工作流",
     "description": "基于工作流的 N 面板筛选与自定义脚本模块工具 / Workflow panel filter and script module manager",
     "category": "3D View",
 }
 
-__version__ = (0, 6, 20)
+__version__ = (0, 7, 2)
 
 import json
 import hashlib
@@ -65,7 +65,7 @@ CURRENT_WORKFLOW_PRESET_KIND = "active_workflow"
 PRESET_FILE_EXTENSION = ".goworkflow"
 PRESET_FILE_FILTER = "*.goworkflow"
 LEGACY_PRESET_FILE_FILTER = "*.bworkflow"
-GITHUB_REPOSITORY_URL = "https://github.com/colahzy-hub/GoWorkFlow"
+SCRIPT_LIBRARY_DOC_URL = "https://docs.qq.com/sheet/DRUNEZ0RFUXdtU2FS"
 WORKFLOW_SWITCHER_COLUMNS = 4
 AI_DOC_MAX_CHARS = 6200
 AI_DOC_DESCRIPTION_MAX_CHARS = 900
@@ -8610,6 +8610,47 @@ class BWFLOW_OT_script_library_refresh(Operator):
         return {"FINISHED"}
 
 
+class BWFLOW_OT_script_library_open_storage_folder(Operator):
+    bl_idname = "bworkflow.script_library_open_storage_folder"
+    bl_label = "打开脚本文件夹"
+    bl_description = "用 Windows 文件资源管理器打开当前脚本库条目的脚本存储文件夹"
+
+    @classmethod
+    def poll(cls, context):
+        state = get_state(context=context)
+        return state is not None and bool(state.script_library)
+
+    def execute(self, context):
+        state = get_state(context=context)
+        if state is None or not state.script_library:
+            self.report({"ERROR"}, "当前没有脚本库条目")
+            return {"CANCELLED"}
+
+        item = state.script_library[clamp_index(state.script_library_index, len(state.script_library))]
+        raw_path = (getattr(item, "script_path", "") or "").strip()
+        try:
+            if raw_path:
+                target_path = bpy.path.abspath(raw_path)
+                if os.path.isfile(target_path):
+                    opened = open_path_in_file_explorer(target_path)
+                else:
+                    folder = target_path if os.path.isdir(target_path) else os.path.dirname(target_path)
+                    if folder:
+                        os.makedirs(folder, exist_ok=True)
+                        opened = open_path_in_file_explorer(folder)
+                    else:
+                        opened = open_path_in_file_explorer(default_module_scripts_dir())
+            else:
+                os.makedirs(default_module_scripts_dir(), exist_ok=True)
+                opened = open_path_in_file_explorer(default_module_scripts_dir())
+        except Exception as exc:
+            self.report({"ERROR"}, f"打开脚本文件夹失败: {exc}")
+            return {"CANCELLED"}
+
+        self.report({"INFO"}, f"已打开脚本文件夹: {opened}")
+        return {"FINISHED"}
+
+
 class BWFLOW_OT_panel_toggle_for_workflow(Operator):
     bl_idname = "bworkflow.panel_toggle_for_workflow"
     bl_label = "切换当前面板组"
@@ -10216,8 +10257,8 @@ def draw_script_library_editor(layout, state):
     box = layout.column(align=True)
     header = box.row(align=True)
     header.label(text="脚本库", icon="FILE_SCRIPT")
-    github = header.operator("wm.url_open", text="GitHub主页", icon="URL")
-    github.url = GITHUB_REPOSITORY_URL
+    docs = header.operator("wm.url_open", text="腾讯文档", icon="URL")
+    docs.url = SCRIPT_LIBRARY_DOC_URL
     box.label(text="把常用脚本先存起来，下次切到别的工作流也能直接复用。")
     if workflow is not None and workflow.modules:
         box.label(text=f"当前可保存来源: {workflow.name} / {workflow.modules[clamp_index(workflow.active_module_index, len(workflow.modules))].name}", icon="INFO")
@@ -10280,6 +10321,7 @@ def draw_script_library_editor(layout, state):
     action = detail.row(align=True)
     action.operator("bworkflow.script_library_apply_to_module", text="载入到当前模块", icon="IMPORT")
     action.operator("bworkflow.script_library_save_current_module", text="覆盖当前条目", icon="FILE_TICK").overwrite_existing = True
+    action.operator("bworkflow.script_library_open_storage_folder", text="打开脚本文件夹", icon="FILE_FOLDER")
 
     workflow_box = right.box()
     workflow_box.label(text="工作流启用状态", icon="OUTLINER_COLLECTION")
@@ -10497,6 +10539,7 @@ CLASSES = [
     BWFLOW_OT_script_library_toggle_workflow,
     BWFLOW_OT_script_library_remove,
     BWFLOW_OT_script_library_refresh,
+    BWFLOW_OT_script_library_open_storage_folder,
     BWFLOW_OT_module_runtime_field_write,
     BWFLOW_OT_module_runtime_action,
     BWFLOW_OT_copy_runtime_error,
