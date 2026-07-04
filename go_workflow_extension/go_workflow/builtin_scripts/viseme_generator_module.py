@@ -254,25 +254,25 @@ def run(context, scene, workflow, module):
 
 def draw_panel(layout, context, scene, workflow, module, panel_api, module_state):
     box = panel_api.section(layout, "口型生成 / AA-OH-CH", icon="SHAPEKEY_DATA")
-    panel_api.draw_object_picker(box, "target_object", "目标物体")
-    panel_api.draw_active_object_capture(box, "target_object", "吸取当前选中", icon="EYEDROPPER")
-    panel_api.draw_toggle(box, "generate_base_from_arkit", "先用 ARKit 形态键合成 AA/OH/CH", default=_get_setting(module, "generate_base_from_arkit", False))
-    panel_api.draw_text_input(box, "base_aa", "AA 键名", default="AA")
-    panel_api.draw_text_input(box, "base_oh", "OH 键名", default="OH")
-    panel_api.draw_text_input(box, "base_ch", "CH 键名", default="CH")
+    panel_api.draw_object_picker_inline(box, "target_object", "目标物体:", show_active_button=True, factor=0.24)
+    panel_api.draw_toggle_inline(box, "generate_base_from_arkit", "先用 ARKit 形态键合成 AA/OH/CH", default=_get_setting(module, "generate_base_from_arkit", False), factor=0.24)
+    panel_api.draw_text_input_inline(box, "base_aa", "AA 键名:", default="AA", factor=0.24)
+    panel_api.draw_text_input_inline(box, "base_oh", "OH 键名:", default="OH", factor=0.24)
+    panel_api.draw_text_input_inline(box, "base_ch", "CH 键名:", default="CH", factor=0.24)
     panel_api.draw_enum(box, "preset", "生成目标", [("VRCHAT", "VRChat"), ("MMD", "MMD"), ("BOTH", "全部")], default=_get_setting(module, "preset", "VRCHAT"))
     if panel_api.get_enum("preset", _get_setting(module, "preset", "VRCHAT")) in {"VRCHAT", "BOTH"}:
-        panel_api.draw_text_input(box, "vrc_prefix", "VRChat 前缀", default=_get_setting(module, "vrc_prefix", "vrc.v_"))
+        panel_api.draw_text_input_inline(box, "vrc_prefix", "VRChat 前缀:", default=_get_setting(module, "vrc_prefix", "vrc.v_"), factor=0.24)
     if panel_api.get_enum("preset", _get_setting(module, "preset", "VRCHAT")) in {"MMD", "BOTH"}:
-        panel_api.draw_toggle(box, "mmd_use_japanese", "MMD 使用日文键名", default=_get_setting(module, "mmd_use_japanese", True))
-    panel_api.draw_float_input(box, "strength", "强度", default=_get_setting(module, "strength", 1.0))
-    panel_api.draw_toggle(box, "overwrite_existing", "覆盖已有目标形态键", default=_get_setting(module, "overwrite_existing", False))
+        panel_api.draw_toggle_inline(box, "mmd_use_japanese", "MMD 使用日文键名", default=_get_setting(module, "mmd_use_japanese", True), factor=0.24)
+    panel_api.draw_float_input_inline(box, "strength", "强度", default=_get_setting(module, "strength", 1.0), factor=0.24)
+    panel_api.draw_toggle_inline(box, "overwrite_existing", "覆盖已有目标形态键", default=_get_setting(module, "overwrite_existing", False), factor=0.24)
 
-    note = panel_api.section(box, "说明", icon="INFO")
-    if panel_api.get_bool("generate_base_from_arkit", _get_setting(module, "generate_base_from_arkit", False)):
-        panel_api.label(note, "启用后会先按 ARKit 源键生成/更新 AA、OH、CH，再继续生成口型。", icon="CHECKMARK")
-    else:
-        panel_api.label(note, "关闭时直接使用现有 AA、OH、CH 作为基础键。", icon="INFO")
+    note = panel_api.foldout_section(box, "show_viseme_note", "说明", icon="INFO", default_open=False)
+    if note is not None:
+        if panel_api.get_bool("generate_base_from_arkit", _get_setting(module, "generate_base_from_arkit", False)):
+            panel_api.label(note, "启用后会先按 ARKit 源键生成/更新 AA、OH、CH，再继续生成口型。", icon="CHECKMARK")
+        else:
+            panel_api.label(note, "关闭时直接使用现有 AA、OH、CH 作为基础键。", icon="INFO")
 
     status = module_state.get("last_result", "") if module_state is not None else ""
     if status:

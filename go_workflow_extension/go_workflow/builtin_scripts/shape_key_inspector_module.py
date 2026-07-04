@@ -1,56 +1,91 @@
 import json
-from array import array
+import math
 
 import bmesh
 import bpy
 
 
-DEFAULT_LIST_LIMIT = 24
-EPSILON = 1.0e-7
+DEFAULT_THRESHOLD = 1.0e-4
 REALTIME_TIMER_INTERVAL = 0.24
 _REALTIME_STATE = {"running": False, "token": 0}
 _REALTIME_TIMER_STATE = {"callback": None}
 _REALTIME_TIMER_REGISTRY_KEY = "go_workflow.realtime_diff_callbacks"
 
 
-def _panel_api():
-    return globals().get("panel_api")
+def _get_config(module):
+    payload = getattr(module, "config_payload", "")
+    if isinstance(payload, str) and payload.strip():
+        try:
+            data = json.loads(payload)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            pass
+    return {}
+
+
+def _set_config(module, data):
+    module.config_payload = json.dumps(data or {}, ensure_ascii=False, sort_keys=True)
 
 
 def _module_state():
     return globals().get("module_state")
 
 
-def _settings(module):
-    raw = getattr(module, "config_payload", "") or ""
-    if not raw.strip():
-        return {}
+def _active_or_config_object(context, panel_api, config):
+    obj = panel_api.get_object("target_object") if panel_api is not None else None
+    if obj is None:
+        target_name = str(config.get("target_object", "") or "")
+        obj = bpy.data.objects.get(target_name) if target_name else None
+    if obj is None:
+        obj = getattr(context, "active_object", None)
+    if obj is None:
+        raise Exception("请先选择一个网格对象，或在面板里指定目标对象")
+    if getattr(obj, "type", None) != "MESH":
+        raise Exception("目标对象必须是网格类型")
+    if not getattr(obj.data, "shape_keys", None):
+        raise Exception(f'对象 "{obj.name}" 没有形态键')
+    return obj
+
+
+def _analyze_shape_key(kb, shape_keys, threshold):
+    ref = kb.relative_key
+    if ref is None:
+        if shape_keys.key_blocks:
+            ref = shape_keys.key_blocks[0]
+        else:
+            ref = None
+
+    if ref is None or kb == ref:
+        return True, 0.0, ref.name if ref else "None"
+
+    if not kb.data or not ref.data or len(kb.data) != len(ref.data):
+        return True, 0.0, ref.name if ref else "None"
+
+    max_sq = 0.0
+    for index, vertex in enumerate(kb.data):
+        delta_sq = (vertex.co - ref.data[index].co).length_squared
+        if delta_sq > max_sq:
+            max_sq = delta_sq
+    max_dist = math.sqrt(max_sq)
+    return max_dist <= threshold, max_dist, ref.name
+
+
+def _set_active_shape_key(context, obj, index):
+    shape_keys = getattr(getattr(obj, "data", None), "shape_keys", None)
+    key_blocks = getattr(shape_keys, "key_blocks", None)
+    index = int(index)
+    if key_blocks is None or index < 0 or index >= len(key_blocks):
+        raise Exception("目标形态键索引无效")
     try:
-        data = json.loads(raw)
+        context.view_layer.objects.active = obj
     except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _save_settings(module, data):
-    module.config_payload = json.dumps(data or {}, ensure_ascii=False, sort_keys=True)
-
-
-def _get_setting(module, key, default):
-    return _settings(module).get(key, default)
-
-
-def _set_setting(module, key, value):
-    data = _settings(module)
-    data[key] = value
-    _save_settings(module, data)
-
-
-def _persist_ui_settings(module, panel_api):
-    if panel_api is None:
-        return
-    _set_setting(module, "list_limit", int(panel_api.get_int("list_limit", _get_setting(module, "list_limit", DEFAULT_LIST_LIMIT))))
-    _set_setting(module, "search_text", str(panel_api.get_text("search_text", _get_setting(module, "search_text", "")) or ""))
+        pass
+    try:
+        obj.select_set(True)
+    except Exception:
+        pass
+    obj.active_shape_key_index = index
+    return key_blocks[index]
 
 
 def _register_realtime_timer(callback):
@@ -87,203 +122,63 @@ def _cancel_realtime_timer():
     return True
 
 
-def _realtime_enabled(panel_api, module_state):
+def _stop_realtime_diff(module_state, panel_api=None):
+    _REALTIME_STATE["running"] = False
+    _REALTIME_STATE["token"] += 1
+    _cancel_realtime_timer()
     if panel_api is not None:
-        return bool(panel_api.get_bool("realtime_diff_enabled", False))
-    return bool(module_state.get("realtime_enabled", False)) if module_state is not None else False
-
-
-def _selected(context):
-    return list(getattr(context, "selected_objects", []) or [])
-
-
-def _target_object(context, panel_api):
-    obj = panel_api.get_object("target_object") if panel_api is not None else None
-    if obj is None:
-        selected = _selected(context)
-        obj = selected[0] if selected else getattr(context, "object", None)
-    if obj is None or getattr(obj, "type", None) != "MESH":
-        raise Exception("请选择带形态键的网格物体")
-    shape_keys = getattr(getattr(obj.data, "shape_keys", None), "key_blocks", None)
-    if shape_keys is None or len(shape_keys) <= 1:
-        raise Exception("目标物体需要至少包含 Basis 和一个形态键")
-    return obj, shape_keys
-
-
-def _coords_of_keyblock(keyblock, vert_count):
-    coords = array("f", [0.0]) * (vert_count * 3)
-    keyblock.data.foreach_get("co", coords)
-    return coords
-
-
-def _iter_non_basis_items(key_blocks):
-    for key_index in range(1, len(key_blocks)):
-        yield key_index, key_blocks[key_index]
-
-
-def _delta_stats(reference_coords, target_coords, vert_count):
-    moved_count = 0
-    max_delta_sq = 0.0
-    indices = []
-    for vertex_index in range(vert_count):
-        offset = vertex_index * 3
-        dx = target_coords[offset] - reference_coords[offset]
-        dy = target_coords[offset + 1] - reference_coords[offset + 1]
-        dz = target_coords[offset + 2] - reference_coords[offset + 2]
-        delta_sq = (dx * dx) + (dy * dy) + (dz * dz)
-        if delta_sq > EPSILON:
-            moved_count += 1
-            indices.append(vertex_index)
-            if delta_sq > max_delta_sq:
-                max_delta_sq = delta_sq
-    return moved_count, max_delta_sq ** 0.5, indices
-
-
-def _reference_key_block(key_blocks, key_index):
-    target = key_blocks[key_index]
-    reference = getattr(target, "relative_key", None)
-    if reference is None:
-        return key_blocks[0], "basis_fallback"
-    if reference == target:
-        return key_blocks[0], "basis_fallback"
-    try:
-        _vert_count = len(reference.data)
-    except Exception:
-        return key_blocks[0], "basis_self_fallback"
-    return reference, "relative_key"
-
-
-def _shape_key_delta_stats(key_blocks, key_index):
-    reference, reference_mode = _reference_key_block(key_blocks, key_index)
-    target = key_blocks[key_index]
-    vert_count = len(reference.data)
-    reference_coords = _coords_of_keyblock(reference, vert_count)
-    target_coords = _coords_of_keyblock(target, vert_count)
-    moved_count, max_delta, indices = _delta_stats(reference_coords, target_coords, vert_count)
-    return moved_count == 0, moved_count, max_delta, indices, vert_count, reference, reference_mode
-
-
-def _scan_shape_keys(obj, key_blocks):
-    empty_items = []
-    nearest_items = []
-    max_seen_delta = 0.0
-    non_empty_count = 0
-    last_vert_count = 0
-
-    for key_index, key_block in _iter_non_basis_items(key_blocks):
-        is_empty, moved_count, max_delta, _indices, vert_count, reference, reference_mode = _shape_key_delta_stats(
-            key_blocks, key_index
-        )
-        last_vert_count = vert_count
-        max_seen_delta = max(max_seen_delta, float(max_delta))
-        if is_empty:
-            empty_items.append(
-                {
-                    "index": key_index,
-                    "name": key_block.name,
-                    "vertex_count": vert_count,
-                    "match_mode": reference_mode,
-                    "relative_key_name": getattr(reference, "name", "Basis"),
-                    "max_delta": float(max_delta),
-                }
-            )
-        else:
-            non_empty_count += 1
-            nearest_items.append(
-                {
-                    "index": key_index,
-                    "name": key_block.name,
-                    "moved_count": moved_count,
-                    "relative_key_name": getattr(reference, "name", "Basis"),
-                    "max_delta": float(max_delta),
-                }
-            )
-
-    nearest_items.sort(key=lambda item: (item["moved_count"], item["max_delta"], item["name"].lower()))
-    return {
-        "object_name": obj.name,
-        "shape_key_total": max(0, len(key_blocks) - 1),
-        "empty_count": len(empty_items),
-        "non_empty_count": non_empty_count,
-        "vertex_count": last_vert_count,
-        "empty_items": empty_items,
-        "nearest_items": nearest_items[:8],
-        "max_seen_delta": float(max_seen_delta),
-    }
-
-
-def _store_scan_result(module_state, result):
-    if module_state is None:
-        return
-    module_state.set("scan_object_name", result["object_name"])
-    module_state.set("shape_key_total", result["shape_key_total"])
-    module_state.set("empty_count", result["empty_count"])
-    module_state.set("non_empty_count", result["non_empty_count"])
-    module_state.set("vertex_count", result["vertex_count"])
-    module_state.set("empty_items", result["empty_items"])
-    module_state.set("nearest_items", result["nearest_items"])
-    module_state.set("scan_max_delta", result["max_seen_delta"])
-
-
-def _refresh_scan(context, module):
-    panel_api = _panel_api()
-    module_state = _module_state()
-    _persist_ui_settings(module, panel_api)
-    obj, key_blocks = _target_object(context, panel_api)
-    result = _scan_shape_keys(obj, key_blocks)
-    _store_scan_result(module_state, result)
-    status = f"已扫描 {result['object_name']}：共 {result['shape_key_total']} 个形态键，空形态键 {result['empty_count']}，非空 {result['non_empty_count']}"
-    if panel_api is not None:
-        panel_api.set_status(status, level="OK")
-    if module_state is not None:
-        module_state.set("last_result", status)
-    return result
-
-
-def _set_active_shape_key(obj, key_index):
-    key_index = int(key_index)
-    key_blocks = getattr(getattr(obj.data, "shape_keys", None), "key_blocks", None)
-    if key_blocks is None or key_index <= 0 or key_index >= len(key_blocks):
-        raise Exception("目标形态键索引无效")
-    try:
-        bpy.context.view_layer.objects.active = obj
-    except Exception:
-        pass
-    try:
-        obj.select_set(True)
-    except Exception:
-        pass
-    obj.active_shape_key_index = key_index
-    return key_blocks[key_index]
-
-
-def _find_empty_item_by_index(module_state, key_index):
-    items = list(module_state.get("empty_items", []) or []) if module_state is not None else []
-    for item in items:
         try:
-            if int(item.get("index", -1)) == int(key_index):
-                return item
+            panel_api.set_bool("realtime_diff_enabled", False)
         except Exception:
-            continue
-    return None
-
-
-def _activate_empty_shape_key(context, panel_api, module_state, key_index):
-    obj, _key_blocks = _target_object(context, panel_api)
-    key_block = _set_active_shape_key(obj, key_index)
-    item = _find_empty_item_by_index(module_state, key_index)
-    key_name = str(item.get("name", "") or key_block.name) if item else key_block.name
-    if panel_api is not None:
-        panel_api.set_int("selected_empty_key_index", int(key_index))
-        panel_api.set_text("selected_empty_key_name", key_name)
+            pass
     if module_state is not None:
-        module_state.set("selected_empty_key_index", int(key_index))
-        module_state.set("selected_empty_key_name", key_name)
-        module_state.set("active_summary", f"已选中空形态键：{key_name}（索引 {int(key_index)}）")
-        module_state.set("last_result", f"已选中空形态键：{key_name}（索引 {int(key_index)}）")
-    if panel_api is not None:
-        panel_api.set_status(f"已选中空形态键：{key_name}（索引 {int(key_index)}）", level="OK")
-    return key_block
+        module_state.set("realtime_enabled", False)
+
+
+def cleanup_runtime(scene=None, workflow=None, module=None, module_state=None):
+    _stop_realtime_diff(module_state)
+    if module_state is not None:
+        module_state.set("realtime_object_name", "")
+        module_state.set("realtime_last_key_index", -1)
+    return True
+
+
+def _filtered_details(config):
+    return [entry for entry in list(config.get("details", []) or []) if bool(entry.get("is_empty", False))]
+
+
+def _sync_ui_list(context, config):
+    scene = getattr(context, "scene", None)
+    if scene is None or not hasattr(scene, "bwflow_shape_key_inspector_items"):
+        return
+    items = scene.bwflow_shape_key_inspector_items
+    items.clear()
+    for entry in _filtered_details(config):
+        item = items.add()
+        item.object_name = str(config.get("scanned_object", "") or "")
+        item.key_index = int(entry.get("index", -1))
+        item.key_name = str(entry.get("name", "") or "")
+        item.is_empty = bool(entry.get("is_empty", False))
+        item.max_delta = float(entry.get("max_dist", 0.0) or 0.0)
+        item.reference_name = str(entry.get("ref_name", "Basis") or "Basis")
+    current_active = -1
+    obj = bpy.data.objects.get(str(config.get("scanned_object", "") or ""))
+    if obj is not None:
+        current_active = int(getattr(obj, "active_shape_key_index", -1) or -1)
+    selected = 0
+    for idx, entry in enumerate(_filtered_details(config)):
+        if int(entry.get("index", -1)) == current_active:
+            selected = idx
+            break
+    scene.bwflow_shape_key_inspector_index = selected if len(items) else -1
+
+
+def _copy_empty_names(context, config):
+    names = [str(name).strip() for name in list(config.get("empty_keys", []) or []) if str(name).strip()]
+    if not names:
+        raise Exception("当前没有可复制的空形态键列表，请先扫描")
+    context.window_manager.clipboard = "\n".join(names)
+    return len(names)
 
 
 def _current_active_stats(obj):
@@ -293,34 +188,72 @@ def _current_active_stats(obj):
     key_index = int(getattr(obj, "active_shape_key_index", 0) or 0)
     if key_index <= 0 or key_index >= len(key_blocks):
         raise Exception("请先选中一个非 Basis 的形态键")
-    basis, _reference_mode = _reference_key_block(key_blocks, key_index)
     target = key_blocks[key_index]
-    vert_count = len(basis.data)
-    basis_coords = _coords_of_keyblock(basis, vert_count)
-    target_coords = _coords_of_keyblock(target, vert_count)
-    moved_count, max_delta, indices = _delta_stats(basis_coords, target_coords, vert_count)
-    return target, moved_count, max_delta, indices
+    reference = getattr(target, "relative_key", None)
+    if reference is None or reference == target:
+        reference = key_blocks[0]
+    if len(target.data) != len(reference.data):
+        raise Exception("当前形态键与参考键顶点数量不一致")
+    moved_count = 0
+    max_delta_sq = 0.0
+    indices = []
+    for vertex_index, vertex in enumerate(target.data):
+        delta_sq = (vertex.co - reference.data[vertex_index].co).length_squared
+        if delta_sq > 0.0:
+            moved_count += 1
+            indices.append(vertex_index)
+            if delta_sq > max_delta_sq:
+                max_delta_sq = delta_sq
+    return target, reference, moved_count, math.sqrt(max_delta_sq), indices
 
 
 def _select_difference_vertices_in_edit_mode(context, obj, vertex_indices):
-    if getattr(context.view_layer.objects, "active", None) is not obj:
-        raise Exception("请先把目标物体设为当前活动物体")
+    # 注：timer callback 中的 bpy.context.view_layer.objects.active 可能不是 obj
+    # 因此这里只检查 mode，不依赖 context.view_layer.objects.active
     if getattr(obj, "mode", "") != "EDIT":
         raise Exception("请先进入该物体的编辑模式")
+    try:
+        context.view_layer.objects.active = obj
+    except Exception:
+        pass
+    try:
+        bpy.ops.mesh.select_mode(type="VERT")
+    except Exception:
+        pass
     bm = bmesh.from_edit_mesh(obj.data)
-    for vert in bm.verts:
-        vert.select = False
-    bm.select_flush_mode()
+    try:
+        bm.verts.ensure_lookup_table()
+    except Exception:
+        pass
     selected = set(vertex_indices)
+    # Step 1: 取消当前所有选择（仅操作 bmesh 内存，未推送视口）
     for vert in bm.verts:
-        vert.select = vert.index in selected
+        vert.select_set(False)
+    # Step 2: 选中差异顶点（紧接上一步，无间隙）
+    for vert in bm.verts:
+        if vert.index in selected:
+            vert.select_set(True)
+    # 仅在最后一次性推送到视口，用户感知不到两步操作的间隔
     bm.select_flush_mode()
     bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+    try:
+        obj.data.update()
+    except Exception:
+        pass
+    try:
+        wm = getattr(bpy.context, "window_manager", None)
+        for window in getattr(wm, "windows", []) or []:
+            screen = getattr(window, "screen", None)
+            for area in getattr(screen, "areas", []) or []:
+                if getattr(area, "type", "") == "VIEW_3D":
+                    area.tag_redraw()
+    except Exception:
+        pass
 
 
 def _apply_active_difference_selection(context, panel_api, module_state, obj):
-    key_block, moved_count, max_delta, indices = _current_active_stats(obj)
-    summary = f"{key_block.name}：移动顶点 {moved_count}，最大位移 {max_delta:.6g}"
+    key_block, reference, moved_count, max_delta, indices = _current_active_stats(obj)
+    summary = f"{key_block.name}：相对 {reference.name} 移动顶点 {moved_count} 个，最大位移 {max_delta:.6g}"
     if module_state is not None:
         module_state.set("active_summary", summary)
         module_state.set("last_result", summary)
@@ -329,61 +262,46 @@ def _apply_active_difference_selection(context, panel_api, module_state, obj):
         _select_difference_vertices_in_edit_mode(context, obj, indices)
         if panel_api is not None:
             panel_api.set_status(f"已在编辑模式选中 {moved_count} 个差异顶点", level="OK")
-    else:
-        if panel_api is not None:
-            panel_api.set_status(f"{summary}；进入编辑模式后再点可直接选中这些顶点", level="WARNING")
-    return key_block, moved_count, max_delta, indices
+    elif panel_api is not None:
+        panel_api.set_status(f"{summary}；进入编辑模式后再点可直接选中这些顶点", level="WARNING")
+    return key_block, reference, moved_count, max_delta, indices
 
 
-def _filtered_empty_items(module, panel_api, module_state):
-    items = list(module_state.get("empty_items", []) or []) if module_state is not None else []
-    search_text = ""
+def _realtime_enabled(panel_api, module_state):
     if panel_api is not None:
-        search_text = str(panel_api.get_text("search_text", _get_setting(module, "search_text", "")) or "").strip().lower()
-    if not search_text:
-        return items
-    return [item for item in items if search_text in str(item.get("name", "") or "").lower()]
+        return bool(panel_api.get_bool("realtime_diff_enabled", False))
+    return bool(module_state.get("realtime_enabled", False)) if module_state is not None else False
 
 
-def _copy_empty_names(context, module_state):
-    items = list(module_state.get("empty_items", []) or []) if module_state is not None else []
-    names = [str(item.get("name", "")).strip() for item in items if str(item.get("name", "")).strip()]
-    if not names:
-        raise Exception("当前没有可复制的空形态键列表，请先刷新")
-    context.window_manager.clipboard = "\n".join(names)
-    return len(names)
-
-
-def _stop_realtime_diff(module_state):
-    _REALTIME_STATE["running"] = False
-    _REALTIME_STATE["token"] += 1
-    if module_state is not None:
-        module_state.set("realtime_enabled", False)
-
-
-def cleanup_runtime(scene=None, workflow=None, module=None, module_state=None):
-    _cancel_realtime_timer()
-    _stop_realtime_diff(module_state)
-    if module_state is not None:
-        module_state.set("realtime_object_name", "")
-        module_state.set("realtime_last_key_index", -1)
-    return True
-
-
-def _start_realtime_diff(context, panel_api, module_state):
-    obj, _key_blocks = _target_object(context, panel_api)
+def _start_realtime_diff(context, panel_api, module_state, obj):
     if getattr(obj, "mode", "") != "EDIT":
         raise Exception("实时检查差异点需要先进入编辑模式")
+    _stop_realtime_diff(module_state)
     _REALTIME_STATE["running"] = True
     _REALTIME_STATE["token"] += 1
     token = int(_REALTIME_STATE["token"])
     object_name = obj.name_full
     if panel_api is not None:
         panel_api.set_bool("realtime_diff_enabled", True)
+        panel_api.set_status("已开启实时检查差异点：切换活动形态键后会自动刷新顶点选择", level="OK")
     if module_state is not None:
         module_state.set("realtime_enabled", True)
         module_state.set("realtime_object_name", object_name)
         module_state.set("realtime_last_key_index", -1)
+    try:
+        active_index = int(getattr(obj, "active_shape_key_index", 0) or 0)
+    except Exception:
+        active_index = 0
+    if active_index > 0:
+        try:
+            _apply_active_difference_selection(context, panel_api, module_state, obj)
+        except Exception as exc:
+            if module_state is not None:
+                module_state.set("active_summary", f"实时检查启动失败：{exc}")
+            raise
+    elif module_state is not None:
+        module_state.set("realtime_last_key_index", 0)
+        module_state.set("active_summary", "当前是 Basis，切换到非 Basis 形态键后会自动选择差异顶点")
 
     def _tick():
         if not _REALTIME_STATE["running"] or token != _REALTIME_STATE["token"]:
@@ -405,165 +323,211 @@ def _start_realtime_diff(context, panel_api, module_state):
             if last_index != 0:
                 try:
                     bm = bmesh.from_edit_mesh(current_obj.data)
+                    try:
+                        bm.verts.ensure_lookup_table()
+                    except Exception:
+                        pass
                     for vert in bm.verts:
-                        vert.select = False
+                        vert.select_set(False)
                     bm.select_flush_mode()
                     bmesh.update_edit_mesh(current_obj.data, loop_triangles=False, destructive=False)
                 except Exception:
                     pass
                 if module_state is not None:
                     module_state.set("realtime_last_key_index", 0)
-                    module_state.set("active_summary", "当前是 Basis，已清空差异点选择")
+                    module_state.set("active_summary", "当前是 Basis，已清空差异顶点选择")
             return REALTIME_TIMER_INTERVAL
         if key_index == last_index:
             return REALTIME_TIMER_INTERVAL
         try:
             _apply_active_difference_selection(bpy.context, panel_api, module_state, current_obj)
-        except Exception:
+        except Exception as _e:
+            if module_state is not None:
+                module_state.set("active_summary", f"实时检查出错：{_e}")
             return REALTIME_TIMER_INTERVAL
         return REALTIME_TIMER_INTERVAL
 
     _register_realtime_timer(_tick)
     bpy.app.timers.register(_tick, first_interval=0.02)
-    if panel_api is not None:
-        panel_api.set_status("已开启实时检查差异点：切换形态键后会自动刷新顶点选择", level="OK")
+
+
+def _scan_object(obj, threshold):
+    shape_keys = obj.data.shape_keys
+    empty_keys = []
+    details = []
+
+    for index, key_block in enumerate(shape_keys.key_blocks):
+        is_empty, max_dist, ref_name = _analyze_shape_key(key_block, shape_keys, threshold)
+        item = {
+            "index": index,
+            "name": key_block.name,
+            "is_empty": bool(is_empty),
+            "max_dist": float(max_dist),
+            "ref_name": str(ref_name),
+        }
+        details.append(item)
+        if is_empty:
+            empty_keys.append(key_block.name)
+
+    return {
+        "last_result": f'扫描完成。对象 "{obj.name}" 共 {len(shape_keys.key_blocks)} 个形态键，空键 {len(empty_keys)} 个',
+        "scanned_object": obj.name,
+        "total_keys": len(shape_keys.key_blocks),
+        "empty_keys": empty_keys,
+        "details": details,
+        "threshold_used": float(threshold),
+    }
 
 
 def run(context, scene, workflow, module):
-    _refresh_scan(context, module)
+    config = _get_config(module)
+    panel_api = globals().get("panel_api")
+    obj = _active_or_config_object(context, panel_api, config)
+    threshold = float(config.get("threshold", DEFAULT_THRESHOLD) or DEFAULT_THRESHOLD)
+    if panel_api is not None:
+        threshold = float(panel_api.get_float("threshold", threshold) or threshold)
+
+    config.update(_scan_object(obj, threshold))
+    config["target_object"] = obj.name
+    config["threshold"] = threshold
+    _set_config(module, config)
+    _sync_ui_list(context, config)
+
+    module_state = _module_state()
+    if module_state is not None:
+        module_state.set("last_result", config["last_result"])
     return {"FINISHED"}
 
 
+def _selected_list_item(context):
+    scene = getattr(context, "scene", None)
+    if scene is None or not hasattr(scene, "bwflow_shape_key_inspector_items"):
+        return None
+    index = int(getattr(scene, "bwflow_shape_key_inspector_index", -1) or -1)
+    items = scene.bwflow_shape_key_inspector_items
+    if index < 0 or index >= len(items):
+        return None
+    return items[index]
+
+
 def draw_panel(layout, context, scene, workflow, module, panel_api, module_state):
+    config = _get_config(module)
     box = panel_api.section(layout, "形态键鉴定", icon="SHAPEKEY_DATA")
-    panel_api.draw_object_picker(box, "target_object", "目标物体")
-    panel_api.draw_active_object_capture(box, "target_object", "吸取当前选中", icon="EYEDROPPER")
-    panel_api.draw_int_input(box, "list_limit", "列表显示上限", default=_get_setting(module, "list_limit", DEFAULT_LIST_LIMIT))
-    panel_api.draw_text_input(box, "search_text", "空键搜索", default=_get_setting(module, "search_text", ""))
+
+    panel_api.draw_object_picker_inline(box, "target_object", "目标对象:", show_active_button=True, factor=0.24)
+    panel_api.draw_float_input_inline(
+        box,
+        "threshold",
+        "判定阈值",
+        default=float(config.get("threshold", DEFAULT_THRESHOLD) or DEFAULT_THRESHOLD),
+        factor=0.24,
+    )
 
     actions = panel_api.row(box, align=True)
-    panel_api.draw_run_button(actions, "刷新列表", icon="FILE_REFRESH")
+    panel_api.draw_run_button(actions, "扫描空键", icon="VIEWZOOM")
     panel_api.draw_button(actions, "COPY_EMPTY_NAMES", "复制空键名称", icon="COPYDOWN")
 
-    summary_box = panel_api.section(box, "扫描结果", icon="INFO")
-    object_name = module_state.get("scan_object_name", "") if module_state is not None else ""
-    shape_key_total = int(module_state.get("shape_key_total", 0) or 0) if module_state is not None else 0
-    empty_count = int(module_state.get("empty_count", 0) or 0) if module_state is not None else 0
-    non_empty_count = int(module_state.get("non_empty_count", 0) or 0) if module_state is not None else 0
-    if object_name:
-        panel_api.label(summary_box, f"对象：{object_name}", icon="MESH_DATA")
-        panel_api.label(summary_box, f"形态键总数：{shape_key_total}", icon="SHAPEKEY_DATA")
-        panel_api.label(summary_box, f"空形态键：{empty_count}  非空：{non_empty_count}", icon="CHECKMARK")
-        panel_api.label(summary_box, "空形态键判定：严格按当前键相对 relative_key 是否完全无位移来判断；找不到 relative_key 时才回退到 Basis。", icon="INFO")
+    last_result = str(config.get("last_result", "") or "")
+    if last_result:
+        panel_api.label(box, last_result, icon="INFO")
+
+    scanned_obj = str(config.get("scanned_object", "") or "")
+    empty_keys = list(config.get("empty_keys", []) or [])
+    threshold_used = float(config.get("threshold_used", config.get("threshold", DEFAULT_THRESHOLD)) or 0.0)
+    total_details = list(config.get("details", []) or [])
+    filtered_details = _filtered_details(config)
+
+    if scanned_obj and total_details:
+        summary = panel_api.section(box, "扫描结果", icon="INFO")
+        panel_api.label(summary, f"扫描对象：{scanned_obj}", icon="OBJECT_DATA")
+        panel_api.label(summary, f"形态键总数：{int(config.get('total_keys', 0) or 0)}  空键：{len(empty_keys)}", icon="SHAPEKEY_DATA")
+        panel_api.label(summary, f"阈值：{threshold_used:.6f}", icon="DRIVER_DISTANCE")
+
+        scene_box = panel_api.section(box, f"扫描结果列表 ({len(filtered_details)})", icon="ALIGN_JUSTIFY")
+        row = scene_box.row()
+        row.template_list(
+            "BWFLOW_UL_shape_key_inspector_results",
+            "",
+            context.scene,
+            "bwflow_shape_key_inspector_items",
+            context.scene,
+            "bwflow_shape_key_inspector_index",
+            rows=10,
+            maxrows=16,
+        )
     else:
-        panel_api.label(summary_box, "请先点击刷新列表", icon="INFO")
+        panel_api.label(box, "当前没有扫描结果，请点击扫描空键", icon="INFO")
 
     current_box = panel_api.section(box, "当前活动形态键", icon="RESTRICT_SELECT_OFF")
     try:
-        obj, key_blocks = _target_object(context, panel_api)
+        obj = _active_or_config_object(context, panel_api, config)
+        key_blocks = obj.data.shape_keys.key_blocks
         active_index = int(getattr(obj, "active_shape_key_index", 0) or 0)
         if 0 < active_index < len(key_blocks):
-            panel_api.label(current_box, f"当前：{key_blocks[active_index].name}", icon="SHAPEKEY_DATA")
+            target = key_blocks[active_index]
+            reference = getattr(target, "relative_key", None)
+            if reference is None or reference == target:
+                reference = key_blocks[0]
+            panel_api.label(current_box, f"当前：{target.name}", icon="SHAPEKEY_DATA")
+            panel_api.label(current_box, f"参考键：{reference.name}", icon="LINKED")
         else:
             panel_api.label(current_box, "当前是 Basis 或未选中形态键", icon="INFO")
     except Exception:
         panel_api.label(current_box, "请选择目标物体", icon="INFO")
     current_actions = panel_api.row(current_box, align=True)
     panel_api.draw_button(current_actions, "SELECT_DIFF_ACTIVE", "显示差异顶点", icon="VERTEXSEL")
-    panel_api.draw_toggle(current_actions, "realtime_diff_enabled", "实时检查差异点", default=False)
-    realtime_enabled = _realtime_enabled(panel_api, module_state)
-
-    active_summary = module_state.get("active_summary", "") if module_state is not None else ""
+    panel_api.draw_toggle_inline(current_box, "realtime_diff_enabled", "实时检查差异点", default=False, factor=0.24)
+    if _realtime_enabled(panel_api, module_state):
+        panel_api.label(current_box, "实时模式已开启：在编辑模式切换活动形态键时会自动刷新差异顶点。", icon="CHECKMARK")
+    active_summary = str(module_state.get("active_summary", "") or "") if module_state is not None else ""
     if active_summary:
         panel_api.label(current_box, active_summary, icon="INFO")
-    if realtime_enabled:
-        panel_api.label(current_box, "实时模式已开启：在编辑模式切换活动形态键时会自动清空并重新选中差异点。", icon="CHECKMARK")
-
-    items = _filtered_empty_items(module, panel_api, module_state)
-    all_items = list(module_state.get("empty_items", []) or []) if module_state is not None else []
-    list_limit = max(1, int(panel_api.get_int("list_limit", _get_setting(module, "list_limit", DEFAULT_LIST_LIMIT))))
-    list_box = panel_api.section(box, f"空形态键列表 ({len(items)}/{len(all_items)})", icon="ALIGN_JUSTIFY")
-    if not all_items:
-        panel_api.label(list_box, "当前没有扫描结果，或没有空形态键", icon="INFO")
-    elif not items:
-        panel_api.label(list_box, "没有搜索到匹配的空形态键", icon="INFO")
-    else:
-        try:
-            obj, _key_blocks = _target_object(context, panel_api)
-            active_index = int(getattr(obj, "active_shape_key_index", 0) or 0)
-        except Exception:
-            active_index = -1
-        selected_index = int(module_state.get("selected_empty_key_index", -1) or -1) if module_state is not None else -1
-        display_items = items[:list_limit]
-        panel_api.label(list_box, "点击“选中”会同步切换 Blender 当前活动形态键。", icon="MOUSE_LMB")
-        for item in display_items:
-            key_index = int(item.get("index", -1))
-            key_name = str(item.get("name", "") or "")
-            row = panel_api.row(list_box, align=True)
-            icon = "RADIOBUT_ON" if key_index in {active_index, selected_index} else "RADIOBUT_OFF"
-            row.label(text=f"{key_index}. {key_name} [空键]", icon=icon)
-            panel_api.draw_button(
-                row,
-                f"ACTIVATE_EMPTY::{key_index}",
-                "选中",
-                icon="RESTRICT_SELECT_OFF",
-                tooltip=f"切换当前物体的活动形态键到 {key_name}",
-            )
-            panel_api.draw_button(
-                row,
-                f"SELECT_DIFF::{key_index}",
-                "差异顶点",
-                icon="VERTEXSEL",
-                tooltip=f"切换到 {key_name} 并在编辑模式选中差异顶点",
-            )
-        hidden_count = len(items) - len(display_items)
-        if hidden_count > 0:
-            panel_api.label(list_box, f"还有 {hidden_count} 个未显示，可提高列表显示上限", icon="INFO")
-
-    nearest_items = list(module_state.get("nearest_items", []) or []) if module_state is not None else []
-    if nearest_items:
-        diag_box = panel_api.section(box, "接近空键但未命中", icon="INFO")
-        for item in nearest_items[:5]:
-            panel_api.label(
-                diag_box,
-                f"{item.get('name', '')}：相对 {item.get('relative_key_name', 'Basis')} 移动 {int(item.get('moved_count', 0))} 点，最大位移 {float(item.get('max_delta', 0.0)):.8f}",
-                icon="DOT",
-            )
 
     panel_api.draw_status(box)
 
 
 def on_panel_action(action, context, scene, workflow, module, panel_api, module_state):
-    _persist_ui_settings(module, panel_api)
-    if action == "COPY_EMPTY_NAMES":
-        copied = _copy_empty_names(context, module_state)
-        panel_api.set_status(f"已复制 {copied} 个空形态键名称", level="OK")
-        if module_state is not None:
-            module_state.set("last_result", f"已复制 {copied} 个空形态键名称")
+    config = _get_config(module)
+    if action.startswith("FIELD_WRITE::"):
+        field = action.split("::", 1)[1]
+        if field == "target_object":
+            obj = panel_api.get_object("target_object")
+            config["target_object"] = obj.name if obj else ""
+        elif field == "threshold":
+            config["threshold"] = float(panel_api.get_float("threshold", DEFAULT_THRESHOLD) or DEFAULT_THRESHOLD)
+        elif field == "realtime_diff_enabled":
+            obj = _active_or_config_object(context, panel_api, config)
+            if _realtime_enabled(panel_api, module_state):
+                _start_realtime_diff(context, panel_api, module_state, obj)
+            else:
+                _stop_realtime_diff(module_state, panel_api=panel_api)
+                panel_api.set_status("已关闭实时检查差异点", level="OK")
+                if module_state is not None:
+                    module_state.set("last_result", "已关闭实时检查差异点")
+            return {"FINISHED"}
+        _set_config(module, config)
         return {"FINISHED"}
 
-    if action.startswith("ACTIVATE_EMPTY::"):
-        key_index = int(action.split("::", 1)[1] or 0)
-        _activate_empty_shape_key(context, panel_api, module_state, key_index)
+    if action == "COPY_EMPTY_NAMES":
+        copied = _copy_empty_names(context, config)
+        panel_api.set_status(f"已复制 {copied} 个空形态键名称", level="OK")
+        return {"FINISHED"}
+
+    if action.startswith("ACTIVATE_KEY::"):
+        index = int(action.split("::", 1)[1] or 0)
+        obj = bpy.data.objects.get(str(config.get("scanned_object", "") or ""))
+        if obj is None:
+            obj = _active_or_config_object(context, panel_api, config)
+        key_block = _set_active_shape_key(context, obj, index)
+        panel_api.set_status(f"已切换到形态键：{key_block.name}", level="OK")
         return {"FINISHED"}
 
     if action == "SELECT_DIFF_ACTIVE" or action.startswith("SELECT_DIFF::"):
-        obj, _key_blocks = _target_object(context, panel_api)
+        obj = _active_or_config_object(context, panel_api, config)
         if action.startswith("SELECT_DIFF::"):
-            key_index = int(action.split("::", 1)[1] or 0)
-            _set_active_shape_key(obj, key_index)
+            index = int(action.split("::", 1)[1] or 0)
+            _set_active_shape_key(context, obj, index)
         _apply_active_difference_selection(context, panel_api, module_state, obj)
-        return {"FINISHED"}
-
-    if action == "FIELD_WRITE::realtime_diff_enabled":
-        realtime_enabled = _realtime_enabled(panel_api, module_state)
-        if realtime_enabled:
-            _start_realtime_diff(context, panel_api, module_state)
-        else:
-            _stop_realtime_diff(module_state)
-            panel_api.set_status("已关闭实时检查差异点", level="OK")
-            if module_state is not None:
-                module_state.set("last_result", "已关闭实时检查差异点")
         return {"FINISHED"}
 
     return {"FINISHED"}

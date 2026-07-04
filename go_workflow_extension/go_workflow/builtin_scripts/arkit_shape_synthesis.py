@@ -677,8 +677,7 @@ def draw_panel(layout, context, scene, workflow, module, panel_api, module_state
     summary_text, summary_icon = _table_summary_text(module, target_set, profile)
 
     box = panel_api.section(layout, "ARKit 合成形态键", icon="SHAPEKEY_DATA")
-    panel_api.draw_object_picker(box, "target_object", "目标网格")
-    panel_api.draw_active_object_capture(box, "target_object", "使用当前物体", icon="EYEDROPPER")
+    panel_api.draw_object_picker_inline(box, "target_object", "目标网格:", show_active_button=True, factor=0.24)
     panel_api.draw_enum(box, "target_set", "目标预设", [("VRM_BASIC", "VRM 基础"), ("MMD_POSSIBLE", "MMD 常用"), ("CUSTOM_TARGET", "自定义目标预设")], default=DEFAULT_TARGET_SET)
     mix_profile_disabled = ("CONSERVATIVE", "AGGRESSIVE") if target_set == CUSTOM_TARGET_SET else ()
     panel_api.draw_enum(
@@ -692,22 +691,26 @@ def draw_panel(layout, context, scene, workflow, module, panel_api, module_state
     )
     if target_set == CUSTOM_TARGET_SET:
         panel_api.label(box, "自定义目标预设固定使用额外导入表，常规和激进在此模式下不可用。", icon="INFO")
-    panel_api.draw_text_input(box, "target_filter_text", "指定合成键（空格分隔，留空为全部）", default="")
-    panel_api.draw_float_input(box, "strength_scale", "额外强度倍率", default=1.0)
-    panel_api.draw_toggle(box, "overwrite_existing", "覆盖已有同名目标形态键", default=False)
+    panel_api.draw_text_input_inline(box, "target_filter_text", "指定合成键:", default="", factor=0.24)
+    panel_api.draw_float_input_inline(box, "strength_scale", "额外强度倍率", default=1.0, factor=0.24)
+    panel_api.draw_toggle_inline(box, "overwrite_existing", "覆盖已有同名目标形态键", default=False, factor=0.24)
     panel_api.label(box, "白名单留空时生成当前表里的全部目标键。", icon="INFO")
 
-    panel_api.draw_toggle(box, "show_recipe_table", "展开混合系数表", default=False)
-    panel_api.label(box, "可通过 Blender 文件浏览器导入或导出 csv/txt。", icon="INFO")
+    table_box = None
     if panel_api.get_bool("show_recipe_table", False):
-        table_box = panel_api.section(box, "混合系数表", icon="TEXT")
+        table_box = panel_api.foldout_section(box, "show_recipe_table", "混合系数表", icon="TEXT", default_open=True)
+    else:
+        table_box = panel_api.foldout_section(box, "show_recipe_table", "混合系数表", icon="TEXT", default_open=False)
+    panel_api.label(box, "可通过 Blender 文件浏览器导入或导出 csv/txt。", icon="INFO")
+    if table_box is not None:
         panel_api.label(table_box, f"当前表：{_combo_label(target_set, profile)}", icon="INFO")
         panel_api.label(table_box, summary_text, icon=summary_icon)
-        note = panel_api.section(table_box, "备注", icon="INFO")
-        panel_api.label(note, "导出的是当前目标预设和混合强度对应的表。", icon="CHECKMARK")
-        panel_api.label(note, "自定义表按 VRM 基础 / MMD 常用分开保存。", icon="CHECKMARK")
-        panel_api.label(note, "自定义目标预设会单独保存一份额外导入表，不受常规/激进切换影响。", icon="CHECKMARK")
-        panel_api.label(note, "自定义模式找不到有效表格时会报错，不会静默生成。", icon="CHECKMARK")
+        note = panel_api.foldout_section(table_box, "show_recipe_note", "备注", icon="INFO", default_open=False)
+        if note is not None:
+            panel_api.label(note, "导出的是当前目标预设和混合强度对应的表。", icon="CHECKMARK")
+            panel_api.label(note, "自定义表按 VRM 基础 / MMD 常用分开保存。", icon="CHECKMARK")
+            panel_api.label(note, "自定义目标预设会单独保存一份额外导入表，不受常规/激进切换影响。", icon="CHECKMARK")
+            panel_api.label(note, "自定义模式找不到有效表格时会报错，不会静默生成。", icon="CHECKMARK")
 
         row = panel_api.row(table_box, align=True)
         if profile == "CUSTOM" or target_set == CUSTOM_TARGET_SET:

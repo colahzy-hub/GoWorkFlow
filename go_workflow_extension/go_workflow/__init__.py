@@ -1,25 +1,30 @@
 bl_info = {
     "name": "Go工作流 / Go Workflow",
     "author": "OpenAI Codex",
-    "version": (0, 7, 2),
+    "version": (0, 9, 1),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Go工作流",
     "description": "基于工作流的 N 面板筛选与自定义脚本模块工具 / Workflow panel filter and script module manager",
     "category": "3D View",
 }
 
-__version__ = (0, 7, 2)
+__version__ = (0, 9, 1)
 
 import json
+import csv
 import hashlib
 import inspect
 import os
 import re
 import shutil
 import subprocess
+import sys
 import time
+import ctypes
 import traceback
 import uuid
+import tempfile
+import zipfile
 from datetime import datetime
 
 import bpy
@@ -62,15 +67,21 @@ from .native_reference import BWFLOW_OT_native_reference_cleanup, BWFLOW_OT_nati
 WORKFLOW_CATEGORY = "Go工作流"
 SCHEMA_VERSION = 5
 CURRENT_WORKFLOW_PRESET_KIND = "active_workflow"
-PRESET_FILE_EXTENSION = ".goworkflow"
-PRESET_FILE_FILTER = "*.goworkflow"
-LEGACY_PRESET_FILE_FILTER = "*.bworkflow"
+PRESET_FILE_EXTENSION = ".gwpreset"
+PRESET_FILE_FILTER = "*.gwpreset"
+LEGACY_PRESET_FILE_FILTER = "*.goworkflow;*.goworkflow.zip;*.bworkflow"
 SCRIPT_LIBRARY_DOC_URL = "https://docs.qq.com/sheet/DRUNEZ0RFUXdtU2FS"
 WORKFLOW_SWITCHER_COLUMNS = 4
-AI_DOC_MAX_CHARS = 6200
+AI_DOC_LEGACY_MAX_CHARS = 6200
 AI_DOC_DESCRIPTION_MAX_CHARS = 900
+MAX_RNA_TEXT_CHARS = 256 * 1024
+MAX_RNA_SHORT_TEXT_CHARS = 4096
+MAX_RNA_NAME_CHARS = 512
+MAX_PRESET_IMPORT_RNA_TEXT_CHARS = 2048
 UI_LABEL_MAX_CHARS = 56
 UI_BUTTON_MAX_CHARS = 24
+PANEL_GROUP_DRAW_LIMIT = 12
+SELECTED_PANEL_GROUP_DRAW_LIMIT = 12
 MAX_PRESET_FILE_BYTES = 50 * 1024 * 1024
 MAX_GLOBAL_STATE_FILE_BYTES = 12 * 1024 * 1024
 DEFAULT_WORKFLOW_NAME = "默认工作流"
@@ -107,6 +118,10 @@ PANEL_CLASS_REGISTRY_BY_SPACE = {}
 PANEL_POLL_CALLERS = {}
 PANEL_POLL_ORIGINALS = {}
 PANEL_POLL_TARGETS = {}
+PANEL_POLL_ERROR_KEYS = set()
+PANEL_DRAW_ORIGINALS = {}
+PANEL_DRAW_HEADER_ORIGINALS = {}
+PANEL_DRAW_ERROR_KEYS = set()
 PANEL_BL_ORDER_ORIGINALS = {}
 UNREGISTERED_PANEL_IDS = set()
 ACTIVE_ALLOWED_PANEL_IDS_BY_SPACE = {}
@@ -115,15 +130,30 @@ PANEL_REGISTRY_LOOKUP_CACHE_BY_SPACE = {}
 PANEL_LIBRARY_GROUPS_CACHE_BY_SPACE = {}
 PANEL_LIBRARY_GROUP_ENTRY_CACHE_BY_SPACE = {}
 SELECTED_PANEL_GROUPS_CACHE_BY_SPACE = {}
+SELECTED_PANEL_GROUP_SUMMARY_CACHE_BY_SPACE = {}
+PANEL_VISIBILITY_DATA_CACHE_BY_SPACE = {}
+WORKFLOW_FAMILY_ORDER_GROUPS_CACHE_BY_SPACE = {}
+PANEL_GROUP_FILTER_CACHE_BY_SPACE = {}
+PANEL_DRAWER_ROOT_CACHE_BY_SPACE = {}
+WORKFLOW_MISSING_PANEL_IDS_CACHE_BY_SPACE = {}
+WORKFLOW_MISSING_RECORDS_CACHE_BY_SPACE = {}
+RUNTIME_HIDDEN_PANEL_IDS_CACHE_BY_SPACE = {}
 PANEL_ORDER_SIGNATURE_BY_SPACE = {}
 PANEL_FILTER_SIGNATURE_BY_SPACE = {}
 FILE_TEXT_CACHE = {}
 FILE_JSON_CACHE = {}
+IMAGE_PREVIEW_ICON_CACHE = {}
+PRESET_IMPORT_ENTRY_CACHE = {}
+IMPORTED_WORKFLOW_PANEL_MATCH_CACHE = {}
+IMPORTED_WORKFLOW_MISSING_MATCH_CACHE = {}
 BUILTIN_SCRIPT_LIBRARY_PAYLOAD_CACHE = {"signature": None, "payloads": []}
 LOAD_HANDLER_REGISTERED = False
 IS_INITIALIZING_ADDON = False
 PANEL_POLL_MISSING = object()
 PANEL_BL_ORDER_MISSING = object()
+BROKEN_PANEL_POLL_IDS = {
+    "SPIO_PT_PrefPanel",
+}
 DEFERRED_REFRESH_INTERVALS = (0.25,)
 DEFERRED_REFRESH_TOKENS = {}
 DEFERRED_REFRESH_PENDING_KEYS = set()
@@ -133,6 +163,11 @@ DOUBLE_CLICK_SECONDS = 1.0
 DOUBLE_CLICK_CLICK_COUNT = 2
 TRACKED_ONE_SHOT_TIMER_CALLBACKS = set()
 MODULE_RUNTIME_CLEANUP_CACHE = {}
+MODULE_RUNTIME_NAMESPACE_CACHE = {}
+MODULE_SOURCE_TEXT_CACHE = {}
+MODULE_RUNTIME_FIELD_INIT_CACHE = {}
+CACHED_MODULE_STATE_PROXY_CLASS = None
+CACHED_MODULE_PANEL_API_CLASS = None
 BUILTIN_DEFAULT_PANEL_PREFIXES = (
     "bl_ui.",
     "bpy_types",
@@ -203,6 +238,7 @@ SUSPICIOUS_TEXT_TOKENS = (
     "\u95bc?",
     "\u93bc?",
     "\u9353?",
+    "\u9418?",
 )
 
 
@@ -232,7 +268,17 @@ def _cancel_tracked_one_shot_timers():
 
 
 def module_runtime_cleanup_cache_key(scene, workflow, module):
-    return (id(scene) if scene is not None else 0, id(workflow) if workflow is not None else 0, id(module) if module is not None else 0)
+    """用稳定的字符串键替代 id()，因为 Blender CollectionProperty 迭代
+    每次返回新的 Python 包装器，id() 不跨帧稳定，导致缓存全部 miss。
+    """
+    scene_id = getattr(scene, "as_pointer", lambda: 0)() if scene is not None else 0
+    wf_id = getattr(workflow, "name", "") if workflow is not None else ""
+    mod_id = getattr(module, "name", "") if module is not None else ""
+    return (str(scene_id), str(wf_id), str(mod_id))
+
+
+def module_runtime_namespace_cache_key(scene, workflow, module, name):
+    return module_runtime_cleanup_cache_key(scene, workflow, module) + (str(name or ""),)
 
 
 def cache_module_runtime_cleanup(scene, workflow, module, cleanup_fn, module_state=None):
@@ -280,6 +326,11 @@ def builtin_default_panel_category(panel_id):
 
 def is_builtin_default_panel_name(panel_id):
     return panel_id in BUILTIN_PANEL_CATEGORY_MAP
+
+
+def is_builtin_foundation_panel_id(panel_id, space_type=None):
+    category = builtin_default_panel_category(panel_id)
+    return category in {"Tool", "View"}
 
 
 def discover_sidebar_panels(space_type="VIEW_3D"):
@@ -439,6 +490,55 @@ def panel_plugin_key(panel_id):
     return panel_plugin_key_from_module(getattr(cls, "__module__", ""))
 
 
+def addon_version_from_module_name(module_name):
+    module_name = str(module_name or "").strip()
+    if not module_name:
+        return ""
+    candidates = [module_name]
+    parts = [part for part in module_name.split(".") if part]
+    if parts:
+        candidates.append(parts[0])
+    plugin_key = panel_plugin_key_from_module(module_name)
+    if plugin_key:
+        candidates.append(plugin_key)
+    try:
+        addon_keys = list(bpy.context.preferences.addons.keys())
+    except Exception:
+        addon_keys = []
+    candidates.extend(addon_keys)
+    seen = set()
+    for candidate in candidates:
+        candidate = str(candidate or "").strip()
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        addon = None
+        try:
+            addon = bpy.context.preferences.addons.get(candidate)
+        except Exception:
+            addon = None
+        module = getattr(addon, "module", None) if addon is not None else None
+        if module is None:
+            module = sys.modules.get(candidate)
+        if module is None and plugin_key and candidate in addon_keys and (
+            candidate == plugin_key or candidate.endswith("." + plugin_key)
+        ):
+            module = getattr(bpy.context.preferences.addons.get(candidate), "module", None)
+        bl_info = getattr(module, "bl_info", None)
+        if isinstance(bl_info, dict):
+            version_text = version_tuple_to_text(bl_info.get("version", ()))
+            if version_text:
+                return version_text
+    return ""
+
+
+def runtime_panel_addon_version(panel_id, space_type=None):
+    cls = get_panel_registry(space_type).get(panel_id) or get_panel_cache(space_type).get(panel_id)
+    if cls is None:
+        return ""
+    return addon_version_from_module_name(getattr(cls, "__module__", ""))
+
+
 def infer_plugin_key_from_panel_id(panel_id):
     value = (panel_id or "").strip()
     if not value:
@@ -571,16 +671,11 @@ def panel_component_key(title):
 def panel_group_index_signature(state, space_type):
     if state is None:
         return ()
-    return tuple(
-        (
-            record.panel_id,
-            record.title,
-            record.category,
-            record.source_module,
-            bool(record.discovered),
-            panel_parent_id(record.panel_id, space_type=space_type),
-        )
-        for record in getattr(state, "panel_registry", [])
+    registry = getattr(state, "panel_registry", [])
+    return (
+        space_type,
+        len(registry),
+        getattr(state, "panel_registry_index", 0),
     )
 
 
@@ -664,12 +759,10 @@ def get_panel_group_index(state):
 def panel_registry_lookup_signature(state):
     if state is None:
         return ()
-    return tuple(
-        (
-            record.panel_id,
-            bool(record.discovered),
-        )
-        for record in getattr(state, "panel_registry", [])
+    registry = getattr(state, "panel_registry", [])
+    return (
+        len(registry),
+        getattr(state, "panel_registry_index", 0),
     )
 
 
@@ -689,6 +782,17 @@ def selected_panel_groups_signature(state, workflow):
         panel_registry_lookup_signature(state),
         workflow_panel_membership_signature(workflow),
         clamp_index(getattr(workflow, "active_panel_index", 0), len(getattr(workflow, "panels", []))) if workflow is not None else 0,
+    )
+
+
+def selected_panel_group_summary_signature(state, workflow):
+    if state is None:
+        return ()
+    return (
+        panel_registry_lookup_signature(state),
+        workflow_panel_membership_signature(workflow),
+        clamp_index(getattr(workflow, "active_panel_index", 0), len(getattr(workflow, "panels", []))) if workflow is not None else 0,
+        "summary",
     )
 
 
@@ -822,6 +926,33 @@ def get_panel_registry(space_type=None):
     return PANEL_CLASS_REGISTRY_BY_SPACE.get(space_type or "VIEW_3D", {})
 
 
+def runtime_hidden_panel_ids(space_type=None):
+    if space_type is None:
+        return set(UNREGISTERED_PANEL_IDS)
+    signature = (
+        tuple(sorted(UNREGISTERED_PANEL_IDS)),
+        len(get_panel_cache(space_type)),
+        len(get_panel_registry(space_type)),
+    )
+    cached = RUNTIME_HIDDEN_PANEL_IDS_CACHE_BY_SPACE.get(space_type)
+    if cached is not None and cached.get("signature") == signature:
+        return set(cached.get("ids", ()))
+    cache = get_panel_cache(space_type)
+    registry = get_panel_registry(space_type)
+    hidden_ids = set()
+    for panel_id in UNREGISTERED_PANEL_IDS:
+        cls = cache.get(panel_id) or registry.get(panel_id)
+        if cls is None:
+            cls = resolve_panel_class_anywhere(panel_id, space_type=space_type)
+        if cls is not None and getattr(cls, "bl_space_type", None) == space_type:
+            hidden_ids.add(panel_id)
+    RUNTIME_HIDDEN_PANEL_IDS_CACHE_BY_SPACE[space_type] = {
+        "signature": signature,
+        "ids": tuple(hidden_ids),
+    }
+    return hidden_ids
+
+
 def iter_registries(space_type=None):
     if space_type:
         yield space_type, get_panel_registry(space_type)
@@ -875,17 +1006,29 @@ def iter_available_scenes():
         return []
 
 
-def tag_redraw_all():
+def tag_redraw_all(space_type=None):
     wm = getattr(bpy.context, "window_manager", None)
     if wm is None:
         return
+    target_spaces = set(iter_supported_space_types()) if space_type is None else {space_type}
     for window in wm.windows:
         screen = window.screen
         if screen is None:
             continue
         for area in screen.areas:
-            if area.type in SUPPORTED_SPACE_TYPES:
+            if area.type in target_spaces:
                 area.tag_redraw()
+
+
+def tag_redraw_context_area(context=None):
+    area = getattr(context or bpy.context, "area", None)
+    if area is None:
+        return False
+    try:
+        area.tag_redraw()
+        return True
+    except Exception:
+        return False
 
 
 def clamp_index(index, size):
@@ -1000,6 +1143,7 @@ def workflow_signature(workflow):
         bool(getattr(workflow, "is_default", False)),
         getattr(workflow, "description", ""),
         getattr(workflow, "tag_filter", ""),
+        bool(getattr(workflow, "missing_warning_dismissed", False)),
         tuple(unique_panel_ids(item.panel_id for item in getattr(workflow, "panels", []))),
         tuple(workflow_module_signature(module) for module in getattr(workflow, "modules", [])),
     )
@@ -1008,9 +1152,15 @@ def workflow_signature(workflow):
 def workflow_panel_membership_signature(workflow):
     if workflow is None:
         return ()
+    panels = getattr(workflow, "panels", [])
+    first_panel_id = panels[0].panel_id if panels else ""
+    last_panel_id = panels[-1].panel_id if panels else ""
     return (
         bool(getattr(workflow, "is_default", False)),
-        tuple(unique_panel_ids(item.panel_id for item in getattr(workflow, "panels", []))),
+        len(panels),
+        getattr(workflow, "active_panel_index", 0),
+        first_panel_id,
+        last_panel_id,
     )
 
 
@@ -1032,6 +1182,7 @@ def dedupe_panel_registry(state):
             "category": item.category,
             "tags": item.tags,
             "source_module": item.source_module,
+            "addon_version": getattr(item, "addon_version", ""),
             "discovered": bool(item.discovered),
         }
         if panel_id not in seen:
@@ -1042,7 +1193,7 @@ def dedupe_panel_registry(state):
         existing = seen[panel_id]
         if payload["discovered"]:
             existing["discovered"] = True
-        for key in ("title", "category", "tags", "source_module"):
+        for key in ("title", "category", "tags", "source_module", "addon_version"):
             if not existing.get(key) and payload.get(key):
                 existing[key] = payload[key]
 
@@ -1061,6 +1212,7 @@ def dedupe_panel_registry(state):
         item.category = payload["category"]
         item.tags = payload["tags"]
         item.source_module = payload["source_module"]
+        item.addon_version = payload.get("addon_version", "")
         item.discovered = payload["discovered"]
 
     state.panel_registry_index = 0
@@ -1118,6 +1270,7 @@ def dedupe_workflows(state):
                 "is_default": workflow.is_default,
                 "description": workflow.description,
                 "tag_filter": workflow.tag_filter,
+                "missing_warning_dismissed": bool(getattr(workflow, "missing_warning_dismissed", False)),
                 "panels": [item.panel_id for item in workflow.panels],
                 "modules": [
                     {
@@ -1146,6 +1299,7 @@ def dedupe_workflows(state):
         workflow.is_default = workflow_data["is_default"]
         workflow.description = workflow_data["description"]
         workflow.tag_filter = workflow_data["tag_filter"]
+        workflow.missing_warning_dismissed = bool(workflow_data.get("missing_warning_dismissed", False))
         for panel_id in workflow_data["panels"]:
             item = workflow.panels.add()
             item.panel_id = panel_id
@@ -1154,7 +1308,7 @@ def dedupe_workflows(state):
             module.name = module_data["name"]
             module.enabled = module_data["enabled"]
             module.use_custom_panel = module_data["use_custom_panel"]
-            module.runtime_panel_expanded = module_data.get("runtime_panel_expanded", True)
+            module.runtime_panel_expanded = module_data.get("runtime_panel_expanded", not module_prefers_collapsed_runtime_panel(module_data))
             module.panel_title = module_data["panel_title"]
             module.panel_description = module_data["panel_description"]
             module.script_path = module_data["script_path"]
@@ -1255,6 +1409,10 @@ def validate_panel_registry_against_runtime(state, space_type=None, prune_missin
             "category": panel_display_category(panel_id, runtime_cls, space_type=target_space) if runtime_cls is not None else item.category,
             "tags": item.tags,
             "source_module": getattr(runtime_cls, "__module__", "") if runtime_cls is not None else item.source_module,
+            "addon_version": max_version_text(
+                getattr(item, "addon_version", ""),
+                addon_version_from_module_name(getattr(runtime_cls, "__module__", "")) if runtime_cls is not None else "",
+            ),
             "discovered": runtime_cls is not None,
         }
 
@@ -1268,7 +1426,7 @@ def validate_panel_registry_against_runtime(state, space_type=None, prune_missin
         changed = True
         if payload["discovered"]:
             existing["discovered"] = True
-        for key in ("title", "category", "tags", "source_module"):
+        for key in ("title", "category", "tags", "source_module", "addon_version"):
             if not existing.get(key) and payload.get(key):
                 existing[key] = payload[key]
 
@@ -1285,6 +1443,7 @@ def validate_panel_registry_against_runtime(state, space_type=None, prune_missin
                 "category": panel_display_category(panel_id, runtime_cls, space_type=target_space),
                 "tags": "",
                 "source_module": getattr(runtime_cls, "__module__", ""),
+                "addon_version": addon_version_from_module_name(getattr(runtime_cls, "__module__", "")),
                 "discovered": True,
             }
         )
@@ -1308,6 +1467,7 @@ def validate_panel_registry_against_runtime(state, space_type=None, prune_missin
         item.category = payload["category"]
         item.tags = payload["tags"]
         item.source_module = payload["source_module"]
+        item.addon_version = payload.get("addon_version", "")
         item.discovered = payload["discovered"]
 
     state.panel_registry_index = 0
@@ -1326,14 +1486,20 @@ def validate_panel_registry_against_runtime(state, space_type=None, prune_missin
     }
 
 
-def coerce_text_value(value, fallback=""):
+def coerce_text_value(value, fallback="", max_chars=None):
     if value is None:
         return fallback
     if isinstance(value, str):
-        return value
-    if isinstance(value, (int, float, bool)):
-        return str(value)
-    return fallback
+        text = value
+    elif isinstance(value, (int, float, bool)):
+        text = str(value)
+    else:
+        return fallback
+    text = text.replace("\x00", "")
+    text = "".join(ch for ch in text if ch in "\t\r\n" or ord(ch) >= 32)
+    if max_chars is not None and max_chars >= 0 and len(text) > max_chars:
+        return text[:max_chars]
+    return text
 
 
 def coerce_bool_value(value, fallback=False):
@@ -1365,6 +1531,46 @@ def coerce_int_value(value, fallback=0):
     return fallback
 
 
+def coerce_version_tuple(value):
+    if isinstance(value, (tuple, list)):
+        result = []
+        for item in value:
+            try:
+                result.append(int(item))
+            except Exception:
+                break
+        return tuple(result)
+    if isinstance(value, str):
+        parts = re.findall(r"\d+", value)
+        return tuple(int(part) for part in parts)
+    return ()
+
+
+def version_tuple_to_text(value):
+    version = coerce_version_tuple(value)
+    return ".".join(str(part) for part in version)
+
+
+def compare_version_tuples(current, required):
+    current = coerce_version_tuple(current)
+    required = coerce_version_tuple(required)
+    if not current or not required:
+        return 0
+    length = max(len(current), len(required))
+    current = current + (0,) * (length - len(current))
+    required = required + (0,) * (length - len(required))
+    return (current > required) - (current < required)
+
+
+def max_version_text(*values):
+    best = ()
+    for value in values:
+        version = coerce_version_tuple(value)
+        if version and (not best or compare_version_tuples(version, best) > 0):
+            best = version
+    return version_tuple_to_text(best)
+
+
 def coerce_list_value(value):
     if isinstance(value, list):
         return value
@@ -1377,19 +1583,39 @@ def coerce_dict_value(value):
     return value if isinstance(value, dict) else {}
 
 
+def sanitize_panel_match_payload(match_data):
+    if not isinstance(match_data, dict):
+        return None
+    panel_id = coerce_text_value(match_data.get("panel_id", ""), max_chars=MAX_RNA_NAME_CHARS).strip()
+    if not panel_id:
+        return None
+    return {
+        "panel_id": panel_id,
+        "title": clean_panel_title(coerce_text_value(match_data.get("title", ""), max_chars=MAX_RNA_NAME_CHARS), panel_id),
+        "category": coerce_text_value(match_data.get("category", ""), max_chars=MAX_RNA_NAME_CHARS),
+        "source_module": coerce_text_value(match_data.get("source_module", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS),
+        "addon_version": version_tuple_to_text(match_data.get("addon_version", "")),
+        "plugin_key": coerce_text_value(match_data.get("plugin_key", ""), max_chars=MAX_RNA_NAME_CHARS),
+        "plugin_title": coerce_text_value(match_data.get("plugin_title", ""), max_chars=MAX_RNA_NAME_CHARS),
+    }
+
+
 def sanitize_module_payload(module_data):
     if not isinstance(module_data, dict):
         return None
     return {
-        "name": normalize_workflow_name(coerce_text_value(module_data.get("name", "")), "默认脚本模板"),
+        "name": normalize_workflow_name(coerce_text_value(module_data.get("name", ""), max_chars=MAX_RNA_NAME_CHARS), "默认脚本模板"),
         "enabled": coerce_bool_value(module_data.get("enabled", True), True),
         "use_custom_panel": coerce_bool_value(module_data.get("use_custom_panel", False), False),
-        "runtime_panel_expanded": coerce_bool_value(module_data.get("runtime_panel_expanded", True), True),
-        "panel_title": normalize_text_value(coerce_text_value(module_data.get("panel_title", "")), ""),
-        "panel_description": normalize_text_value(coerce_text_value(module_data.get("panel_description", "")), ""),
-        "script_path": coerce_text_value(module_data.get("script_path", "")),
-        "description": normalize_text_value(coerce_text_value(module_data.get("description", "")), ""),
-        "text_block_name": normalize_text_value(coerce_text_value(module_data.get("text_block_name", "")), ""),
+        "runtime_panel_expanded": coerce_bool_value(
+            module_data.get("runtime_panel_expanded", not module_prefers_collapsed_runtime_panel(module_data)),
+            not module_prefers_collapsed_runtime_panel(module_data),
+        ),
+        "panel_title": normalize_text_value(coerce_text_value(module_data.get("panel_title", ""), max_chars=MAX_RNA_NAME_CHARS), ""),
+        "panel_description": normalize_text_value(coerce_text_value(module_data.get("panel_description", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS), ""),
+        "script_path": coerce_text_value(module_data.get("script_path", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS),
+        "description": normalize_text_value(coerce_text_value(module_data.get("description", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS), ""),
+        "text_block_name": normalize_text_value(coerce_text_value(module_data.get("text_block_name", ""), max_chars=MAX_RNA_NAME_CHARS), ""),
         "script_source": coerce_text_value(module_data.get("script_source", "")),
         "config_payload": coerce_text_value(module_data.get("config_payload", "")),
         "ai_doc": coerce_text_value(module_data.get("ai_doc", "")),
@@ -1400,14 +1626,14 @@ def sanitize_script_library_payload(item_data):
     if not isinstance(item_data, dict):
         return None
     return {
-        "name": normalize_workflow_name(coerce_text_value(item_data.get("name", "")), "脚本模板"),
-        "description": normalize_text_value(coerce_text_value(item_data.get("description", "")), ""),
-        "tags": coerce_text_value(item_data.get("tags", "")),
+        "name": normalize_workflow_name(coerce_text_value(item_data.get("name", ""), max_chars=MAX_RNA_NAME_CHARS), "脚本模板"),
+        "description": normalize_text_value(coerce_text_value(item_data.get("description", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS), ""),
+        "tags": coerce_text_value(item_data.get("tags", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS),
         "use_custom_panel": coerce_bool_value(item_data.get("use_custom_panel", False), False),
-        "panel_title": normalize_text_value(coerce_text_value(item_data.get("panel_title", "")), ""),
-        "panel_description": normalize_text_value(coerce_text_value(item_data.get("panel_description", "")), ""),
-        "script_path": coerce_text_value(item_data.get("script_path", "")),
-        "text_block_name": normalize_text_value(coerce_text_value(item_data.get("text_block_name", "")), ""),
+        "panel_title": normalize_text_value(coerce_text_value(item_data.get("panel_title", ""), max_chars=MAX_RNA_NAME_CHARS), ""),
+        "panel_description": normalize_text_value(coerce_text_value(item_data.get("panel_description", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS), ""),
+        "script_path": coerce_text_value(item_data.get("script_path", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS),
+        "text_block_name": normalize_text_value(coerce_text_value(item_data.get("text_block_name", ""), max_chars=MAX_RNA_NAME_CHARS), ""),
         "script_source": coerce_text_value(item_data.get("script_source", "")),
         "config_payload": coerce_text_value(item_data.get("config_payload", "")),
         "ai_doc": coerce_text_value(item_data.get("ai_doc", "")),
@@ -1418,11 +1644,17 @@ def sanitize_workflow_payload(workflow_data):
     if not isinstance(workflow_data, dict):
         return None
     return {
-        "name": normalize_workflow_name(coerce_text_value(workflow_data.get("name", "")), "自定义工作流"),
+        "name": normalize_workflow_name(coerce_text_value(workflow_data.get("name", ""), max_chars=MAX_RNA_NAME_CHARS), "自定义工作流"),
         "is_default": coerce_bool_value(workflow_data.get("is_default", False), False),
-        "description": normalize_workflow_description(coerce_text_value(workflow_data.get("description", "")), ""),
-        "tag_filter": coerce_text_value(workflow_data.get("tag_filter", "")),
-        "panels": unique_panel_ids(coerce_text_value(panel_id) for panel_id in coerce_list_value(workflow_data.get("panels", []))),
+        "description": normalize_workflow_description(coerce_text_value(workflow_data.get("description", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS), ""),
+        "tag_filter": coerce_text_value(workflow_data.get("tag_filter", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS),
+        "missing_warning_dismissed": coerce_bool_value(workflow_data.get("missing_warning_dismissed", False), False),
+        "panels": unique_panel_ids(coerce_text_value(panel_id, max_chars=MAX_RNA_NAME_CHARS) for panel_id in coerce_list_value(workflow_data.get("panels", []))),
+        "panel_matches": [
+            match_payload
+            for match_payload in (sanitize_panel_match_payload(item) for item in coerce_list_value(workflow_data.get("panel_matches", [])))
+            if match_payload is not None
+        ],
         "modules": [
             module_payload
             for module_payload in (sanitize_module_payload(item) for item in coerce_list_value(workflow_data.get("modules", [])))
@@ -1440,15 +1672,16 @@ def sanitize_space_payload(space_payload):
     for record_data in coerce_list_value(space_payload.get("panel_registry", [])):
         if not isinstance(record_data, dict):
             continue
-        panel_id = coerce_text_value(record_data.get("panel_id", "")).strip()
+        panel_id = coerce_text_value(record_data.get("panel_id", ""), max_chars=MAX_RNA_NAME_CHARS).strip()
         if not panel_id:
             continue
         payload = {
             "panel_id": panel_id,
-            "title": clean_panel_title(coerce_text_value(record_data.get("title", "")), panel_id),
-            "category": normalize_text_value(coerce_text_value(record_data.get("category", "")), ""),
-            "tags": coerce_text_value(record_data.get("tags", "")),
-            "source_module": normalize_text_value(coerce_text_value(record_data.get("source_module", "")), ""),
+            "title": clean_panel_title(coerce_text_value(record_data.get("title", ""), max_chars=MAX_RNA_NAME_CHARS), panel_id),
+            "category": normalize_text_value(coerce_text_value(record_data.get("category", ""), max_chars=MAX_RNA_NAME_CHARS), ""),
+            "tags": coerce_text_value(record_data.get("tags", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS),
+            "source_module": normalize_text_value(coerce_text_value(record_data.get("source_module", ""), max_chars=MAX_RNA_NAME_CHARS), ""),
+            "addon_version": version_tuple_to_text(record_data.get("addon_version", "")),
         }
         if panel_id not in record_map:
             record_map[panel_id] = payload
@@ -1635,7 +1868,14 @@ def panel_tree_root_id(panel_id, space_type=None):
 
 
 def panel_drawer_root_id(panel_id, space_type=None):
-    return panel_tree_root_id(panel_id, space_type=space_type)
+    target_space = space_type or "VIEW_3D"
+    cache = PANEL_DRAWER_ROOT_CACHE_BY_SPACE.setdefault(target_space, {})
+    cached = cache.get(panel_id)
+    if cached is not None:
+        return cached
+    root_id = panel_tree_root_id(panel_id, space_type=target_space)
+    cache[panel_id] = root_id
+    return root_id
 
 
 def panel_drawer_ids_for_records(records, space_type=None):
@@ -1664,11 +1904,13 @@ def panel_drawer_record(state, drawer_id):
 def panel_drawer_discovered(state, drawer_id):
     if state is None or not drawer_id:
         return False
-    for record in panel_drawer_records(state, drawer_id):
-        if record.discovered:
-            return True
     space_type = getattr(state, "space_type", "VIEW_3D")
-    return drawer_id in get_panel_registry(space_type) or drawer_id in get_panel_cache(space_type)
+    registry = get_panel_registry(space_type)
+    cache = get_panel_cache(space_type)
+    if drawer_id in registry or drawer_id in cache:
+        return True
+    records = get_panel_registry_lookup(state).get("records_by_drawer", {}).get(drawer_id, [])
+    return any(record.discovered for record in records)
 
 
 def panel_drawer_title(state, drawer_id):
@@ -1684,10 +1926,7 @@ def panel_drawer_entry_for_id(state, drawer_id, selected_ids=None, active_panel_
     discovered = panel_drawer_discovered(state, drawer_id)
     index = fallback_index
     if state is not None and record is not None:
-        for item_index, item in enumerate(getattr(state, "panel_registry", [])):
-            if item.panel_id == drawer_id:
-                index = item_index
-                break
+        index = get_panel_registry_lookup(state).get("index_by_id", {}).get(drawer_id, fallback_index)
     title = panel_drawer_title(state, drawer_id)
     if not discovered and record is not None:
         family_title = panel_family_title(state, record)
@@ -1751,7 +1990,9 @@ def build_panel_library_groups(state, workflow):
         return cached
 
     selected_drawer_ids = {cached_drawer_root(panel_id) for panel_id in selected_ids}
-    direct_record_lookup = get_panel_registry_lookup(state)["record_by_id"] if state is not None else {}
+    registry_lookup = get_panel_registry_lookup(state) if state is not None else {}
+    direct_record_lookup = registry_lookup.get("record_by_id", {})
+    records_by_drawer = registry_lookup.get("records_by_drawer", {})
     panel_cache = get_panel_cache(space_type)
     groups = {}
     for index, record in enumerate(registry):
@@ -1784,11 +2025,7 @@ def build_panel_library_groups(state, workflow):
         for drawer_id in drawer_ids:
             record = direct_record_lookup.get(drawer_id)
             if record is None:
-                drawer_records = [
-                    item
-                    for item in registry
-                    if item.panel_id == drawer_id or cached_drawer_root(item.panel_id) == drawer_id
-                ]
+                drawer_records = records_by_drawer.get(drawer_id, [])
                 record = next((item for item in drawer_records if item.discovered), drawer_records[0] if drawer_records else None)
             discovered = bool(record and record.discovered)
             if not discovered:
@@ -1856,6 +2093,64 @@ def set_group_expanded(state, group_key, expanded, selected=False):
 def toggle_group_expanded(state, group_key, selected=False):
     expanded = is_group_expanded(state, group_key, selected=selected)
     set_group_expanded(state, group_key, not expanded, selected=selected)
+
+
+def panel_group_matches_filter(group, filter_text):
+    query = str(filter_text or "").strip().casefold()
+    if not query:
+        return True
+    haystack = " ".join(
+        str(value or "")
+        for value in (
+            group.get("title", ""),
+            group.get("key", ""),
+            " ".join(group.get("drawer_ids", []) or []),
+            group.get("panel_id", ""),
+        )
+    ).casefold()
+    return all(token in haystack for token in query.split())
+
+
+def panel_groups_filter_signature(groups, filter_text):
+    source = list(groups or [])
+    return (
+        str(filter_text or ""),
+        len(source),
+        tuple(group.get("key", "") for group in source),
+    )
+
+
+def filtered_panel_groups(groups, filter_text, cache_key=None):
+    if not cache_key:
+        return [group for group in list(groups or []) if panel_group_matches_filter(group, filter_text)]
+    signature = panel_groups_filter_signature(groups, filter_text)
+    cached = PANEL_GROUP_FILTER_CACHE_BY_SPACE.get(cache_key)
+    if cached is not None and cached.get("signature") == signature:
+        return cached.get("groups", [])
+    result = [group for group in list(groups or []) if panel_group_matches_filter(group, filter_text)]
+    PANEL_GROUP_FILTER_CACHE_BY_SPACE[cache_key] = {"signature": signature, "groups": result}
+    return result
+
+
+def clear_space_prefixed_cache(cache, space_type):
+    prefix = f"{space_type}:"
+    for key in list(cache.keys()):
+        if str(key).startswith(prefix):
+            cache.pop(key, None)
+
+
+def paged_panel_groups(state, groups, prop_name, limit):
+    groups = list(groups or [])
+    limit = max(1, int(limit or 1))
+    page_count = max(1, (len(groups) + limit - 1) // limit)
+    page = clamp_index(int(getattr(state, prop_name, 0) or 0), page_count)
+    if getattr(state, prop_name, 0) != page:
+        try:
+            setattr(state, prop_name, page)
+        except Exception:
+            pass
+    start = page * limit
+    return groups[start : start + limit], page, page_count
 
 
 def clear_panel_library_click_state(state):
@@ -1927,12 +2222,12 @@ def workflow_panel_registry_index(state, workflow, panel_id):
     return -1
 
 
-def build_selected_panel_groups(state, workflow):
+def build_selected_panel_groups_legacy_unused(state, workflow):
     if state is None or workflow is None:
         return []
     cache_key = getattr(state, "space_type", "VIEW_3D")
-    signature = selected_panel_groups_signature(state, workflow)
-    cached = SELECTED_PANEL_GROUPS_CACHE_BY_SPACE.get(cache_key)
+    signature = selected_panel_group_summary_signature(state, workflow)
+    cached = SELECTED_PANEL_GROUP_SUMMARY_CACHE_BY_SPACE.get(cache_key)
     if cached is not None and cached.get("signature") == signature:
         return cached.get("groups", [])
 
@@ -2009,6 +2304,159 @@ def build_selected_panel_groups(state, workflow):
     )
     SELECTED_PANEL_GROUPS_CACHE_BY_SPACE[cache_key] = {"signature": signature, "groups": ordered_groups}
     return ordered_groups
+
+
+def build_selected_panel_groups(state, workflow):
+    if state is None or workflow is None:
+        return []
+    cache_key = getattr(state, "space_type", "VIEW_3D")
+    signature = selected_panel_group_summary_signature(state, workflow)
+    cached = SELECTED_PANEL_GROUP_SUMMARY_CACHE_BY_SPACE.get(cache_key)
+    if cached is not None and cached.get("signature") == signature:
+        return cached.get("groups", [])
+
+    active_panel_id = ""
+    active_drawer_id = ""
+    space_type = getattr(state, "space_type", "VIEW_3D")
+    if workflow.panels:
+        active_index = clamp_index(workflow.active_panel_index, len(workflow.panels))
+        active_panel_id = workflow.panels[active_index].panel_id
+        active_drawer_id = panel_drawer_root_id(active_panel_id, space_type=space_type) or active_panel_id
+
+    groups = {}
+    seen_panel_ids = set()
+    for index, item in enumerate(workflow.panels):
+        panel_id = item.panel_id
+        if not panel_id or panel_id == "BWFLOW_PT_workflow":
+            continue
+        if is_builtin_default_panel_id(panel_id, space_type=space_type):
+            continue
+        if panel_id in seen_panel_ids:
+            continue
+        seen_panel_ids.add(panel_id)
+
+        drawer_id = panel_drawer_root_id(panel_id, space_type=space_type) or panel_id
+        group_key = workflow_group_key_for_panel(state, panel_id)
+        family_title = workflow_family_group_title(state, panel_id)
+        group = groups.setdefault(
+            group_key,
+            {
+                "key": group_key,
+                "title": family_title or "未分类插件",
+                "panel_id": panel_id,
+                "drawer_ids": [],
+                "panel_ids": [],
+                "workflow_indexes": [],
+                "first_index": index,
+                "is_active": False,
+            },
+        )
+        if index < group["first_index"]:
+            group["first_index"] = index
+            group["panel_id"] = panel_id
+        if drawer_id not in group["drawer_ids"]:
+            group["drawer_ids"].append(drawer_id)
+        if panel_id not in group["panel_ids"]:
+            group["panel_ids"].append(panel_id)
+            group["workflow_indexes"].append(index)
+        if panel_id == active_panel_id or drawer_id == active_drawer_id:
+            group["is_active"] = True
+
+    ordered_groups = []
+    for group in groups.values():
+        panel_count = len(group["drawer_ids"])
+        ordered_groups.append(
+            {
+                "key": group["key"],
+                "title": group["title"] or "未分类插件",
+                "panel_id": group["panel_id"],
+                "panel_count": panel_count,
+                "plugin_title": panel_count_label(panel_count),
+                "entries": [],
+                "panel_ids": tuple(group.get("panel_ids", ())),
+                "workflow_indexes": tuple(group.get("workflow_indexes", ())),
+                "first_index": group["first_index"],
+                "is_active": group["is_active"],
+            }
+        )
+
+    ordered_groups.sort(
+        key=lambda item: (
+            item.get("first_index", 999999),
+            item["title"].casefold(),
+            item["key"],
+        )
+    )
+    SELECTED_PANEL_GROUP_SUMMARY_CACHE_BY_SPACE[cache_key] = {"signature": signature, "groups": ordered_groups}
+    return ordered_groups
+
+
+def selected_panel_group_entries(state, workflow, group):
+    if state is None or workflow is None or not isinstance(group, dict):
+        return []
+    group_key = group.get("key", "")
+    if not group_key:
+        return []
+    cache_key = getattr(state, "space_type", "VIEW_3D")
+    signature = (
+        selected_panel_groups_signature(state, workflow),
+        group_key,
+    )
+    group_cache = SELECTED_PANEL_GROUPS_CACHE_BY_SPACE.setdefault(cache_key, {})
+    cached = group_cache.get(group_key)
+    if cached is not None and cached.get("signature") == signature:
+        return [dict(entry) for entry in cached.get("entries", ())]
+
+    active_panel_id = ""
+    if workflow.panels:
+        active_index = clamp_index(workflow.active_panel_index, len(workflow.panels))
+        active_panel_id = workflow.panels[active_index].panel_id
+
+    space_type = getattr(state, "space_type", "VIEW_3D")
+    selected_ids = {item.panel_id for item in workflow.panels}
+    selected_drawer_ids = {
+        panel_drawer_root_id(panel_id, space_type=space_type)
+        for panel_id in selected_ids
+    }
+    selected_lookup_ids = selected_ids.union(selected_drawer_ids)
+    entries = []
+    panel_ids = list(group.get("panel_ids", ()) or ())
+    workflow_indexes = list(group.get("workflow_indexes", ()) or ())
+    if not panel_ids:
+        seen_panel_ids = set()
+        for index, item in enumerate(workflow.panels):
+            panel_id = item.panel_id
+            if not panel_id or panel_id == "BWFLOW_PT_workflow":
+                continue
+            if is_builtin_default_panel_id(panel_id, space_type=space_type):
+                continue
+            if panel_id in seen_panel_ids:
+                continue
+            seen_panel_ids.add(panel_id)
+            if workflow_group_key_for_panel(state, panel_id) != group_key:
+                continue
+            panel_ids.append(panel_id)
+            workflow_indexes.append(index)
+
+    for fallback_pos, panel_id in enumerate(panel_ids):
+        if not panel_id or panel_id == "BWFLOW_PT_workflow":
+            continue
+        if is_builtin_default_panel_id(panel_id, space_type=space_type):
+            continue
+        workflow_index = workflow_indexes[fallback_pos] if fallback_pos < len(workflow_indexes) else workflow_panel_registry_index(state, workflow, panel_id)
+        entry = panel_drawer_entry_for_id(
+            state,
+            panel_id,
+            selected_ids=selected_lookup_ids,
+            active_panel_id=active_panel_id,
+            fallback_index=workflow_index,
+        )
+        entry["workflow_index"] = workflow_index
+        entries.append(entry)
+
+    entries.sort(key=lambda entry: (entry["workflow_index"], entry["title"].casefold(), entry["panel_id"]))
+    group_cache[group_key] = {"signature": signature, "entries": tuple(dict(entry) for entry in entries)}
+    return entries
 
 
 def panel_library_group_entries(state, workflow, group):
@@ -2092,6 +2540,23 @@ def workflow_family_drawer_ids(state, workflow, group_key):
 def workflow_family_order_groups(state, workflow):
     if state is None or workflow is None:
         return []
+    space_type = getattr(state, "space_type", "VIEW_3D")
+    cache_key = f"{space_type}:{getattr(workflow, 'name', '')}"
+    signature = (
+        workflow_panel_membership_signature(workflow),
+        panel_registry_lookup_signature(state),
+    )
+    cached = WORKFLOW_FAMILY_ORDER_GROUPS_CACHE_BY_SPACE.get(cache_key)
+    if cached is not None and cached.get("signature") == signature:
+        return [
+            {
+                "key": group.get("key", ""),
+                "title": group.get("title", ""),
+                "ids": list(group.get("ids", ())),
+                "first_index": group.get("first_index", 0),
+            }
+            for group in cached.get("groups", ())
+        ]
 
     groups = []
     group_map = {}
@@ -2099,7 +2564,7 @@ def workflow_family_order_groups(state, workflow):
         panel_id = item.panel_id
         if panel_id == "BWFLOW_PT_workflow":
             continue
-        if is_builtin_default_panel_id(panel_id, space_type=getattr(state, "space_type", "VIEW_3D")):
+        if is_builtin_default_panel_id(panel_id, space_type=space_type):
             continue
         family_title = workflow_family_group_title(state, panel_id)
         group_key = f"family:{panel_family_key(family_title)}"
@@ -2115,6 +2580,18 @@ def workflow_family_order_groups(state, workflow):
             groups.append(group)
         if panel_id not in group["ids"]:
             group["ids"].append(panel_id)
+    WORKFLOW_FAMILY_ORDER_GROUPS_CACHE_BY_SPACE[cache_key] = {
+        "signature": signature,
+        "groups": tuple(
+            {
+                "key": group.get("key", ""),
+                "title": group.get("title", ""),
+                "ids": tuple(group.get("ids", ())),
+                "first_index": group.get("first_index", 0),
+            }
+            for group in groups
+        ),
+    }
     return groups
 
 
@@ -2194,22 +2671,158 @@ def workflow_missing_panel_ids(state, workflow):
     if state is None or workflow is None:
         return []
 
-    missing_ids = []
     space_type = getattr(state, "space_type", "VIEW_3D")
+    signature = (
+        workflow_panel_membership_signature(workflow),
+        panel_registry_lookup_signature(state),
+        len(get_panel_registry(space_type)),
+        len(get_panel_cache(space_type)),
+        tuple(payload.get("panel_id", "") for payload in imported_workflow_panel_matches(state, workflow)),
+    )
+    cache_key = f"{space_type}:{getattr(workflow, 'name', '')}"
+    cached = WORKFLOW_MISSING_PANEL_IDS_CACHE_BY_SPACE.get(cache_key)
+    if cached is not None and cached.get("signature") == signature:
+        return list(cached.get("missing_ids", ()))
+
+    missing_ids = []
     for panel_id in workflow_explicit_panel_ids(workflow):
         drawer_id = panel_drawer_root_id(panel_id, space_type=space_type)
         if panel_drawer_discovered(state, drawer_id):
             continue
         missing_ids.append(drawer_id or panel_id)
-    return unique_panel_ids(missing_ids)
+    for payload in imported_workflow_missing_panel_matches(state, workflow):
+        panel_id = payload.get("panel_id", "")
+        if panel_id:
+            missing_ids.append(panel_id)
+    result = unique_panel_ids(missing_ids)
+    WORKFLOW_MISSING_PANEL_IDS_CACHE_BY_SPACE[cache_key] = {
+        "signature": signature,
+        "missing_ids": tuple(result),
+    }
+    return result
 
 
 def workflow_missing_records(state, workflow):
+    if bool(getattr(workflow, "missing_warning_dismissed", False)):
+        return []
+    space_type = getattr(state, "space_type", "VIEW_3D") if state is not None else "VIEW_3D"
+    signature = (
+        tuple(workflow_missing_panel_ids(state, workflow)),
+        tuple(payload.get("panel_id", "") for payload in imported_workflow_panel_matches(state, workflow)),
+    )
+    cache_key = f"{space_type}:{getattr(workflow, 'name', '')}"
+    cached = WORKFLOW_MISSING_RECORDS_CACHE_BY_SPACE.get(cache_key)
+    if cached is not None and cached.get("signature") == signature:
+        return list(cached.get("records", ()))
+    match_by_id = imported_panel_match_payload_by_id(state, workflow)
     records = []
     for panel_id in workflow_missing_panel_ids(state, workflow):
         record = panel_drawer_record(state, panel_id) or find_registry_record(state, panel_id)
+        if record is None and panel_id in match_by_id:
+            record = ImportedMissingPanelRecord(match_by_id[panel_id])
+        if record is None:
+            record = ImportedMissingPanelRecord({"panel_id": panel_id})
         records.append(record)
+    WORKFLOW_MISSING_RECORDS_CACHE_BY_SPACE[cache_key] = {
+        "signature": signature,
+        "records": tuple(records),
+    }
     return records
+
+
+def workflow_has_imported_missing_panel_matches(state, workflow):
+    if state is None or workflow is None or getattr(workflow, "is_default", False):
+        return False
+    if not imported_workflow_panel_matches(state, workflow):
+        return False
+    return bool(workflow_missing_panel_ids(state, workflow))
+
+
+def workflow_can_reveal_or_match_missing_panels(state, workflow):
+    if state is None or workflow is None or getattr(workflow, "is_default", False):
+        return False
+    if workflow_has_imported_missing_panel_matches(state, workflow):
+        return True
+    return bool(getattr(workflow, "missing_warning_dismissed", False)) and bool(workflow_missing_panel_ids(state, workflow))
+
+
+def workflow_missing_panel_summary(state, workflows, limit=4):
+    missing_ids = []
+    for workflow in workflows or []:
+        if bool(getattr(workflow, "missing_warning_dismissed", False)):
+            continue
+        missing_ids.extend(workflow_missing_panel_ids(state, workflow))
+    missing_ids = unique_panel_ids(missing_ids)
+    titles = []
+    plugin_hints = []
+    for panel_id in missing_ids[: max(0, int(limit or 0))]:
+        record = panel_drawer_record(state, panel_id) or find_registry_record(state, panel_id)
+        if record is None:
+            for workflow in workflows or []:
+                payload = imported_panel_match_payload_by_id(state, workflow).get(panel_id)
+                if payload:
+                    record = ImportedMissingPanelRecord(payload)
+                    break
+        if record is not None:
+            titles.append(clean_panel_title(getattr(record, "title", ""), getattr(record, "panel_id", panel_id)) or panel_id)
+            source_module = getattr(record, "source_module", "")
+            plugin_key = panel_plugin_key_from_module(source_module)
+            if plugin_key:
+                plugin_hints.append(plugin_key)
+        else:
+            titles.append(panel_id)
+    suffix = ""
+    if titles:
+        suffix = "：" + "、".join(titles)
+        if len(missing_ids) > len(titles):
+            suffix += f" 等 {len(missing_ids)} 个"
+    plugin_hints = sorted(set(plugin_hints))
+    if plugin_hints:
+        suffix += f"；可能缺少插件 {', '.join(plugin_hints[:3])}"
+    return len(missing_ids), suffix
+
+
+def workflow_low_version_plugin_summary(state, workflows, limit=3):
+    if state is None:
+        return 0, ""
+    items = []
+    seen = set()
+    for workflow in workflows or []:
+        for panel_id in workflow_explicit_panel_ids(workflow):
+            drawer_id = panel_drawer_root_id(panel_id, space_type=getattr(state, "space_type", "VIEW_3D")) or panel_id
+            record = panel_drawer_record(state, drawer_id) or find_registry_record(state, drawer_id)
+            if record is None:
+                continue
+            required = coerce_version_tuple(getattr(record, "addon_version", ""))
+            if not required:
+                continue
+            source_module = getattr(record, "source_module", "")
+            current_text = addon_version_from_module_name(source_module)
+            current = coerce_version_tuple(current_text)
+            if not current or compare_version_tuples(current, required) >= 0:
+                continue
+            plugin_key = panel_plugin_key_from_module(source_module) or source_module or drawer_id
+            key = (plugin_key, current, required)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(
+                f"{plugin_key} {version_tuple_to_text(current)} < {version_tuple_to_text(required)}"
+            )
+    if not items:
+        return 0, ""
+    shown = items[: max(0, int(limit or 0))]
+    suffix = "；插件版本偏低：" + "、".join(shown)
+    if len(items) > len(shown):
+        suffix += f" 等 {len(items)} 个"
+    return len(items), suffix
+
+
+def finish_current_space_preset_import(context, state, imported_workflows):
+    mark_imported_preset_data_dirty(state, scene=context.scene, context=context)
+    missing_count, missing_suffix = workflow_missing_panel_summary(state, imported_workflows)
+    low_version_count, low_version_suffix = workflow_low_version_plugin_summary(state, imported_workflows)
+    return missing_count, missing_suffix, low_version_count, low_version_suffix
 
 
 def workflow_effective_panel_count(state, workflow):
@@ -2445,6 +3058,78 @@ def replace_workflow_groups(workflow, groups, active_panel_id=""):
         set_active_workflow_panel_by_id(workflow, active_panel_id)
 
 
+def mark_panel_order_pending(state, scene=None, context=None):
+    if state is None:
+        return
+    space_type = getattr(state, "space_type", "VIEW_3D")
+    PANEL_VISIBILITY_DATA_CACHE_BY_SPACE.pop(space_type, None)
+    PANEL_LIBRARY_GROUPS_CACHE_BY_SPACE.pop(space_type, None)
+    PANEL_GROUP_FILTER_CACHE_BY_SPACE.pop(f"{space_type}:library", None)
+    PANEL_GROUP_FILTER_CACHE_BY_SPACE.pop(f"{space_type}:selected", None)
+    clear_space_prefixed_cache(WORKFLOW_MISSING_PANEL_IDS_CACHE_BY_SPACE, space_type)
+    clear_space_prefixed_cache(WORKFLOW_MISSING_RECORDS_CACHE_BY_SPACE, space_type)
+    SELECTED_PANEL_GROUPS_CACHE_BY_SPACE.pop(space_type, None)
+    SELECTED_PANEL_GROUP_SUMMARY_CACHE_BY_SPACE.pop(space_type, None)
+    clear_space_prefixed_cache(WORKFLOW_FAMILY_ORDER_GROUPS_CACHE_BY_SPACE, space_type)
+    PANEL_FILTER_SIGNATURE_BY_SPACE.pop(space_type, None)
+    state.panel_order_pending_apply = False
+    workflow = get_active_workflow(state)
+    if workflow is not None and not workflow.is_default:
+        ordered_ids = workflow_ordered_panel_ids(state, workflow)
+        apply_panel_order_overrides(ordered_ids, space_type=space_type)
+    if scene is not None:
+        save_global_workflow_state(scene)
+    if not tag_redraw_context_area(context):
+        tag_redraw_all(space_type=space_type)
+
+
+def mark_panel_visibility_pending(state, scene=None, context=None):
+    if state is None:
+        return
+    space_type = getattr(state, "space_type", "VIEW_3D")
+    state.panel_visibility_pending_apply = False
+    state.panel_order_pending_apply = False
+    PANEL_LIBRARY_GROUPS_CACHE_BY_SPACE.pop(space_type, None)
+    PANEL_GROUP_FILTER_CACHE_BY_SPACE.pop(f"{space_type}:library", None)
+    PANEL_GROUP_FILTER_CACHE_BY_SPACE.pop(f"{space_type}:selected", None)
+    clear_space_prefixed_cache(WORKFLOW_MISSING_PANEL_IDS_CACHE_BY_SPACE, space_type)
+    clear_space_prefixed_cache(WORKFLOW_MISSING_RECORDS_CACHE_BY_SPACE, space_type)
+    SELECTED_PANEL_GROUPS_CACHE_BY_SPACE.pop(space_type, None)
+    SELECTED_PANEL_GROUP_SUMMARY_CACHE_BY_SPACE.pop(space_type, None)
+    clear_space_prefixed_cache(WORKFLOW_FAMILY_ORDER_GROUPS_CACHE_BY_SPACE, space_type)
+    PANEL_VISIBILITY_DATA_CACHE_BY_SPACE.pop(space_type, None)
+    apply_panel_visibility_overrides(
+        scene=scene,
+        space_type=space_type,
+        restore_first=False,
+        install_poll=True,
+        repair_callbacks=False,
+    )
+    if scene is not None:
+        save_global_workflow_state(scene)
+    if not tag_redraw_context_area(context):
+        tag_redraw_all(space_type=space_type)
+
+
+def mark_imported_preset_data_dirty(state, scene=None, context=None):
+    if state is None:
+        return
+    space_type = getattr(state, "space_type", "VIEW_3D")
+    PANEL_LIBRARY_GROUPS_CACHE_BY_SPACE.pop(space_type, None)
+    PANEL_GROUP_FILTER_CACHE_BY_SPACE.pop(f"{space_type}:library", None)
+    PANEL_GROUP_FILTER_CACHE_BY_SPACE.pop(f"{space_type}:selected", None)
+    clear_space_prefixed_cache(WORKFLOW_MISSING_PANEL_IDS_CACHE_BY_SPACE, space_type)
+    clear_space_prefixed_cache(WORKFLOW_MISSING_RECORDS_CACHE_BY_SPACE, space_type)
+    SELECTED_PANEL_GROUPS_CACHE_BY_SPACE.pop(space_type, None)
+    SELECTED_PANEL_GROUP_SUMMARY_CACHE_BY_SPACE.pop(space_type, None)
+    clear_space_prefixed_cache(WORKFLOW_FAMILY_ORDER_GROUPS_CACHE_BY_SPACE, space_type)
+    PANEL_VISIBILITY_DATA_CACHE_BY_SPACE.pop(space_type, None)
+    PANEL_FILTER_SIGNATURE_BY_SPACE.pop(space_type, None)
+    if scene is not None:
+        save_global_workflow_state(scene)
+    tag_redraw_context_area(context)
+
+
 def normalize_workflow_active_panel_index(workflow):
     if workflow is None or not workflow.panels:
         return
@@ -2529,33 +3214,129 @@ def compute_allowed_panel_ids(state):
     workflow = get_active_workflow(state)
     if workflow is None or workflow.is_default:
         return None
-    visible_ids = workflow_visible_panel_ids(state, workflow)
+    return workflow_visibility_data(state, workflow)["allowed_ids"]
+
+
+def workflow_visibility_data_signature(state, workflow):
+    if state is None or workflow is None:
+        return ()
     space_type = getattr(state, "space_type", "VIEW_3D")
-    allowed_ids = expand_panel_family(panel_descendant_ids(visible_ids, space_type=space_type), space_type=space_type)
+    registry = get_panel_registry(space_type)
+    return (
+        panel_registry_lookup_signature(state),
+        workflow_panel_membership_signature(workflow),
+        getattr(workflow, "tag_filter", ""),
+        len(registry),
+        getattr(state, "panel_registry_index", 0),
+    )
+
+
+def workflow_visibility_data(state, workflow):
+    space_type = getattr(state, "space_type", "VIEW_3D") if state is not None else "VIEW_3D"
+    registry = get_panel_registry(space_type)
+    if state is None or workflow is None or workflow.is_default:
+        return {
+            "visible_ids": list(registry.keys()),
+            "allowed_ids": None,
+            "ordered_ids": list(registry.keys()),
+        }
+
+    signature = workflow_visibility_data_signature(state, workflow)
+    cached = PANEL_VISIBILITY_DATA_CACHE_BY_SPACE.get(space_type)
+    if cached is not None and cached.get("signature") == signature:
+        return cached["data"]
+
+    explicit_workflow_ids = [
+        panel_id
+        for panel_id in workflow_panel_order_ids(workflow)
+        if panel_id != "BWFLOW_PT_workflow" and not is_builtin_default_panel_id(panel_id, space_type=space_type)
+    ]
+    panel_order_ids = unique_panel_ids(
+        panel_drawer_root_id(panel_id, space_type=space_type)
+        for panel_id in explicit_workflow_ids
+    )
+    explicit_ids = [panel_id for panel_id in panel_order_ids if panel_id != "BWFLOW_PT_workflow"]
+    auto_ids = [panel_id for panel_id in workflow_auto_tag_panel_ids(state, workflow) if panel_id not in explicit_ids]
+    visible_ids = explicit_ids + auto_ids
+    visible_set = set(visible_ids)
+    allowed_for_order = expand_panel_family(panel_descendant_ids(visible_ids, space_type=space_type), space_type=space_type)
     builtin_ids = {
         panel_id
-        for panel_id, cls in get_panel_registry(space_type).items()
+        for panel_id, cls in registry.items()
         if is_builtin_default_panel_id(panel_id, space_type=space_type)
         and getattr(cls, "bl_region_type", None) == "UI"
     }
-    return allowed_ids.union(builtin_ids)
+    allowed_ids = allowed_for_order.union(builtin_ids)
+
+    preferred_by_drawer = {}
+    for panel_id in explicit_workflow_ids:
+        drawer_id = panel_drawer_root_id(panel_id, space_type=space_type)
+        if drawer_id not in visible_set:
+            continue
+        member_id = ""
+        if panel_id in allowed_for_order and panel_id in registry:
+            member_id = panel_id
+        elif drawer_id in allowed_for_order and drawer_id in registry:
+            member_id = drawer_id
+        if member_id:
+            preferred_by_drawer.setdefault(drawer_id, []).append(member_id)
+
+    lookup = get_panel_registry_lookup(state)
+    ordered_drawer_member_ids = []
+    for drawer_id in visible_ids:
+        preferred_members = preferred_by_drawer.get(drawer_id, [])
+        drawer_records = lookup["records_by_drawer"].get(drawer_id, [])
+        members = [
+            record.panel_id
+            for record in drawer_records
+            if record.panel_id in allowed_for_order and record.panel_id in registry
+        ]
+        if not members and drawer_id in allowed_for_order and drawer_id in registry:
+            members = [drawer_id]
+        members = unique_panel_ids(preferred_members + members)
+        if drawer_id in registry and drawer_id not in members:
+            members.insert(0, drawer_id)
+        ordered_drawer_member_ids.extend(members)
+
+    trailing_ids = [
+        panel_id
+        for panel_id in registry.keys()
+        if panel_id in allowed_for_order and panel_id not in visible_set
+    ]
+    preferred_ids = [panel_id for panel_id in ordered_drawer_member_ids if panel_id in registry]
+    preferred_ids.extend(panel_id for panel_id in trailing_ids if panel_id not in preferred_ids)
+    ordered_ids = ordered_panel_ids_for_register(preferred_ids, space_type=space_type)
+
+    data = {
+        "visible_ids": visible_ids,
+        "allowed_ids": allowed_ids,
+        "ordered_ids": ordered_ids,
+    }
+    PANEL_VISIBILITY_DATA_CACHE_BY_SPACE[space_type] = {"signature": signature, "data": data}
+    return data
 
 
 def panel_filter_signature(state):
     workflow = get_active_workflow(state) if state is not None else None
     if workflow is None or workflow.is_default:
         return None
-    allowed_ids = compute_allowed_panel_ids(state)
+    visibility_data = workflow_visibility_data(state, workflow)
+    allowed_ids = visibility_data["allowed_ids"]
     if allowed_ids is None:
         return None
-    ordered_ids = workflow_ordered_panel_ids(state, workflow)
+    space_type = getattr(state, "space_type", "VIEW_3D")
+    ordered_ids = visibility_data["ordered_ids"]
+    registry_ids = tuple(sorted(get_panel_registry(space_type).keys()))
+    hidden_ids = tuple(sorted(runtime_hidden_panel_ids(space_type)))
     return (
         tuple(sorted(allowed_ids)),
         tuple(ordered_ids),
+        registry_ids,
+        hidden_ids,
     )
 
 
-def workflow_ordered_panel_ids(state, workflow):
+def workflow_ordered_panel_ids_legacy_unused(state, workflow):
     if workflow is None or workflow.is_default:
         return list(get_panel_registry(getattr(state, "space_type", "VIEW_3D")).keys())
 
@@ -2609,6 +3390,12 @@ def workflow_ordered_panel_ids(state, workflow):
     return ordered_panel_ids_for_register(preferred_ids, space_type=space_type)
 
 
+def workflow_ordered_panel_ids(state, workflow):
+    if workflow is None or workflow.is_default:
+        return list(get_panel_registry(getattr(state, "space_type", "VIEW_3D")).keys())
+    return workflow_visibility_data(state, workflow)["ordered_ids"]
+
+
 def clear_panel_filter():
     restore_default_n_panel_state(disable_filters=True)
 
@@ -2629,6 +3416,59 @@ def addon_module_candidates():
     except Exception:
         pass
     return candidates
+
+
+def addon_root_dir():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def addon_package_dir():
+    return os.path.dirname(addon_root_dir())
+
+
+def addon_uninstall_script_path():
+    return os.path.join(tempfile.gettempdir(), "go_workflow_uninstall.cmd")
+
+
+def write_delayed_uninstall_script():
+    package_dir = addon_package_dir()
+    script_path = addon_uninstall_script_path()
+    blender_pid = os.getpid()
+    lines = [
+        "@echo off",
+        "setlocal enableextensions",
+        f"set TARGET={package_dir}",
+        f"set BLENDER_PID={blender_pid}",
+        ":waitloop",
+        "tasklist /FI \"PID eq %BLENDER_PID%\" | find \"%BLENDER_PID%\" >nul",
+        "if not errorlevel 1 (",
+        "  timeout /t 2 /nobreak >nul",
+        "  goto waitloop",
+        ")",
+        "timeout /t 1 /nobreak >nul",
+        "if exist \"%TARGET%\" rmdir /S /Q \"%TARGET%\"",
+        "endlocal",
+        "del /F /Q \"%~f0\" >nul 2>nul",
+    ]
+    with open(script_path, "w", encoding="mbcs", errors="replace") as handle:
+        handle.write("\r\n".join(lines) + "\r\n")
+    return script_path
+
+
+def launch_delayed_uninstall_script():
+    script_path = write_delayed_uninstall_script()
+    try:
+        subprocess.Popen(
+            ["cmd.exe", "/c", "start", "", "/min", script_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return script_path
+    except Exception:
+        traceback.print_exc()
+        return ""
 
 
 def panel_depth(panel_id, space_type=None):
@@ -2731,6 +3571,18 @@ def call_original_panel_poll(panel_id, cls, context):
     original = PANEL_POLL_ORIGINALS.get(panel_id, PANEL_POLL_MISSING)
     if original is PANEL_POLL_MISSING:
         return True
+    def report_poll_error(exc):
+        if isinstance(exc, TypeError) and "could not find function poll" in str(exc):
+            try:
+                setattr(cls, "poll", classmethod(default_panel_poll))
+            except Exception:
+                pass
+            return
+        key = (panel_id, type(exc).__name__, str(exc))
+        if key not in PANEL_POLL_ERROR_KEYS:
+            PANEL_POLL_ERROR_KEYS.add(key)
+            traceback.print_exc()
+
     try:
         if isinstance(original, classmethod):
             return bool(original.__func__(cls, context))
@@ -2738,6 +3590,12 @@ def call_original_panel_poll(panel_id, cls, context):
             return bool(original.__func__(context))
         return bool(original(cls, context))
     except TypeError:
+        if "could not find function poll" in traceback.format_exc():
+            try:
+                setattr(cls, "poll", classmethod(default_panel_poll))
+            except Exception:
+                pass
+            return True
         try:
             bound = getattr(original, "__get__", None)
             if callable(bound):
@@ -2748,11 +3606,11 @@ def call_original_panel_poll(panel_id, cls, context):
                     except TypeError:
                         pass
             return bool(original(context))
-        except Exception:
-            traceback.print_exc()
+        except Exception as exc:
+            report_poll_error(exc)
             return False
-    except Exception:
-        traceback.print_exc()
+    except Exception as exc:
+        report_poll_error(exc)
         return False
 
 
@@ -2772,20 +3630,189 @@ def default_panel_poll(cls, _context):
     return True
 
 
+def _camera_rig_panel_draw_error_is_safe(exc):
+    if not isinstance(exc, AttributeError):
+        return False
+    text = str(exc or "")
+    return "'NoneType' object has no attribute 'pose'" in text or "'NoneType' object has no attribute 'data'" in text
+
+
+def _safe_panel_draw_wrapper(panel_id, method_name, original):
+    def wrapped(self, context):
+        try:
+            return original(self, context)
+        except Exception as exc:
+            if not _camera_rig_panel_draw_error_is_safe(exc):
+                raise
+            key = (panel_id, method_name, type(exc).__name__, str(exc))
+            if key not in PANEL_DRAW_ERROR_KEYS:
+                PANEL_DRAW_ERROR_KEYS.add(key)
+                print(f"[GoWorkflow] Suppressed panel draw error in {panel_id}.{method_name}: {exc}", file=sys.stderr)
+            return None
+    wrapped.__name__ = getattr(original, "__name__", method_name)
+    wrapped.__doc__ = getattr(original, "__doc__", None)
+    return wrapped
+
+
+def _panel_callback_from_class_dict(cls, name):
+    value = cls.__dict__.get(name)
+    if isinstance(value, (staticmethod, classmethod)):
+        return value.__func__
+    return value
+
+
+def repair_problematic_panel_draw_callbacks(space_type=None):
+    repaired = 0
+    target_space = str(space_type or "").strip()
+    for cls in iter_panel_subclasses(bpy.types.Panel):
+        panel_id = str(getattr(cls, "bl_idname", "") or getattr(cls, "__name__", "") or "")
+        if target_space and str(getattr(cls, "bl_space_type", "") or "") != target_space:
+            continue
+        module_name = str(getattr(cls, "__module__", "") or "")
+        if not module_name.endswith("add_camera_rigs.ui_panels"):
+            continue
+        if not panel_id.startswith("ADD_CAMERA_RIGS_"):
+            continue
+        original_draw = _panel_callback_from_class_dict(cls, "draw")
+        if callable(original_draw) and panel_id not in PANEL_DRAW_ORIGINALS:
+            PANEL_DRAW_ORIGINALS[panel_id] = original_draw
+            setattr(cls, "draw", _safe_panel_draw_wrapper(panel_id, "draw", original_draw))
+            repaired += 1
+        original_draw_header = _panel_callback_from_class_dict(cls, "draw_header")
+        if callable(original_draw_header) and panel_id not in PANEL_DRAW_HEADER_ORIGINALS:
+            PANEL_DRAW_HEADER_ORIGINALS[panel_id] = original_draw_header
+            setattr(cls, "draw_header", _safe_panel_draw_wrapper(panel_id, "draw_header", original_draw_header))
+            repaired += 1
+    return repaired
+
+
+def restore_problematic_panel_draw_callbacks(panel_ids=None, space_type=None):
+    target_ids = set(panel_ids or set(PANEL_DRAW_ORIGINALS.keys()) | set(PANEL_DRAW_HEADER_ORIGINALS.keys()))
+    for panel_id in list(target_ids):
+        cls = resolve_panel_class_anywhere(panel_id, space_type=space_type)
+        if cls is None:
+            continue
+        original_draw = PANEL_DRAW_ORIGINALS.pop(panel_id, None)
+        if original_draw is not None:
+            setattr(cls, "draw", original_draw)
+        original_draw_header = PANEL_DRAW_HEADER_ORIGINALS.pop(panel_id, None)
+        if original_draw_header is not None:
+            setattr(cls, "draw_header", original_draw_header)
+        for key in list(PANEL_DRAW_ERROR_KEYS):
+            if key[0] == panel_id:
+                PANEL_DRAW_ERROR_KEYS.discard(key)
+
+
+def repair_missing_panel_poll_callbacks(space_type=None):
+    repaired = 0
+    target_space = str(space_type or "").strip()
+    for cls in iter_panel_subclasses(bpy.types.Panel):
+        panel_id = str(getattr(cls, "bl_idname", "") or getattr(cls, "__name__", "") or "")
+        if not panel_id or panel_id.startswith("BWFLOW_"):
+            continue
+        if target_space and str(getattr(cls, "bl_space_type", "") or "") != target_space:
+            continue
+        module_name = str(getattr(cls, "__module__", "") or "")
+        if module_name == __name__ or module_name.startswith("bl_ui"):
+            continue
+        cls_dict = getattr(cls, "__dict__", {}) or {}
+        force_repair = panel_id in BROKEN_PANEL_POLL_IDS
+        if not force_repair and panel_id.startswith("SPIO_"):
+            try:
+                poll_attr = cls_dict.get("poll")
+                if poll_attr is not None:
+                    poll_fn = getattr(poll_attr, "__func__", poll_attr)
+                    if not callable(poll_fn):
+                        force_repair = True
+            except Exception:
+                force_repair = True
+        if force_repair:
+            try:
+                setattr(cls, "poll", classmethod(default_panel_poll))
+                PANEL_POLL_CALLERS.pop(panel_id, None)
+                PANEL_POLL_ORIGINALS.pop(panel_id, None)
+                PANEL_POLL_TARGETS.pop(panel_id, None)
+                try:
+                    delattr(cls, "_bworkflow_poll_panel_id")
+                except Exception:
+                    pass
+                repaired += 1
+            except Exception:
+                pass
+            continue
+        if "poll" in cls_dict and callable(getattr(cls, "poll", None)):
+            continue
+        try:
+            setattr(cls, "poll", classmethod(default_panel_poll))
+            repaired += 1
+        except Exception:
+            pass
+    return repaired
+
+
+def quarantine_broken_panel_polls(space_type=None):
+    repaired = 0
+    target_space = str(space_type or "").strip()
+    for panel_id in BROKEN_PANEL_POLL_IDS:
+        cls = resolve_panel_class_anywhere(panel_id, space_type=space_type)
+        if cls is None:
+            continue
+        if target_space and str(getattr(cls, "bl_space_type", "") or "") != target_space:
+            continue
+        try:
+            setattr(cls, "poll", classmethod(default_panel_poll))
+            try:
+                delattr(cls, "_bworkflow_poll_panel_id")
+            except Exception:
+                pass
+            PANEL_POLL_CALLERS.pop(panel_id, None)
+            PANEL_POLL_ORIGINALS.pop(panel_id, None)
+            PANEL_POLL_TARGETS.pop(panel_id, None)
+            repaired += 1
+        except Exception:
+            pass
+    return repaired
+
+
 def install_panel_poll_overrides():
-    for registry in PANEL_CLASS_REGISTRY_BY_SPACE.values():
-        for panel_id, cls in registry.items():
-            target_cls = PANEL_POLL_TARGETS.get(panel_id)
-            if target_cls is not None and target_cls is not cls and panel_id in PANEL_POLL_CALLERS:
-                uninstall_panel_poll_overrides([panel_id])
-            if panel_id not in PANEL_POLL_CALLERS:
-                original_attr = inspect.getattr_static(cls, "poll", PANEL_POLL_MISSING)
-                PANEL_POLL_ORIGINALS[panel_id] = original_attr
-                wrapped = make_panel_poll_wrapper(panel_id)
+    uninstall_panel_poll_overrides()
+    repair_missing_panel_poll_callbacks()
+    repair_problematic_panel_draw_callbacks()
+
+
+def ensure_panel_poll_overrides(space_type=None):
+    target_spaces = (space_type,) if space_type else iter_supported_space_types()
+    installed = 0
+    for target_space in target_spaces:
+        registry = get_panel_registry(target_space)
+        for panel_id, cls in list(registry.items()):
+            if not panel_id or panel_id.startswith("BWFLOW_"):
+                continue
+            if panel_id in BROKEN_PANEL_POLL_IDS:
+                try:
+                    setattr(cls, "poll", classmethod(default_panel_poll))
+                    delattr(cls, "_bworkflow_poll_panel_id")
+                except Exception:
+                    pass
+                PANEL_POLL_CALLERS.pop(panel_id, None)
+                PANEL_POLL_ORIGINALS.pop(panel_id, None)
+                PANEL_POLL_TARGETS.pop(panel_id, None)
+                continue
+            if panel_id in PANEL_POLL_TARGETS:
+                continue
+            original = cls.__dict__.get("poll", PANEL_POLL_MISSING)
+            PANEL_POLL_ORIGINALS[panel_id] = original
+            PANEL_POLL_TARGETS[panel_id] = cls
+            PANEL_POLL_CALLERS[panel_id] = True
+            try:
                 setattr(cls, "_bworkflow_poll_panel_id", panel_id)
-                setattr(cls, "poll", wrapped)
-                PANEL_POLL_CALLERS[panel_id] = wrapped
-                PANEL_POLL_TARGETS[panel_id] = cls
+                setattr(cls, "poll", make_panel_poll_wrapper(panel_id))
+                installed += 1
+            except Exception:
+                PANEL_POLL_CALLERS.pop(panel_id, None)
+                PANEL_POLL_ORIGINALS.pop(panel_id, None)
+                PANEL_POLL_TARGETS.pop(panel_id, None)
+    return installed
 
 
 def uninstall_panel_poll_overrides(panel_ids=None):
@@ -2794,12 +3821,19 @@ def uninstall_panel_poll_overrides(panel_ids=None):
         cls = PANEL_POLL_TARGETS.get(panel_id)
         if cls is None or panel_id not in PANEL_POLL_CALLERS:
             continue
+        if panel_id in BROKEN_PANEL_POLL_IDS:
+            try:
+                setattr(cls, "poll", classmethod(default_panel_poll))
+                delattr(cls, "_bworkflow_poll_panel_id")
+            except Exception:
+                pass
+            PANEL_POLL_CALLERS.pop(panel_id, None)
+            PANEL_POLL_ORIGINALS.pop(panel_id, None)
+            PANEL_POLL_TARGETS.pop(panel_id, None)
+            continue
         original = PANEL_POLL_ORIGINALS.get(panel_id, PANEL_POLL_MISSING)
         if original is PANEL_POLL_MISSING:
-            try:
-                delattr(cls, "poll")
-            except Exception:
-                setattr(cls, "poll", classmethod(default_panel_poll))
+            setattr(cls, "poll", classmethod(default_panel_poll))
         else:
             setattr(cls, "poll", original)
         try:
@@ -2809,12 +3843,20 @@ def uninstall_panel_poll_overrides(panel_ids=None):
         PANEL_POLL_CALLERS.pop(panel_id, None)
         PANEL_POLL_ORIGINALS.pop(panel_id, None)
         PANEL_POLL_TARGETS.pop(panel_id, None)
+        for key in list(PANEL_POLL_ERROR_KEYS):
+            if key[0] == panel_id:
+                PANEL_POLL_ERROR_KEYS.discard(key)
 
 
 def apply_panel_order_overrides(ordered_panel_ids, space_type=None):
     registries = [(space_type, get_panel_registry(space_type))] if space_type else list(iter_registries())
     for target_space, registry in registries:
-        ordered_signature = tuple(panel_id for panel_id in ordered_panel_ids if panel_id in registry)
+        ordered_signature = tuple(
+            panel_id
+            for panel_id in ordered_panel_ids
+            if panel_id in registry and panel_id not in BROKEN_PANEL_POLL_IDS
+        )
+        previous_signature = PANEL_ORDER_SIGNATURE_BY_SPACE.get(target_space)
         ordered_map = {panel_id: index for index, panel_id in enumerate(ordered_signature)}
         if not ordered_signature:
             continue
@@ -2825,7 +3867,7 @@ def apply_panel_order_overrides(ordered_panel_ids, space_type=None):
             if panel_id not in PANEL_BL_ORDER_ORIGINALS:
                 PANEL_BL_ORDER_ORIGINALS[panel_id] = cls.__dict__.get("bl_order", PANEL_BL_ORDER_MISSING)
             cls.bl_order = ordered_map[panel_id] + 100
-        if ordered_signature and PANEL_ORDER_SIGNATURE_BY_SPACE.get(target_space) != ordered_signature:
+        if previous_signature != ordered_signature:
             reorder_registered_panels(ordered_signature, space_type=target_space)
         PANEL_ORDER_SIGNATURE_BY_SPACE[target_space] = ordered_signature
     enforce_go_workflow_panel_order()
@@ -2848,9 +3890,11 @@ def clear_panel_order_overrides(panel_ids=None, space_type=None):
     if space_type is None:
         PANEL_ORDER_SIGNATURE_BY_SPACE.clear()
         PANEL_FILTER_SIGNATURE_BY_SPACE.clear()
+        PANEL_VISIBILITY_DATA_CACHE_BY_SPACE.clear()
     else:
         PANEL_ORDER_SIGNATURE_BY_SPACE.pop(space_type, None)
         PANEL_FILTER_SIGNATURE_BY_SPACE.pop(space_type, None)
+        PANEL_VISIBILITY_DATA_CACHE_BY_SPACE.pop(space_type, None)
     target_ids = list(PANEL_BL_ORDER_ORIGINALS.keys()) if panel_ids is None else list(panel_ids)
     if space_type is not None and panel_ids is None:
         target_ids = [
@@ -2885,8 +3929,6 @@ def restore_panel_registry_order(panel_ids=None, space_type=None):
         ordered_ids = [panel_id for panel_id in panel_ids if panel_id in registry]
         if not ordered_ids:
             continue
-        if PANEL_ORDER_SIGNATURE_BY_SPACE.get(target_space) != tuple(ordered_ids):
-            reorder_registered_panels(ordered_ids, space_type=target_space)
         for panel_id in ordered_ids:
             cls = registry.get(panel_id)
             if cls is None:
@@ -2922,13 +3964,17 @@ def has_runtime_unregistered_panels(space_type=None):
 
 
 def restore_space_default_n_panel_state(scene=None, space_type="VIEW_3D", disable_filters=True, sync_registry_after_restore=True):
+    quarantine_broken_panel_polls(space_type=space_type)
     if disable_filters:
         ACTIVE_ALLOWED_PANEL_IDS_BY_SPACE.pop(space_type, None)
     PANEL_ORDER_SIGNATURE_BY_SPACE.pop(space_type, None)
     PANEL_FILTER_SIGNATURE_BY_SPACE.pop(space_type, None)
+    PANEL_VISIBILITY_DATA_CACHE_BY_SPACE.pop(space_type, None)
     PANEL_LIBRARY_GROUPS_CACHE_BY_SPACE.pop(space_type, None)
     PANEL_LIBRARY_GROUP_ENTRY_CACHE_BY_SPACE.pop(space_type, None)
     SELECTED_PANEL_GROUPS_CACHE_BY_SPACE.pop(space_type, None)
+    SELECTED_PANEL_GROUP_SUMMARY_CACHE_BY_SPACE.pop(space_type, None)
+    PANEL_VISIBILITY_DATA_CACHE_BY_SPACE.pop(space_type, None)
     try:
         restore_panel_registry_order(space_type=space_type)
     except Exception:
@@ -2937,6 +3983,7 @@ def restore_space_default_n_panel_state(scene=None, space_type="VIEW_3D", disabl
         uninstall_panel_poll_overrides(poll_override_panel_ids_for_space(space_type))
     except Exception:
         traceback.print_exc()
+    quarantine_broken_panel_polls(space_type=space_type)
     try:
         restore_unregistered_panels(space_type=space_type)
     except Exception:
@@ -2946,9 +3993,11 @@ def restore_space_default_n_panel_state(scene=None, space_type="VIEW_3D", disabl
     except Exception:
         traceback.print_exc()
     PANEL_GROUP_INDEX_CACHE_BY_SPACE.pop(space_type, None)
+    PANEL_DRAWER_ROOT_CACHE_BY_SPACE.pop(space_type, None)
     PANEL_LIBRARY_GROUPS_CACHE_BY_SPACE.pop(space_type, None)
     PANEL_LIBRARY_GROUP_ENTRY_CACHE_BY_SPACE.pop(space_type, None)
     SELECTED_PANEL_GROUPS_CACHE_BY_SPACE.pop(space_type, None)
+    SELECTED_PANEL_GROUP_SUMMARY_CACHE_BY_SPACE.pop(space_type, None)
     target_scene = scene or safe_context_scene()
     if sync_registry_after_restore and target_scene is not None:
         try:
@@ -2985,16 +4034,26 @@ def switch_all_states_to_default_workflow(scene=None):
 
 
 def restore_default_n_panel_state(scene=None, disable_filters=True, switch_workflow=True, sync_registry_after_restore=True):
+    quarantine_broken_panel_polls()
     if switch_workflow:
         switch_all_states_to_default_workflow(scene=scene)
     if disable_filters:
         ACTIVE_ALLOWED_PANEL_IDS_BY_SPACE.clear()
     PANEL_GROUP_INDEX_CACHE_BY_SPACE.clear()
+    PANEL_DRAWER_ROOT_CACHE_BY_SPACE.clear()
     PANEL_ORDER_SIGNATURE_BY_SPACE.clear()
     PANEL_FILTER_SIGNATURE_BY_SPACE.clear()
+    PANEL_VISIBILITY_DATA_CACHE_BY_SPACE.clear()
     PANEL_LIBRARY_GROUPS_CACHE_BY_SPACE.clear()
     PANEL_LIBRARY_GROUP_ENTRY_CACHE_BY_SPACE.clear()
+    WORKFLOW_MISSING_PANEL_IDS_CACHE_BY_SPACE.clear()
+    WORKFLOW_MISSING_RECORDS_CACHE_BY_SPACE.clear()
+    RUNTIME_HIDDEN_PANEL_IDS_CACHE_BY_SPACE.clear()
+    IMPORTED_WORKFLOW_MISSING_MATCH_CACHE.clear()
     SELECTED_PANEL_GROUPS_CACHE_BY_SPACE.clear()
+    SELECTED_PANEL_GROUP_SUMMARY_CACHE_BY_SPACE.clear()
+    WORKFLOW_FAMILY_ORDER_GROUPS_CACHE_BY_SPACE.clear()
+    PANEL_GROUP_FILTER_CACHE_BY_SPACE.clear()
     try:
         restore_panel_registry_order()
     except Exception:
@@ -3037,6 +4096,7 @@ def restore_unregistered_panels(panel_ids=None, space_type=None):
     ids_to_restore.difference_update(unresolved_ids)
     UNREGISTERED_PANEL_IDS.difference_update(unresolved_ids)
 
+    ids_to_restore.difference_update(BROKEN_PANEL_POLL_IDS)
     pending_ids = ordered_panel_ids_for_register(ids_to_restore, space_type=space_type)
     for _attempt in range(max(1, len(pending_ids))):
         if not pending_ids:
@@ -3052,7 +4112,10 @@ def restore_unregistered_panels(panel_ids=None, space_type=None):
             try:
                 if _safe_register_panel_class(cls):
                     UNREGISTERED_PANEL_IDS.discard(panel_id)
-                    PANEL_ORDER_SIGNATURE_BY_SPACE.pop(getattr(cls, "bl_space_type", space_type or "VIEW_3D"), None)
+                    target_space = getattr(cls, "bl_space_type", space_type or "VIEW_3D")
+                    PANEL_ORDER_SIGNATURE_BY_SPACE.pop(target_space, None)
+                    PANEL_VISIBILITY_DATA_CACHE_BY_SPACE.pop(target_space, None)
+                    RUNTIME_HIDDEN_PANEL_IDS_CACHE_BY_SPACE.pop(target_space, None)
                     made_progress = True
                 else:
                     still_pending.append(panel_id)
@@ -3079,6 +4142,11 @@ def unregister_panels(panel_ids, space_type=None):
         try:
             if _safe_unregister_panel_class(cls):
                 UNREGISTERED_PANEL_IDS.add(panel_id)
+                target_space = getattr(cls, "bl_space_type", space_type or "VIEW_3D")
+                PANEL_ORDER_SIGNATURE_BY_SPACE.pop(target_space, None)
+                PANEL_FILTER_SIGNATURE_BY_SPACE.pop(target_space, None)
+                PANEL_VISIBILITY_DATA_CACHE_BY_SPACE.pop(target_space, None)
+                RUNTIME_HIDDEN_PANEL_IDS_CACHE_BY_SPACE.pop(target_space, None)
         except Exception:
             pass
 
@@ -3087,7 +4155,7 @@ def reorder_registered_panels(panel_ids, space_type=None):
     ids_to_reorder = [
         panel_id
         for panel_id in ordered_panel_ids_for_register(panel_ids, space_type=space_type)
-        if panel_id not in UNREGISTERED_PANEL_IDS
+        if panel_id not in UNREGISTERED_PANEL_IDS and panel_id not in BROKEN_PANEL_POLL_IDS
     ]
     for panel_id in reversed(ids_to_reorder):
         cls = resolve_panel_class(panel_id, space_type=space_type)
@@ -3121,39 +4189,69 @@ def reorder_registered_panels(panel_ids, space_type=None):
     enforce_go_workflow_panel_order()
 
 
-def apply_panel_visibility_overrides(scene=None, space_type=None, restore_first=True, install_poll=True):
+def apply_panel_visibility_overrides(scene=None, space_type=None, restore_first=True, install_poll=True, repair_callbacks=True):
+    if repair_callbacks:
+        repair_missing_panel_poll_callbacks(space_type=space_type)
+        repair_problematic_panel_draw_callbacks(space_type=space_type)
     if install_poll:
-        install_panel_poll_overrides()
+        ensure_panel_poll_overrides(space_type=space_type)
     if restore_first:
         restore_unregistered_panels(space_type=space_type)
 
+    changed = False
     target_spaces = (space_type,) if space_type else iter_supported_space_types()
     for target_space in target_spaces:
         state = get_state(scene=scene, space_type=target_space)
         if state is None:
             continue
-        allowed_ids = compute_allowed_panel_ids(state)
+        workflow = get_active_workflow(state)
+        visibility_data = workflow_visibility_data(state, workflow)
+        allowed_ids = visibility_data["allowed_ids"]
         ACTIVE_ALLOWED_PANEL_IDS_BY_SPACE[target_space] = allowed_ids
 
         registry_ids = set(get_panel_registry(target_space).keys())
         if allowed_ids is None:
             restore_space_default_n_panel_state(scene=scene, space_type=target_space, disable_filters=True)
+            changed = True
             continue
 
         allowed_ids = set(allowed_ids)
-        hidden_ids = [
+        hidden_ids = {
             panel_id
             for panel_id in registry_ids
             if panel_id not in allowed_ids and not panel_id.startswith("BWFLOW_")
-        ]
+        }
+        current_signature = (
+            len(allowed_ids),
+            hash(frozenset(allowed_ids)),
+            len(visibility_data["ordered_ids"]),
+            hash(tuple(visibility_data["ordered_ids"])),
+            panel_registry_lookup_signature(state),
+            len(runtime_hidden_panel_ids(target_space)),
+        )
+        if PANEL_FILTER_SIGNATURE_BY_SPACE.get(target_space) == current_signature:
+            continue
 
-        restore_unregistered_panels(allowed_ids, space_type=target_space)
-        unregister_panels(hidden_ids, space_type=target_space)
+        hidden_runtime_ids = runtime_hidden_panel_ids(target_space)
+        restore_ids = allowed_ids.intersection(hidden_runtime_ids)
+        if restore_ids:
+            restore_unregistered_panels(restore_ids, space_type=target_space)
+            changed = True
+        if install_poll:
+            ensure_panel_poll_overrides(space_type=target_space)
+        hide_ids = hidden_ids.difference(hidden_runtime_ids)
+        if hide_ids:
+            unregister_panels(hide_ids, space_type=target_space)
+            changed = True
 
-        ordered_ids = workflow_ordered_panel_ids(state, get_active_workflow(state))
-        apply_panel_order_overrides(ordered_ids, space_type=target_space)
-        restore_panel_registry_order(ordered_ids, space_type=target_space)
-        PANEL_FILTER_SIGNATURE_BY_SPACE[target_space] = panel_filter_signature(state)
+        ordered_ids = visibility_data["ordered_ids"]
+        if not getattr(state, "panel_order_pending_apply", False):
+            previous_order_signature = PANEL_ORDER_SIGNATURE_BY_SPACE.get(target_space)
+            apply_panel_order_overrides(ordered_ids, space_type=target_space)
+            if previous_order_signature != PANEL_ORDER_SIGNATURE_BY_SPACE.get(target_space):
+                changed = True
+        PANEL_FILTER_SIGNATURE_BY_SPACE[target_space] = current_signature
+    return changed
 
 
 def ensure_one_default_workflow(state):
@@ -3176,6 +4274,7 @@ def sync_registry(scene, space_type="VIEW_3D"):
     if state is None:
         return
     PANEL_GROUP_INDEX_CACHE_BY_SPACE.pop(space_type, None)
+    PANEL_DRAWER_ROOT_CACHE_BY_SPACE.pop(space_type, None)
     PANEL_LIBRARY_GROUP_ENTRY_CACHE_BY_SPACE.pop(space_type, None)
 
     discovered = dict(get_panel_registry(space_type))
@@ -3192,41 +4291,58 @@ def sync_registry(scene, space_type="VIEW_3D"):
         record.title = clean_panel_title(getattr(cls, "bl_label", panel_id), panel_id)
         record.category = panel_display_category(panel_id, cls, space_type=space_type)
         record.source_module = getattr(cls, "__module__", "")
+        record.addon_version = max_version_text(getattr(record, "addon_version", ""), addon_version_from_module_name(record.source_module))
         record.discovered = True
 
 def rebuild_panel_cache(scene=None, space_type=None, restore_first=True, install_poll=True):
     target_scene = scene or safe_context_scene()
     target_spaces = (space_type,) if space_type else iter_supported_space_types()
+    repair_missing_panel_poll_callbacks(space_type=space_type)
+    repair_problematic_panel_draw_callbacks(space_type=space_type)
     for target_space in target_spaces:
         if restore_first and has_runtime_unregistered_panels(space_type=target_space):
             restore_unregistered_panels(space_type=target_space)
         PANEL_GROUP_INDEX_CACHE_BY_SPACE.pop(target_space, None)
+        PANEL_DRAWER_ROOT_CACHE_BY_SPACE.pop(target_space, None)
         PANEL_LIBRARY_GROUPS_CACHE_BY_SPACE.pop(target_space, None)
+        PANEL_GROUP_FILTER_CACHE_BY_SPACE.pop(f"{target_space}:library", None)
+        PANEL_GROUP_FILTER_CACHE_BY_SPACE.pop(f"{target_space}:selected", None)
+        clear_space_prefixed_cache(WORKFLOW_MISSING_PANEL_IDS_CACHE_BY_SPACE, target_space)
+        clear_space_prefixed_cache(WORKFLOW_MISSING_RECORDS_CACHE_BY_SPACE, target_space)
+        clear_space_prefixed_cache(IMPORTED_WORKFLOW_MISSING_MATCH_CACHE, target_space)
+        RUNTIME_HIDDEN_PANEL_IDS_CACHE_BY_SPACE.pop(target_space, None)
         PANEL_LIBRARY_GROUP_ENTRY_CACHE_BY_SPACE.pop(target_space, None)
         SELECTED_PANEL_GROUPS_CACHE_BY_SPACE.pop(target_space, None)
+        SELECTED_PANEL_GROUP_SUMMARY_CACHE_BY_SPACE.pop(target_space, None)
+        clear_space_prefixed_cache(WORKFLOW_FAMILY_ORDER_GROUPS_CACHE_BY_SPACE, target_space)
+        PANEL_VISIBILITY_DATA_CACHE_BY_SPACE.pop(target_space, None)
         PANEL_ORDER_SIGNATURE_BY_SPACE.pop(target_space, None)
         PANEL_FILTER_SIGNATURE_BY_SPACE.pop(target_space, None)
         PANEL_CLASS_CACHE_BY_SPACE[target_space] = discover_sidebar_panels(target_space)
         if target_scene is not None:
             sync_registry(target_scene, space_type=target_space)
     if install_poll:
-        install_panel_poll_overrides()
+        ensure_panel_poll_overrides(space_type=space_type)
 
 
 def rebuild_runtime_panels(scene=None, space_type=None, rebuild_cache=True):
-    if has_runtime_unregistered_panels(space_type=space_type):
+    changed = False
+    if rebuild_cache and has_runtime_unregistered_panels(space_type=space_type):
         restore_unregistered_panels(space_type=space_type)
+        changed = True
     if rebuild_cache:
         rebuild_panel_cache(scene=scene, space_type=space_type, restore_first=False, install_poll=True)
-    force_reload_script_panels(scene=scene, space_type=space_type, restore_first=False)
-    apply_panel_visibility_overrides(
+        changed = True
+    changed = force_reload_script_panels(scene=scene, space_type=space_type, restore_first=False) or changed
+    changed = apply_panel_visibility_overrides(
         scene=scene,
         space_type=space_type,
         restore_first=False,
         install_poll=not rebuild_cache,
-    )
-    tag_redraw_all()
-    return True
+    ) or changed
+    if changed:
+        tag_redraw_all(space_type=space_type)
+    return changed
 
 
 def refresh_runtime_overrides(scene=None, space_type=None, restore_first=False, include_script_panels=True):
@@ -3403,7 +4519,7 @@ def apply_script_library_item_to_module(module, item):
     module.name = normalize_workflow_name(getattr(item, "name", ""), "默认脚本模板")
     module.description = normalize_text_value(getattr(item, "description", ""), "")
     module.use_custom_panel = bool(getattr(item, "use_custom_panel", False))
-    module.runtime_panel_expanded = True
+    module.runtime_panel_expanded = False
     module.panel_title = normalize_text_value(getattr(item, "panel_title", ""), "")
     module.panel_description = normalize_text_value(getattr(item, "panel_description", ""), "")
     # 脚本库是模板仓库，载入到模块后必须绑定到当前工作流自己的 .py，
@@ -3513,6 +4629,7 @@ def serialize_panel_registry(space_state):
             "category": record.category,
             "tags": record.tags,
             "source_module": record.source_module,
+            "addon_version": getattr(record, "addon_version", ""),
         }
         for record in getattr(space_state, "panel_registry", [])
     ]
@@ -3530,6 +4647,7 @@ def panel_registry_payload_for_panel_id(space_state, panel_id):
         "category": record.category,
         "tags": record.tags,
         "source_module": record.source_module,
+        "addon_version": getattr(record, "addon_version", ""),
     }
 
 
@@ -3572,6 +4690,7 @@ def collect_workflow_panel_registry_records(space_state, workflows):
                         "category": record.category,
                         "tags": record.tags,
                         "source_module": record.source_module,
+                        "addon_version": getattr(record, "addon_version", ""),
                     }
                 )
     return records
@@ -3588,7 +4707,7 @@ def serialize_script_library(space_state):
             "panel_description": item.panel_description,
             "script_path": item.script_path,
             "text_block_name": item.text_block_name,
-            "script_source": item.script_source,
+            "script_source": export_script_source_from_item(item),
             "config_payload": getattr(item, "config_payload", ""),
             "ai_doc": item.ai_doc,
         }
@@ -3611,12 +4730,37 @@ def serialize_script_library_items(items):
                 "panel_description": getattr(item, "panel_description", ""),
                 "script_path": getattr(item, "script_path", ""),
                 "text_block_name": getattr(item, "text_block_name", ""),
-                "script_source": getattr(item, "script_source", ""),
+                "script_source": export_script_source_from_item(item),
                 "config_payload": getattr(item, "config_payload", ""),
                 "ai_doc": getattr(item, "ai_doc", ""),
             }
         )
     return serialized
+
+
+def export_script_source_from_item(item):
+    if item is None:
+        return ""
+    text_name = str(getattr(item, "text_block_name", "") or "").strip()
+    if text_name:
+        text_block = bpy.data.texts.get(text_name)
+        if text_block is not None:
+            try:
+                return text_block.as_string().lstrip("\ufeff")
+            except Exception:
+                traceback.print_exc()
+    raw_source = str(getattr(item, "script_source", "") or "")
+    if raw_source:
+        return raw_source.lstrip("\ufeff")
+    raw_path = str(getattr(item, "script_path", "") or "").strip()
+    if raw_path:
+        try:
+            filepath = bpy.path.abspath(raw_path)
+            if os.path.isfile(filepath):
+                return read_cached_text_file(filepath, encodings=("utf-8", "utf-8-sig")).lstrip("\ufeff")
+        except Exception:
+            traceback.print_exc()
+    return ""
 
 
 def sync_script_library_item_source(item):
@@ -3710,7 +4854,66 @@ def workflow_related_script_library_items(state, workflows):
     return selected
 
 
-def serialize_workflow(workflow):
+def panel_match_payload_for_export(state, panel_id):
+    if state is None or not panel_id:
+        return None
+    record = panel_drawer_record(state, panel_id) or find_registry_record(state, panel_id)
+    if record is None:
+        return None
+    source_module = getattr(record, "source_module", "")
+    return {
+        "panel_id": getattr(record, "panel_id", panel_id),
+        "title": clean_panel_title(getattr(record, "title", ""), getattr(record, "panel_id", panel_id)),
+        "category": getattr(record, "category", ""),
+        "source_module": source_module,
+        "addon_version": getattr(record, "addon_version", ""),
+        "plugin_key": panel_plugin_key_from_module(source_module) or panel_plugin_key(panel_id),
+        "plugin_title": panel_plugin_title(state, panel_id),
+    }
+
+
+def workflow_panel_match_payloads(state, workflow):
+    if state is None or workflow is None:
+        return []
+    payloads = []
+    seen = set()
+    for item in getattr(workflow, "panels", []):
+        panel_id = getattr(item, "panel_id", "")
+        if not panel_id or panel_id == "BWFLOW_PT_workflow" or panel_id in seen:
+            continue
+        seen.add(panel_id)
+        payload = panel_match_payload_for_export(state, panel_id)
+        if payload is not None:
+            payloads.append(payload)
+    return payloads
+
+
+def workflow_plugin_requirement_payloads(state, workflows):
+    if state is None:
+        return []
+    requirements = {}
+    for workflow in workflows or []:
+        if workflow is None:
+            continue
+        for item in getattr(workflow, "panels", []):
+            panel_id = getattr(item, "panel_id", "")
+            if not panel_id or panel_id == "BWFLOW_PT_workflow":
+                continue
+            payload = panel_match_payload_for_export(state, panel_id)
+            if payload is None:
+                continue
+            key = payload.get("plugin_key", "") or payload.get("source_module", "") or panel_id
+            existing = requirements.get(key, {})
+            requirements[key] = {
+                "plugin_key": key,
+                "plugin_title": payload.get("plugin_title", "") or existing.get("plugin_title", ""),
+                "source_module": payload.get("source_module", "") or existing.get("source_module", ""),
+                "addon_version": max_version_text(existing.get("addon_version", ""), payload.get("addon_version", "")),
+            }
+    return list(requirements.values())
+
+
+def serialize_workflow(workflow, state=None):
     if workflow is None:
         return None
     return {
@@ -3718,7 +4921,10 @@ def serialize_workflow(workflow):
         "is_default": workflow.is_default,
         "description": workflow.description,
         "tag_filter": workflow.tag_filter,
+        "missing_warning_dismissed": bool(getattr(workflow, "missing_warning_dismissed", False)),
         "panels": [item.panel_id for item in workflow.panels],
+        "panel_matches": workflow_panel_match_payloads(state, workflow),
+        "plugin_requirements": workflow_plugin_requirement_payloads(state, [workflow]),
         "modules": [
             {
                 "name": module.name,
@@ -3730,7 +4936,7 @@ def serialize_workflow(workflow):
                 "script_path": module.script_path,
                 "description": module.description,
                 "text_block_name": module.text_block_name,
-                "script_source": module.script_source,
+                "script_source": export_script_source_from_item(module),
                 "config_payload": getattr(module, "config_payload", ""),
                 "ai_doc": module.ai_doc,
             }
@@ -3764,7 +4970,7 @@ def serialize_space_state(space_state):
         "script_library": serialize_script_library(space_state),
         "workflows": [
             workflow_payload
-            for workflow_payload in (serialize_workflow(workflow) for workflow in space_state.workflows)
+            for workflow_payload in (serialize_workflow(workflow, state=space_state) for workflow in space_state.workflows)
             if workflow_payload is not None
         ],
     }
@@ -3791,6 +4997,21 @@ def workflow_preset_filename(state, workflows):
     return f"go_workflow_{space_suffix}_{count}_workflows{PRESET_FILE_EXTENSION}"
 
 
+def normalize_preset_export_filepath(filepath):
+    path = bpy.path.abspath(str(filepath or "").strip())
+    if not path:
+        return path
+    lowered = path.lower()
+    for suffix in (".goworkflow.zip", ".goworkflow", ".bworkflow", ".zip"):
+        if lowered.endswith(suffix):
+            path = path[: -len(suffix)]
+            lowered = path.lower()
+            break
+    if not lowered.endswith(PRESET_FILE_EXTENSION):
+        path += PRESET_FILE_EXTENSION
+    return path
+
+
 def default_preset_export_path(context, state):
     workflows = selected_preset_export_workflows(state)
     if not workflows:
@@ -3810,11 +5031,118 @@ def load_json_payload_file(filepath, max_bytes=None):
     return read_cached_json_file(filepath, max_bytes=max_bytes)
 
 
+def preset_archive_script_name(kind, index, module_name):
+    safe_name = safe_filename_component(module_name or f"{kind}_{index + 1}", f"{kind}_{index + 1}", max_length=48)
+    return f"scripts/{kind}_{index + 1:03d}_{safe_name}.py"
+
+
+def externalize_preset_scripts(payload):
+    if not isinstance(payload, dict):
+        return payload, {}
+    payload = json.loads(json.dumps(payload, ensure_ascii=False))
+    assets = {}
+    asset_index = 0
+
+    def externalize_module(module, kind):
+        nonlocal asset_index
+        if not isinstance(module, dict):
+            return
+        source = str(module.get("script_source", "") or "")
+        if not source:
+            return
+        asset_name = preset_archive_script_name(kind, asset_index, module.get("name", "module"))
+        asset_index += 1
+        assets[asset_name] = source
+        module["script_asset"] = asset_name
+        module["script_source"] = ""
+        module["text_block_name"] = ""
+
+    def externalize_workflow(workflow):
+        if not isinstance(workflow, dict):
+            return
+        for module in workflow.get("modules", []) or []:
+            externalize_module(module, "module")
+
+    if isinstance(payload.get("workflow"), dict):
+        externalize_workflow(payload.get("workflow"))
+    for space_payload in (payload.get("space_states") or {}).values() if isinstance(payload.get("space_states"), dict) else []:
+        if not isinstance(space_payload, dict):
+            continue
+        for workflow in space_payload.get("workflows", []) or []:
+            externalize_workflow(workflow)
+        for item in space_payload.get("script_library", []) or []:
+            externalize_module(item, "library")
+    for item in payload.get("script_library", []) or []:
+        externalize_module(item, "library")
+    return payload, assets
+
+
+def write_preset_archive(filepath, payload):
+    target_path = normalize_preset_export_filepath(filepath)
+    if not target_path:
+        raise ValueError("Preset export path is empty")
+    folder = os.path.dirname(target_path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    manifest, assets = externalize_preset_scripts(payload)
+    with zipfile.ZipFile(target_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+        for asset_name, source in assets.items():
+            archive.writestr(asset_name, str(source or ""))
+    return target_path
+
+
+def read_preset_archive(filepath, max_bytes=None):
+    target_path = bpy.path.abspath(str(filepath or "").strip())
+    if not target_path:
+        raise ValueError("Preset path is empty")
+    if not zipfile.is_zipfile(target_path):
+        return load_json_payload_file(target_path, max_bytes=max_bytes)
+    if max_bytes is not None and os.path.getsize(target_path) > max_bytes:
+        raise ValueError("Preset archive is too large")
+    with zipfile.ZipFile(target_path, "r") as archive:
+        names = set(archive.namelist())
+        if "manifest.json" not in names:
+            raise ValueError("Preset archive missing manifest.json")
+        with archive.open("manifest.json", "r") as handle:
+            payload = json.loads(handle.read().decode("utf-8-sig"))
+        if isinstance(payload, dict):
+            payload["preset_archive_format"] = "zip"
+
+        def hydrate_module(module):
+            if not isinstance(module, dict):
+                return
+            asset_name = str(module.get("script_asset", "") or "")
+            if not asset_name or asset_name not in names or not asset_name.startswith("scripts/"):
+                return
+            with archive.open(asset_name, "r") as handle:
+                module["script_source"] = handle.read().decode("utf-8-sig", errors="replace")
+
+        def hydrate_workflow(workflow):
+            if not isinstance(workflow, dict):
+                return
+            for module in workflow.get("modules", []) or []:
+                hydrate_module(module)
+
+        if isinstance(payload.get("workflow"), dict):
+            hydrate_workflow(payload.get("workflow"))
+        for space_payload in (payload.get("space_states") or {}).values() if isinstance(payload.get("space_states"), dict) else []:
+            if not isinstance(space_payload, dict):
+                continue
+            for workflow in space_payload.get("workflows", []) or []:
+                hydrate_workflow(workflow)
+            for item in space_payload.get("script_library", []) or []:
+                hydrate_module(item)
+        for item in payload.get("script_library", []) or []:
+            hydrate_module(item)
+        return payload
+
+
 def build_current_workflow_preset_payload(scene, context=None):
     space_type = current_space_type(context=context)
     state = get_state(context=context, scene=scene, space_type=space_type)
     workflow = get_active_workflow(state)
-    workflow_payload = serialize_workflow(workflow)
+    workflow_payload = serialize_workflow(workflow, state=state)
     if state is None or workflow_payload is None:
         return None
     related_scripts = workflow_related_script_library_items(state, [workflow] if workflow is not None else [])
@@ -3826,7 +5154,7 @@ def build_current_workflow_preset_payload(scene, context=None):
         "space_label": SPACE_LABELS.get(space_type, space_type),
         "workflow_name": workflow_payload.get("name", ""),
         "settings": serialize_space_settings(state),
-        "panel_registry": collect_workflow_panel_registry_records(state, [workflow]),
+        "panel_registry": [],
         "script_library": serialize_script_library_items(related_scripts),
         "workflow": workflow_payload,
     }
@@ -3842,7 +5170,7 @@ def build_selected_workflows_preset_payload(scene, context=None):
 
     workflow_payloads = [
         workflow_payload
-        for workflow_payload in (serialize_workflow(workflow) for workflow in workflows)
+        for workflow_payload in (serialize_workflow(workflow, state=state) for workflow in workflows)
         if workflow_payload is not None
     ]
     if not workflow_payloads:
@@ -3862,7 +5190,7 @@ def build_selected_workflows_preset_payload(scene, context=None):
             "label": SPACE_LABELS.get(space_type, space_type),
             "active_workflow_index": active_workflow_index,
             "settings": serialize_space_settings(state),
-            "panel_registry": collect_workflow_panel_registry_records(state, workflows),
+            "panel_registry": [],
             "script_library": serialize_script_library_items(related_scripts),
             "workflows": workflow_payloads,
         }
@@ -3925,10 +5253,13 @@ def apply_space_state_payload(state, space_payload):
         record.category = record_data.get("category", "")
         record.tags = record_data.get("tags", "")
         record.source_module = record_data.get("source_module", "")
+        record.addon_version = record_data.get("addon_version", "")
         record.discovered = False
 
     for script_data in cleaned_payload.get("script_library", []):
         item = state.script_library.add()
+        apply_safe_imported_script_library_payload(state, item, script_data)
+        continue
         item.name = unique_script_library_name(state, script_data.get("name", ""), exclude_index=None)
         item.description = normalize_text_value(script_data.get("description", ""), "")
         item.tags = script_data.get("tags", "")
@@ -3952,15 +5283,18 @@ def apply_space_state_payload(state, space_payload):
         )
         workflow.description = normalize_workflow_description(workflow_data.get("description", ""), "")
         workflow.tag_filter = workflow_data.get("tag_filter", "")
-        for panel_id in workflow_data.get("panels", []):
+        workflow.missing_warning_dismissed = bool(workflow_data.get("missing_warning_dismissed", False))
+        for panel_id in remap_imported_workflow_panel_ids(state, workflow_data):
             item = workflow.panels.add()
             item.panel_id = panel_id
         for module_data in workflow_data.get("modules", []):
             module = workflow.modules.add()
+            apply_safe_imported_module_payload(workflow, module, module_data)
+            continue
             module.name = normalize_workflow_name(module_data.get("name", ""), "默认脚本模板")
             module.enabled = module_data.get("enabled", True)
             module.use_custom_panel = module_data.get("use_custom_panel", False)
-            module.runtime_panel_expanded = module_data.get("runtime_panel_expanded", True)
+            module.runtime_panel_expanded = module_data.get("runtime_panel_expanded", not module_prefers_collapsed_runtime_panel(module_data))
             module.panel_title = normalize_text_value(module_data.get("panel_title", ""), "")
             module.panel_description = normalize_text_value(module_data.get("panel_description", ""), "")
             module.script_path = module_data.get("script_path", "")
@@ -3998,11 +5332,252 @@ def merge_panel_registry_payload(state, panel_records):
             record.title = clean_panel_title(record_data.get("title", ""), panel_id)
         if not record.category:
             record.category = normalize_text_value(record_data.get("category", ""), "")
-        if not record.tags:
-            record.tags = record_data.get("tags", "")
-        if not record.source_module:
-            record.source_module = normalize_text_value(record_data.get("source_module", ""), "")
     return added
+
+
+def normalized_panel_match_text(value):
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def panel_match_payload_from_record(state, record):
+    if record is None:
+        return None
+    panel_id = getattr(record, "panel_id", "")
+    source_module = getattr(record, "source_module", "")
+    return {
+        "panel_id": panel_id,
+        "title": clean_panel_title(getattr(record, "title", ""), panel_id),
+        "category": getattr(record, "category", ""),
+        "source_module": source_module,
+        "addon_version": getattr(record, "addon_version", ""),
+        "plugin_key": panel_plugin_key_from_module(source_module) or panel_plugin_key(panel_id),
+        "plugin_title": panel_plugin_title(state, panel_id) if state is not None else "",
+    }
+
+
+def panel_match_payloads_by_id(state, workflow_data):
+    payloads = {}
+    for item in coerce_list_value((workflow_data or {}).get("panel_matches", [])):
+        payload = sanitize_panel_match_payload(item)
+        if payload is not None:
+            payloads[payload["panel_id"]] = payload
+    for item in coerce_list_value((workflow_data or {}).get("panels", [])):
+        panel_id = str(item or "").strip()
+        if not panel_id or panel_id in payloads:
+            continue
+        record = find_registry_record(state, panel_id) if state is not None else None
+        payload = panel_match_payload_from_record(state, record)
+        if payload is not None:
+            payloads[panel_id] = payload
+    return payloads
+
+
+def imported_workflow_match_cache_key(state, workflow):
+    if state is None or workflow is None:
+        return ""
+    return f"{getattr(state, 'space_type', 'VIEW_3D')}::{getattr(workflow, 'name', '')}"
+
+
+def cache_imported_workflow_panel_matches(state, workflow, workflow_data):
+    key = imported_workflow_match_cache_key(state, workflow)
+    if not key or not isinstance(workflow_data, dict):
+        return
+    matches = []
+    for item in coerce_list_value(workflow_data.get("panel_matches", [])):
+        payload = sanitize_panel_match_payload(item)
+        if payload is not None:
+            matches.append(payload)
+    if matches:
+        IMPORTED_WORKFLOW_PANEL_MATCH_CACHE[key] = matches
+        IMPORTED_WORKFLOW_MISSING_MATCH_CACHE.pop(key, None)
+
+
+def imported_workflow_panel_matches(state, workflow):
+    key = imported_workflow_match_cache_key(state, workflow)
+    return IMPORTED_WORKFLOW_PANEL_MATCH_CACHE.get(key, []) if key else []
+
+
+def imported_workflow_missing_panel_matches(state, workflow):
+    key = imported_workflow_match_cache_key(state, workflow)
+    matches = imported_workflow_panel_matches(state, workflow)
+    space_type = getattr(state, "space_type", "VIEW_3D") if state is not None else "VIEW_3D"
+    signature = (
+        panel_registry_lookup_signature(state),
+        len(get_panel_cache(space_type)),
+        len(get_panel_registry(space_type)),
+        tuple(
+            (
+                payload.get("panel_id", ""),
+                payload.get("title", ""),
+                payload.get("category", ""),
+                payload.get("source_module", ""),
+                payload.get("plugin_key", ""),
+            )
+            for payload in matches
+            if isinstance(payload, dict)
+        ),
+    )
+    cached = IMPORTED_WORKFLOW_MISSING_MATCH_CACHE.get(key)
+    if cached is not None and cached.get("signature") == signature:
+        return list(cached.get("matches", ()))
+    runtime_ids = runtime_panel_ids_for_space(space_type) if state is not None else set()
+    missing = []
+    for payload in matches:
+        if not isinstance(payload, dict):
+            continue
+        panel_id = payload.get("panel_id", "")
+        matched_id = find_panel_by_name_match(state, payload)
+        if matched_id and matched_id in runtime_ids:
+            continue
+        if panel_id:
+            missing.append(payload)
+    if key:
+        IMPORTED_WORKFLOW_MISSING_MATCH_CACHE[key] = {
+            "signature": signature,
+            "matches": tuple(missing),
+        }
+    return missing
+
+
+class ImportedMissingPanelRecord:
+    def __init__(self, payload):
+        payload = payload or {}
+        self.panel_id = payload.get("panel_id", "")
+        self.title = payload.get("title", "") or self.panel_id
+        self.category = payload.get("category", "")
+        self.tags = ""
+        self.source_module = payload.get("source_module", "") or payload.get("plugin_key", "")
+        self.addon_version = payload.get("addon_version", "")
+        self.discovered = False
+
+
+def imported_panel_match_payload_by_id(state, workflow):
+    return {
+        payload.get("panel_id", ""): payload
+        for payload in imported_workflow_missing_panel_matches(state, workflow)
+        if isinstance(payload, dict) and payload.get("panel_id", "")
+    }
+
+
+def runtime_panel_ids_for_space(space_type):
+    return set(get_panel_cache(space_type).keys()) | set(get_panel_registry(space_type).keys())
+
+
+def panel_match_score(source, candidate):
+    if not isinstance(source, dict) or not isinstance(candidate, dict):
+        return 0
+    source_title = normalized_panel_match_text(source.get("title", ""))
+    candidate_title = normalized_panel_match_text(candidate.get("title", ""))
+    source_category = normalized_panel_match_text(source.get("category", ""))
+    candidate_category = normalized_panel_match_text(candidate.get("category", ""))
+    source_module = normalized_panel_match_text(source.get("source_module", ""))
+    candidate_module = normalized_panel_match_text(candidate.get("source_module", ""))
+    source_plugin = normalized_panel_match_text(source.get("plugin_key", ""))
+    candidate_plugin = normalized_panel_match_text(candidate.get("plugin_key", ""))
+    source_plugin_title = normalized_panel_match_text(source.get("plugin_title", ""))
+    candidate_plugin_title = normalized_panel_match_text(candidate.get("plugin_title", ""))
+    source_panel_id = normalized_panel_match_text(source.get("panel_id", ""))
+    candidate_panel_id = normalized_panel_match_text(candidate.get("panel_id", ""))
+
+    score = 0
+    if source_panel_id and source_panel_id == candidate_panel_id:
+        score += 1000
+    if source_module and source_module == candidate_module:
+        score += 420
+    if source_plugin and source_plugin == candidate_plugin:
+        score += 360
+    if source_plugin_title and source_plugin_title == candidate_plugin_title:
+        score += 180
+    if source_title and source_title == candidate_title:
+        score += 260
+    elif source_title and candidate_title and (source_title in candidate_title or candidate_title in source_title):
+        score += 120
+    if source_category and source_category == candidate_category:
+        score += 120
+    if score >= 360 and source_title and candidate_title:
+        return score
+    if source_panel_id and source_panel_id == candidate_panel_id:
+        return score
+    return 0
+
+
+def find_panel_by_name_match(state, source_payload):
+    if state is None or not isinstance(source_payload, dict):
+        return ""
+    space_type = getattr(state, "space_type", "VIEW_3D")
+    runtime_ids = runtime_panel_ids_for_space(space_type)
+    old_id = source_payload.get("panel_id", "")
+    if old_id and old_id in runtime_ids:
+        return old_id
+    best_id = ""
+    best_score = 0
+    for record in getattr(state, "panel_registry", []):
+        panel_id = getattr(record, "panel_id", "")
+        if not panel_id or panel_id == "BWFLOW_PT_workflow" or panel_id not in runtime_ids:
+            continue
+        candidate = panel_match_payload_from_record(state, record)
+        score = panel_match_score(source_payload, candidate)
+        if score > best_score:
+            best_id = panel_id
+            best_score = score
+    return best_id if best_score >= 520 else ""
+
+
+def remap_imported_workflow_panel_ids(state, workflow_data):
+    if not isinstance(workflow_data, dict):
+        return []
+    match_by_id = panel_match_payloads_by_id(state, workflow_data)
+    remapped = []
+    seen = set()
+    for panel_id in unique_panel_ids(workflow_data.get("panels", [])):
+        if panel_id == "BWFLOW_PT_workflow":
+            target_id = panel_id
+        else:
+            source_payload = match_by_id.get(panel_id) or {"panel_id": panel_id}
+            target_id = find_panel_by_name_match(state, source_payload)
+        if target_id and target_id not in seen:
+            remapped.append(target_id)
+            seen.add(target_id)
+    return remapped
+
+
+def rematch_workflow_panels_by_name(state, workflow):
+    if state is None or workflow is None:
+        return 0, 0
+    runtime_ids = runtime_panel_ids_for_space(getattr(state, "space_type", "VIEW_3D"))
+    changed = 0
+    missing = 0
+    seen = set()
+    for item in getattr(workflow, "panels", []):
+        panel_id = getattr(item, "panel_id", "")
+        if not panel_id or panel_id == "BWFLOW_PT_workflow":
+            continue
+        if panel_id in runtime_ids:
+            seen.add(panel_id)
+            continue
+        missing += 1
+        record = find_registry_record(state, panel_id)
+        source_payload = panel_match_payload_from_record(state, record) or {"panel_id": panel_id}
+        matched_id = find_panel_by_name_match(state, source_payload)
+        if matched_id and matched_id not in seen:
+            item.panel_id = matched_id
+            seen.add(matched_id)
+            changed += 1
+    if changed:
+        normalize_workflow_active_panel_index(workflow)
+        clear_panel_library_click_state(state)
+    current_ids = {getattr(item, "panel_id", "") for item in getattr(workflow, "panels", [])}
+    for source_payload in imported_workflow_panel_matches(state, workflow):
+        matched_id = find_panel_by_name_match(state, source_payload)
+        if matched_id and matched_id not in current_ids:
+            item = workflow.panels.add()
+            item.panel_id = matched_id
+            current_ids.add(matched_id)
+            changed += 1
+    if changed:
+        normalize_workflow_active_panel_index(workflow)
+        clear_panel_library_click_state(state)
+    return changed, missing
 
 
 def script_library_signature_from_payload(payload):
@@ -4037,17 +5612,7 @@ def merge_script_library_payload(state, script_items):
         if signature in existing_signatures:
             continue
         item = state.script_library.add()
-        item.name = unique_script_library_name(state, payload.get("name", ""), exclude_index=len(state.script_library) - 1)
-        item.description = payload.get("description", "")
-        item.tags = payload.get("tags", "")
-        item.use_custom_panel = bool(payload.get("use_custom_panel", False))
-        item.panel_title = payload.get("panel_title", "")
-        item.panel_description = payload.get("panel_description", "")
-        item.script_path = payload.get("script_path", "")
-        item.text_block_name = payload.get("text_block_name", "")
-        item.script_source = payload.get("script_source", "")
-        item.config_payload = payload.get("config_payload", "")
-        item.ai_doc = payload.get("ai_doc", "")
+        apply_safe_imported_script_library_payload(state, item, payload)
         existing_signatures.add(signature)
         added += 1
     return added
@@ -4057,12 +5622,112 @@ def unique_workflow_name_for_import(state, base_name, exclude_index=None):
     return unique_workflow_name(state, base_name, fallback="导入工作流", exclude_index=exclude_index)
 
 
+def apply_safe_imported_script_library_payload(state, item, item_data):
+    if item is None or not isinstance(item_data, dict):
+        return False
+    payload = sanitize_script_library_payload(item_data)
+    if payload is None:
+        return False
+
+    item.name = unique_script_library_name(state, payload.get("name", ""), exclude_index=None) if state is not None else payload.get("name", "")
+    item.description = payload.get("description", "")
+    item.tags = payload.get("tags", "")
+    item.use_custom_panel = bool(payload.get("use_custom_panel", False))
+    item.panel_title = payload.get("panel_title", "")
+    item.panel_description = payload.get("panel_description", "")
+    item.text_block_name = ""
+    item.script_source = ""
+    item.config_payload = ""
+    item.ai_doc = ""
+
+    source = payload.get("script_source", "")
+    source_path = ""
+    if source:
+        try:
+            source_path = write_preset_import_text_asset(None, item.name, "library_script", source, "py")
+        except Exception:
+            traceback.print_exc()
+    item.script_path = source_path or payload.get("script_path", "")
+
+    config_payload = payload.get("config_payload", "")
+    if config_payload:
+        try:
+            config_path = write_preset_import_text_asset(None, item.name, "library_config", config_payload, "json")
+            item.config_payload = import_asset_note("external_config", config_path)
+        except Exception:
+            traceback.print_exc()
+
+    ai_doc = payload.get("ai_doc", "")
+    if ai_doc:
+        try:
+            ai_doc_path = write_preset_import_text_asset(None, item.name, "library_ai_doc", ai_doc, "md")
+            item.ai_doc = import_asset_note("external_ai_doc", ai_doc_path)
+        except Exception:
+            traceback.print_exc()
+
+    return True
+
+
+def apply_safe_imported_module_payload(workflow, module, module_data):
+    if workflow is None or module is None or not isinstance(module_data, dict):
+        return False
+
+    module.name = normalize_workflow_name(coerce_text_value(module_data.get("name", ""), max_chars=MAX_RNA_NAME_CHARS), "Imported Module")
+    module.enabled = coerce_bool_value(module_data.get("enabled", True), True)
+    module.use_custom_panel = coerce_bool_value(module_data.get("use_custom_panel", False), False)
+    module.runtime_panel_expanded = coerce_bool_value(
+        module_data.get("runtime_panel_expanded", not module_prefers_collapsed_runtime_panel(module_data)),
+        not module_prefers_collapsed_runtime_panel(module_data),
+    )
+    module.panel_title = normalize_text_value(coerce_text_value(module_data.get("panel_title", ""), max_chars=MAX_RNA_NAME_CHARS), "")
+    module.panel_description = normalize_text_value(coerce_text_value(module_data.get("panel_description", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS), "")
+    module.description = normalize_text_value(coerce_text_value(module_data.get("description", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS), "")
+    module.text_block_name = ""
+    module.script_source = ""
+    module.config_payload = ""
+    module.ai_doc = ""
+
+    source = coerce_text_value(module_data.get("script_source", ""))
+    source_path = ""
+    if source:
+        try:
+            source_path = write_preset_import_text_asset(workflow, module.name, "script", source, "py")
+        except Exception:
+            traceback.print_exc()
+
+    if source_path:
+        module.script_path = source_path
+    else:
+        module.script_path = coerce_text_value(module_data.get("script_path", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS)
+        if not module.script_path:
+            module.script_path = unique_default_module_script_path(workflow, module)
+
+    config_payload = coerce_text_value(module_data.get("config_payload", ""))
+    if config_payload:
+        try:
+            config_path = write_preset_import_text_asset(workflow, module.name, "config", config_payload, "json")
+            module.config_payload = import_asset_note("external_config", config_path)
+        except Exception:
+            traceback.print_exc()
+
+    ai_doc = coerce_text_value(module_data.get("ai_doc", ""))
+    if ai_doc:
+        try:
+            ai_doc_path = write_preset_import_text_asset(workflow, module.name, "ai_doc", ai_doc, "md")
+            module.ai_doc = import_asset_note("external_ai_doc", ai_doc_path)
+        except Exception:
+            traceback.print_exc()
+
+    return True
+
+
 def apply_module_payload_to_workflow(workflow, module_data):
     module = workflow.modules.add()
+    return apply_safe_imported_module_payload(workflow, module, module_data)
     module.name = normalize_workflow_name(module_data.get("name", ""), "导入模块")
     module.enabled = bool(module_data.get("enabled", True))
     module.use_custom_panel = bool(module_data.get("use_custom_panel", False))
-    module.runtime_panel_expanded = bool(module_data.get("runtime_panel_expanded", True))
+    module.runtime_panel_expanded = bool(module_data.get("runtime_panel_expanded", not module_prefers_collapsed_runtime_panel(module_data)))
     module.panel_title = normalize_text_value(module_data.get("panel_title", ""), "")
     module.panel_description = normalize_text_value(module_data.get("panel_description", ""), "")
     module.script_path = module_data.get("script_path", "")
@@ -4084,7 +5749,6 @@ def apply_current_workflow_preset_payload(state, preset_payload, merge_shared=Tr
     imported_name = normalize_workflow_name(workflow_data.get("name", ""), "导入工作流")
     if merge_shared:
         merge_panel_registry_payload(state, sanitized.get("panel_registry", []))
-        merge_script_library_payload(state, sanitized.get("script_library", []))
 
     workflow = state.workflows.add()
     target_index = len(state.workflows) - 1
@@ -4092,12 +5756,14 @@ def apply_current_workflow_preset_payload(state, preset_payload, merge_shared=Tr
     workflow.is_default = False
     workflow.description = normalize_workflow_description(workflow_data.get("description", ""), "")
     workflow.tag_filter = workflow_data.get("tag_filter", "")
-    replace_workflow_panels(workflow, workflow_data.get("panels", []))
+    workflow.missing_warning_dismissed = bool(workflow_data.get("missing_warning_dismissed", False))
+    replace_workflow_panels(workflow, remap_imported_workflow_panel_ids(state, workflow_data))
     clear_collection(workflow.modules)
     for module_data in workflow_data.get("modules", []):
         apply_module_payload_to_workflow(workflow, module_data)
 
     state.active_workflow_index = target_index
+    cache_imported_workflow_panel_matches(state, workflow, workflow_data)
     ensure_one_default_workflow(state)
     ensure_go_workflow_panel_entry(state)
     normalize_workflow_active_panel_index(workflow)
@@ -4105,18 +5771,7 @@ def apply_current_workflow_preset_payload(state, preset_payload, merge_shared=Tr
 
 
 def merge_preset_entries_shared_payloads(state, entries):
-    if state is None:
-        return
-    panel_records = []
-    script_items = []
-    for entry in entries or []:
-        workflow_payload = current_workflow_preset_payload_from_entry(entry)
-        if not isinstance(workflow_payload, dict):
-            continue
-        panel_records.extend(workflow_payload.get("panel_registry", []))
-        script_items.extend(workflow_payload.get("script_library", []))
-    merge_panel_registry_payload(state, panel_records)
-    merge_script_library_payload(state, script_items)
+    return
 
 
 def workflow_entry_is_default(entry):
@@ -4251,23 +5906,169 @@ def current_workflow_preset_payload_from_entry(entry):
     )
 
 
-def populate_preset_workflow_list(state, entries):
+def attach_panel_matches_from_registry_to_entry(entry):
+    if not isinstance(entry, dict):
+        return entry
+    workflow = entry.get("workflow")
+    if not isinstance(workflow, dict):
+        return entry
+    existing_matches = [
+        payload
+        for payload in (sanitize_panel_match_payload(item) for item in coerce_list_value(workflow.get("panel_matches", [])))
+        if payload is not None
+    ]
+    if existing_matches:
+        workflow["panel_matches"] = existing_matches
+        return entry
+
+    registry_by_id = {}
+    for record_data in coerce_list_value(entry.get("panel_registry", [])):
+        if not isinstance(record_data, dict):
+            continue
+        panel_id = coerce_text_value(record_data.get("panel_id", ""), max_chars=MAX_RNA_NAME_CHARS).strip()
+        if panel_id:
+            registry_by_id[panel_id] = record_data
+
+    matches = []
+    for panel_id in unique_panel_ids(workflow.get("panels", [])):
+        record_data = registry_by_id.get(panel_id)
+        if isinstance(record_data, dict):
+            payload = sanitize_panel_match_payload(
+                {
+                    "panel_id": panel_id,
+                    "title": record_data.get("title", ""),
+                    "category": record_data.get("category", ""),
+                    "source_module": record_data.get("source_module", ""),
+                    "plugin_key": record_data.get("plugin_key", record_data.get("source_module", "")),
+                    "plugin_title": record_data.get("plugin_title", record_data.get("category", "")),
+                    "addon_version": record_data.get("addon_version", ""),
+                }
+            )
+        else:
+            payload = sanitize_panel_match_payload({"panel_id": panel_id})
+        if payload is not None:
+            matches.append(payload)
+    workflow["panel_matches"] = matches
+    return entry
+
+
+def prepare_safe_preset_entries(entries):
+    prepared = []
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        item = dict(entry)
+        workflow = dict(entry.get("workflow", {})) if isinstance(entry.get("workflow"), dict) else {}
+        item["workflow"] = workflow
+        prepared.append(attach_panel_matches_from_registry_to_entry(item))
+    return prepared
+
+
+def import_single_preset_entry(context, state, entry):
+    if state is None or not isinstance(entry, dict):
+        return None
+    ensure_minimum_setup(context.scene)
+    workflow_payload = current_workflow_preset_payload_from_entry(entry)
+    return apply_current_workflow_preset_payload(state, workflow_payload, merge_shared=False)
+
+
+def preset_import_cache_key(state):
+    if state is None:
+        return ""
+    return str(getattr(state, "space_type", "VIEW_3D") or "VIEW_3D")
+
+
+def set_preset_import_cache(state, filepath, entries, selected_index=0):
+    key = preset_import_cache_key(state)
+    if not key:
+        return
+    PRESET_IMPORT_ENTRY_CACHE[key] = {
+        "filepath": str(filepath or ""),
+        "entries": list(entries or []),
+        "selected_index": int(selected_index or 0),
+    }
+
+
+def clear_preset_import_cache(state):
+    key = preset_import_cache_key(state)
+    if key:
+        PRESET_IMPORT_ENTRY_CACHE.pop(key, None)
+
+
+def get_preset_import_cache(state):
+    return PRESET_IMPORT_ENTRY_CACHE.get(preset_import_cache_key(state), {})
+
+
+def get_preset_import_entries(state):
+    cache = get_preset_import_cache(state)
+    entries = cache.get("entries", [])
+    return entries if isinstance(entries, list) else []
+
+
+def preset_import_entry_at(state, index):
+    entries = get_preset_import_entries(state)
+    if not entries:
+        return None
+    index = clamp_index(index, len(entries))
+    return entries[index]
+
+
+def preset_import_selected_index(state):
+    entries = get_preset_import_entries(state)
+    if not entries:
+        return -1
+    cache = get_preset_import_cache(state)
+    return clamp_index(int(cache.get("selected_index", 0) or 0), len(entries))
+
+
+def set_preset_import_selected_index(state, index):
+    cache = get_preset_import_cache(state)
+    entries = get_preset_import_entries(state)
+    if not cache or not entries:
+        return -1
+    selected_index = clamp_index(index, len(entries))
+    cache["selected_index"] = selected_index
+    try:
+        state.preset_workflow_index = selected_index
+    except Exception:
+        pass
+    return selected_index
+
+
+def populate_preset_workflow_list(state, entries, preferred_space_type=None):
     if state is None:
         return 0
-    clear_collection(state.preset_workflows)
-    for entry in entries:
-        workflow = entry.get("workflow", {})
-        item = state.preset_workflows.add()
-        item.selected = not bool(workflow.get("is_default", False))
-        item.name = workflow.get("name", "") or "Workflow"
-        item.source_space_type = entry.get("space_type", "VIEW_3D")
-        item.source_label = entry.get("source_label", "") or SPACE_LABELS.get(item.source_space_type, item.source_space_type)
-        item.source_key = entry.get("key", "")
-        item.panel_count = len(workflow.get("panels", []))
-        item.module_count = len(workflow.get("modules", []))
-        item.is_default = bool(workflow.get("is_default", False))
-    state.preset_workflow_index = 0
-    return len(state.preset_workflows)
+    selectable_entries = [entry for entry in entries if not workflow_entry_is_default(entry)]
+    preferred_entries = [
+        entry
+        for entry in selectable_entries
+        if preferred_space_type and entry.get("space_type", "VIEW_3D") == preferred_space_type
+    ]
+    default_selected_keys = {
+        entry.get("key", "")
+        for entry in (preferred_entries if preferred_entries else selectable_entries)
+        if entry.get("key", "")
+    }
+    selected_index = 0
+    for index, entry in enumerate(entries):
+        entry = entries[index] if index < len(entries) else {}
+        if entry.get("key", "") in default_selected_keys:
+            selected_index = index
+            break
+    try:
+        state.preset_workflow_index = selected_index
+    except Exception:
+        pass
+    set_preset_import_cache(state, get_preset_import_cache(state).get("filepath", ""), entries, selected_index=selected_index)
+    return len(entries)
+
+
+def preset_workflow_selection_counts(state):
+    if state is None:
+        return 0, 0
+    total = len(get_preset_import_entries(state))
+    selected = 1 if total else 0
+    return selected, total
 
 
 def save_global_workflow_state_now(scene=None):
@@ -4402,6 +6203,52 @@ def split_preview_lines(text, limit=6, width=64):
     return lines
 
 
+def image_preview_cache_signature(image):
+    filepath = str(getattr(image, "filepath", "") or "").strip()
+    if filepath:
+        try:
+            normalized = os.path.normcase(os.path.abspath(filepath))
+        except Exception:
+            normalized = filepath
+        return normalized, (0, 0)
+    name = str(getattr(image, "name_full", "") or getattr(image, "name", "") or "")
+    return f"memory::{name}", (0, 0)
+
+
+def cached_image_preview_icon_id(image):
+    if image is None:
+        return 0
+    cache_key, signature = image_preview_cache_signature(image)
+    cached = IMAGE_PREVIEW_ICON_CACHE.get(cache_key)
+    image_name = str(getattr(image, "name", "") or "")
+    image_ptr = 0
+    try:
+        image_ptr = int(image.as_pointer())
+    except Exception:
+        image_ptr = 0
+    if (
+        isinstance(cached, dict)
+        and cached.get("signature") == signature
+        and cached.get("image_name") == image_name
+        and int(cached.get("image_ptr", 0) or 0) == image_ptr
+        and int(cached.get("icon_id", 0) or 0) > 0
+    ):
+        return int(cached.get("icon_id", 0) or 0)
+    preview_ensure = getattr(image, "preview_ensure", None)
+    if callable(preview_ensure):
+        preview_ensure()
+    preview = getattr(image, "preview", None)
+    icon_id = int(getattr(preview, "icon_id", 0) or 0) if preview is not None else 0
+    if icon_id > 0:
+        IMAGE_PREVIEW_ICON_CACHE[cache_key] = {
+            "signature": signature,
+            "image_name": image_name,
+            "image_ptr": image_ptr,
+            "icon_id": icon_id,
+        }
+    return icon_id
+
+
 def draw_folded_text_block(layout, owner, prop_name, title, text, icon="INFO", expanded_limit=6, width=64):
     value = str(text or "").strip()
     if not value:
@@ -4440,12 +6287,26 @@ def compact_multiline_text(text, max_chars, max_lines=None):
     return value
 
 
+def runtime_numeric_prop_kwargs(**kwargs):
+    result = {}
+    alias_map = {
+        "min": "min",
+        "max": "max",
+        "soft_min": "soft_min",
+        "soft_max": "soft_max",
+        "step": "step",
+        "precision": "precision",
+        "slider": "slider",
+    }
+    for source_key, target_key in alias_map.items():
+        if source_key in kwargs and kwargs[source_key] is not None:
+            result[target_key] = kwargs[source_key]
+    return result
+
+
 def finalize_ai_doc(lines):
     text = "\n".join(str(line) for line in lines).strip()
-    if len(text) <= AI_DOC_MAX_CHARS:
-        return text
-    suffix = "\n\n（AI 文档已按长度上限截断；请保留关键需求，长说明放到外部文档。）"
-    return text[: max(0, AI_DOC_MAX_CHARS - len(suffix))].rstrip() + suffix
+    return text
 
 
 def module_script_abspath(module):
@@ -4492,12 +6353,65 @@ def default_module_scripts_dir():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "go_workflow_modules")
 
 
+def preset_import_assets_dir():
+    return os.path.join(default_module_scripts_dir(), "_imported_presets")
+
+
+def write_preset_import_text_asset(workflow, module_name, suffix, content, extension):
+    text = str(content or "").lstrip("\ufeff")
+    if not text:
+        return ""
+    folder = preset_import_assets_dir()
+    os.makedirs(folder, exist_ok=True)
+    workflow_part = safe_filename_component(getattr(workflow, "name", "") or "library", "library")
+    module_part = safe_filename_component(module_name or "module", "module")
+    suffix_part = safe_filename_component(suffix or "asset", "asset")
+    filepath = os.path.join(folder, f"{workflow_part}_{module_part}_{suffix_part}.{extension.lstrip('.')}")
+    base, ext = os.path.splitext(filepath)
+    counter = 2
+    while os.path.exists(filepath):
+        filepath = f"{base}_{counter}{ext}"
+        counter += 1
+    with open(filepath, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    return filepath
+
+
+def import_asset_note(label, filepath):
+    if not filepath:
+        return ""
+    basename = os.path.basename(filepath)
+    note = f"{label}: {basename}"
+    return coerce_text_value(note, max_chars=MAX_PRESET_IMPORT_RNA_TEXT_CHARS)
+
+
 def project_root_dir():
     return os.path.dirname(default_module_scripts_dir())
 
 
 def builtin_special_presets_dir():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "special_presets")
+
+
+def module_prefers_collapsed_runtime_panel(module_or_data):
+    if module_or_data is None:
+        return False
+    if isinstance(module_or_data, dict):
+        script_path = str(module_or_data.get("script_path", "") or "")
+        text_block_name = str(module_or_data.get("text_block_name", "") or "")
+        panel_title = str(module_or_data.get("panel_title", "") or module_or_data.get("name", "") or "")
+    else:
+        script_path = str(getattr(module_or_data, "script_path", "") or "")
+        text_block_name = str(getattr(module_or_data, "text_block_name", "") or "")
+        panel_title = str(getattr(module_or_data, "panel_title", "") or getattr(module_or_data, "name", "") or "")
+    script_name = os.path.basename(script_path).casefold()
+    text_name = os.path.basename(text_block_name).casefold()
+    title_name = panel_title.casefold()
+    return (
+        script_name == "arkit形态键工作流参考.py".casefold()
+        or text_name == "arkit形态键工作流参考.py".casefold()
+        or "arkit 形态键工作流参考".casefold() in title_name
+    )
 
 
 BUILTIN_SCRIPT_LIBRARY_TAG = "go_workflow_builtin"
@@ -4733,7 +6647,7 @@ def apply_special_preset_to_module(workflow, module, spec):
     module.name = spec.get("module_name", module.name or "特殊预设模块")
     module.enabled = True
     module.use_custom_panel = True
-    module.runtime_panel_expanded = True
+    module.runtime_panel_expanded = False
     module.panel_title = spec.get("preset_name", module.name)
     module.panel_description = spec.get("workflow_description", "")
     module.description = spec.get("module_description", "")
@@ -4756,7 +6670,7 @@ def apply_module_payload_to_existing_module(module, module_data):
         ("name", normalize_workflow_name(module_data.get("name", ""), getattr(module, "name", "") or "模块")),
         ("enabled", bool(module_data.get("enabled", True))),
         ("use_custom_panel", bool(module_data.get("use_custom_panel", False))),
-        ("runtime_panel_expanded", bool(module_data.get("runtime_panel_expanded", True))),
+        ("runtime_panel_expanded", bool(module_data.get("runtime_panel_expanded", not module_prefers_collapsed_runtime_panel(module_data)))),
         ("panel_title", normalize_text_value(module_data.get("panel_title", ""), "")),
         ("panel_description", normalize_text_value(module_data.get("panel_description", ""), "")),
         ("script_path", module_data.get("script_path", "")),
@@ -4811,7 +6725,7 @@ def refresh_builtin_workflow_modules(state):
                     getattr(module, "runtime_panel_expanded", True),
                 )
                 apply_special_preset_to_module(workflow, module, special_spec)
-                module.runtime_panel_expanded = True
+                module.runtime_panel_expanded = False
                 after = (
                     getattr(module, "script_path", ""),
                     getattr(module, "script_source", ""),
@@ -4832,7 +6746,7 @@ def refresh_builtin_workflow_modules(state):
                 continue
             payload_data = dict(payload)
             payload_data["enabled"] = getattr(module, "enabled", True)
-            payload_data["runtime_panel_expanded"] = True
+            payload_data["runtime_panel_expanded"] = False
             if apply_module_payload_to_existing_module(module, payload_data):
                 changed += 1
         if workflow_has_special_preset and special_spec:
@@ -4844,7 +6758,7 @@ def refresh_builtin_workflow_modules(state):
                     continue
                 module_data = dict(payload)
                 module_data["enabled"] = True
-                module_data["runtime_panel_expanded"] = True
+                module_data["runtime_panel_expanded"] = False
                 apply_module_payload_to_workflow(workflow, module_data)
                 existing_module_names.add(script_name)
                 changed += 1
@@ -4868,7 +6782,7 @@ def create_special_preset_workflow(scene, preset_type):
                 continue
             module_data = dict(payload)
             module_data["enabled"] = True
-            module_data["runtime_panel_expanded"] = True
+            module_data["runtime_panel_expanded"] = False
             apply_module_payload_to_workflow(workflow, module_data)
         workflow.active_module_index = 0
     return created
@@ -4981,7 +6895,8 @@ def build_module_ai_doc_legacy_unused(workflow, module):
             "6. 成功返回 {'FINISHED'}；用户操作不满足条件时 raise Exception('清楚的人类可读错误') 或返回 {'CANCELLED'}。",
             "",
             "panel_api 可用能力:",
-            "- 布局: box/layout.section/row/column/separator/label，用于组织清楚的参数区、操作区、提示区。",
+            "- 布局: box/section/row/column/separator/label/split/grid_flow，用于组织清楚的参数区、操作区、提示区。",
+            "- Blender 原生 UI 透传: prop/prop_search/operator/menu/operator_menu_enum/template_list/template_id/template_icon。",
             "- 可读写字段: draw_object_picker、draw_active_object_capture、draw_text_input、draw_toggle、draw_float_input、draw_int_input。",
             "- 读取字段: get_object、get_text、get_bool、get_float、get_int。",
             "- 写入字段: set_object、set_text、set_bool、set_float、set_int。字段会保存到当前场景，不要自己写全局变量。",
@@ -5007,13 +6922,10 @@ def build_module_ai_doc_legacy_unused(workflow, module):
             "",
             "def run(context, scene, workflow, module):",
             "    items = _validate(context, scene, workflow, module)",
-            "    dry_run = panel_api.get_bool('dry_run', False)",
             "    processed = 0",
             "    for item in items:",
             "        # TODO: 在这里写模块真正要做的事情。",
             "        # 示例: 读取/修改对象属性、创建数据块、批量重命名、检查场景、导入导出等。",
-            "        if dry_run:",
-            "            continue",
             "        processed += 1",
             "    module_state.set('last_result', f'已检查 {len(items)} 项，执行 {processed} 项')",
             "    return {'FINISHED'}",
@@ -5021,7 +6933,6 @@ def build_module_ai_doc_legacy_unused(workflow, module):
             "def draw_panel(layout, context, scene, workflow, module, panel_api, module_state):",
             "    settings = panel_api.section(layout, '参数', icon='TOOL_SETTINGS')",
             "    panel_api.draw_text_input(settings, 'name_prefix', '名称/前缀', default=module.name or 'GoWorkflowTool')",
-            "    panel_api.draw_toggle(settings, 'dry_run', '只检查不写入', default=True)",
             "    status = module_state.get('last_result', '')",
             "    if status:",
             "        panel_api.label(layout, status, icon='CHECKMARK')",
@@ -5106,7 +7017,6 @@ def build_module_ai_doc_v029_unused(workflow, module):
             "",
             "def draw_panel(layout, context, scene, workflow, module, panel_api, module_state):",
             "    box = panel_api.section(layout, '参数')",
-            "    panel_api.draw_toggle(box, 'dry_run', '只检查不写入', default=True)",
             "    status = module_state.get('last_result', '')",
             "    if status:",
             "        panel_api.label(layout, status, icon='CHECKMARK')",
@@ -5122,103 +7032,180 @@ def build_module_ai_doc(workflow, module):
         getattr(module, "description", ""),
         AI_DOC_DESCRIPTION_MAX_CHARS,
         max_lines=12,
-    ) or "未填写，请根据模块名称补全合理的功能目标。"
+    ) or "请根据模块名称和用户补充说明生成具体功能。"
+    panel_description = compact_multiline_text(
+        getattr(module, "panel_description", ""),
+        AI_DOC_DESCRIPTION_MAX_CHARS,
+        max_lines=10,
+    )
+    current_ai_doc = compact_multiline_text(
+        getattr(module, "ai_doc", ""),
+        AI_DOC_DESCRIPTION_MAX_CHARS * 2,
+        max_lines=40,
+    )
+    has_specific_ai_doc = bool(current_ai_doc) and "Go Workflow 自定义脚本 AI 开发文档" not in current_ai_doc
+
     lines = [
-        "# Go工作流通用脚本模块开发说明",
+        "# Go Workflow 自定义脚本 AI 开发文档",
         f"- 模块名称: {module.name}",
         f"- 所属工作流: {workflow.name}",
         f"- 目标 .py 路径: {script_path}",
-        f"- 自定义面板: {'启用' if needs_panel else '关闭'}",
+        f"- 启用自定义脚本面板: {'是' if needs_panel else '否'}",
         "",
-        "模块说明:",
+        "模块目标:",
         module_description,
-        "",
-        "必须接口:",
-        "1. 必须定义 run(context, scene, workflow, module)。",
-        "2. 成功返回 {'FINISHED'}；条件不满足时 raise Exception('给用户看的中文错误原因')。",
-        "3. 导入脚本时不要执行真实操作，所有写入都放进 run 或 on_panel_action。",
-        "",
-        "运行环境:",
-        "- 已注入: bpy, context, scene, workflow, module, panel_api, module_state。",
-        "- `module_state` 适合保存短状态、日志、最近结果。",
-        "- `module.config_payload` 可保存会随 `.goworkflow` 导出的附加文本配置，例如 csv/json。",
-        "",
-        "通用要求:",
-        "- 先检查对象、模式、选择、路径、输入参数和数据块类型。",
-        "- 批处理时跳过不适用对象，并统计处理数量。",
-        "- 不自动删除用户数据；覆盖、删除、写文件前要有明确开关。",
-        "- 如果没有特殊要求，不要使用 bpy.ops；需要时先检查 context/mode/active_object。",
-        "- 记录短状态: module_state.set('last_result', 文本) 或 panel_api.set_status(文本)。",
-        "",
-        "基础脚本模板骨架（建议直接按这个结构生成）:",
-        "```python",
-        "import bpy",
-        "",
-        "def _selected(context):",
-        "    return list(getattr(context, 'selected_objects', []) or [])",
-        "",
-        "def _validate(context, scene, workflow, module):",
-        "    items = _selected(context)",
-        "    if not items:",
-        "        raise Exception('请先选择要处理的对象')",
-        "    return items",
-        "",
-        "def run(context, scene, workflow, module):",
-        "    items = _validate(context, scene, workflow, module)",
-        "    processed = 0",
-        "    for obj in items:",
-        "        if obj is None:",
-        "            continue",
-        "        # TODO: 在这里写真正操作。批处理时跳过不适用对象。",
-        "        processed += 1",
-        "    module_state.set('last_result', f'已处理 {processed} 个对象')",
-        "    return {'FINISHED'}",
-        "```",
     ]
+    if panel_description:
+        lines.extend(["", "面板目标:", panel_description])
+    if has_specific_ai_doc:
+        lines.extend(["", "用户补充 AI 说明:", current_ai_doc])
+
+    lines.extend(
+        [
+            "",
+            "必须遵守的脚本接口:",
+            "1. 必须定义 run(context, scene, workflow, module)，点击模块运行按钮时调用。",
+            "2. 可选定义 draw_panel(layout, context, scene, workflow, module, panel_api, module_state)，只绘制本模块 UI。",
+            "3. 可选定义 on_panel_action(action, context, scene, workflow, module, panel_api, module_state)，处理自定义按钮。",
+            "4. 成功返回 {'FINISHED'}；用户条件不满足时 raise Exception('给用户看的中文原因') 或返回 {'CANCELLED'}。",
+            "5. 不要在导入脚本时执行真实操作；所有写入、导出、删除、bpy.ops 调用放到 run 或 on_panel_action。",
+            "",
+            "运行环境:",
+            "- 脚本全局可直接访问 bpy、context、scene、workflow、module、panel_api、module_state。",
+            "- module_state 是当前模块的轻量持久状态字典，适合保存 last_result、debug_log、临时统计和按钮结果。",
+            "- module_state 支持 dict 风格访问: module_state['key']、'key' in module_state、len(module_state)、keys/items/values/copy/as_dict/to_dict。",
+            "- module_state 支持 get/set/pop/update/clear/append_log，也支持 get_text/get_bool/get_float/get_int/get_enum 与 set_text/set_bool/set_float/set_int/set_enum。",
+            "- 用户可编辑参数优先用 panel_api 的 draw_* 与 get_*；运行结果、预览结果、缓存状态优先用 module_state。",
+            "- module.config_payload 可保存模块配置，适合 csv/json/列表等可序列化数据。",
+            "- draw_panel 绘制期间由 Go Workflow 嵌入到模块区域，不需要注册新的 bpy.types.Panel。",
+            "",
+            "开发规则:",
+            "- 优先使用 Blender 数据 API，例如 bpy.data、对象属性、Modifier/Material/Collection API。",
+            "- 必须先校验对象、模式、选择、路径、用户输入；错误提示写清楚用户该怎么修正。",
+            "- 批量处理时跳过不适用对象，必要时统计 processed/skipped。",
+            "- 不要自动删除用户数据；覆盖、删除、写文件前提供 overwrite/delete_source/confirm 等明确开关。",
+            "- draw_panel 只负责 UI 和轻量读取，不创建物体、不切模式、不写文件、不执行耗时扫描。",
+            "- 需要 bpy.ops 时先检查 context/mode/active_object，能用数据 API 替代就不要用 bpy.ops。",
+            "- 状态提示优先写 module_state.set('last_result', text)，也可用 panel_api.set_status(text)。",
+            "",
+            "基础脚本骨架:",
+            "```python",
+            "import bpy",
+            "",
+            "def _selected(context):",
+            "    return list(getattr(context, 'selected_objects', []) or [])",
+            "",
+            "def _validate(context, scene, workflow, module):",
+            "    items = _selected(context)",
+            "    if not items:",
+            "        raise Exception('请先选择要处理的对象')",
+            "    return items",
+            "",
+            "def run(context, scene, workflow, module):",
+            "    items = _validate(context, scene, workflow, module)",
+            "    processed = 0",
+            "    skipped = 0",
+            "    for obj in items:",
+            "        if obj is None:",
+            "            skipped += 1",
+            "            continue",
+            "        # TODO: 在这里实现模块功能。",
+            "        processed += 1",
+            "    module_state.set('last_result', f'已检查 {len(items)} 项，处理 {processed} 项，跳过 {skipped} 项')",
+            "    return {'FINISHED'}",
+            "```",
+        ]
+    )
     if needs_panel:
         lines.extend(
             [
                 "",
-                "自定义面板已启用:",
-                "- 可定义 draw_panel(layout, context, scene, workflow, module, panel_api, module_state)。",
-                "- 可定义 on_panel_action(action, context, scene, workflow, module, panel_api, module_state)。",
-                "- draw_panel 只画 UI；不要改场景、写文件、切模式、调用 bpy.ops。",
-                "- on_panel_action 处理 draw_button / 字段回写后的动作；动作名可能是 FIELD_WRITE::字段名。",
-                "- 若字段需要长期保存，建议在 FIELD_WRITE::字段名 或 run(...) 中同步写入 module.config_payload / 模块配置，不要只依赖运行时临时字段。",
-                "- 参考图/预览类模块优先复用插件现有的 Blender 内部参考通道，不要再额外启动外部窗口或常驻子进程。",
+                "自定义脚本面板接口:",
+                "- draw_panel 的 layout 是 Blender 原生 UILayout，可直接使用 layout.box/row/column/split/prop/operator/template_list 等。",
+                "- 不要注册新的 bpy.types.Panel；Go Workflow 会把 draw_panel 嵌入当前模块区域。",
+                "- 优先使用原生 layout.* 组织 UI；panel_api 只作为字段持久化、按钮路由、状态块等辅助。",
+                "- on_panel_action 接收 panel_api.draw_button 或原生 bworkflow.module_runtime_action 触发的 action。",
+                "- draw_run_button 或 bworkflow.module_run 会调用 run(context, scene, workflow, module)。",
+                "- FIELD_WRITE:: 开头的 action 是字段写入回调，通常直接 return {'FINISHED'}。",
+                "- 参数字段 key 使用英文，例如 target_object、strength、sample_index；中文只用于 UI label。",
+                "- 原生 layout.prop 需要可绑定的数据源，普通运行时参数建议用 panel_api.draw_runtime_prop。",
                 "",
-                "panel_api 接口:",
-                "- 布局: section(layout, title, icon='NONE'), row(layout), column(layout), separator(layout), label(layout, text, icon='INFO')。",
-                "- 文本/提示: draw_note, draw_status, draw_log, set_status, get_status。",
-                "- 基础输入: draw_text_input, draw_toggle, draw_float_input, draw_int_input, draw_enum。",
-                "- 数据块输入: draw_object_picker, draw_active_object_capture, draw_material_picker, draw_collection_picker, draw_text_block_picker。",
-                "- 按钮: draw_button(layout, action, label, icon='NONE'), draw_run_button(layout, label, icon='PLAY')。",
-                "- 读取: get_text, get_bool, get_float, get_int, get_enum, get_object, get_material, get_collection, get_text_block。",
-                "- 写入: set_text, set_bool, set_float, set_int, set_enum, set_object, set_data_block, clear_value。",
-                "- 上下文: active_object(), selected_objects(type=None), visible_objects(type=None), context_summary()。",
+                "优先使用的 Blender 原生 UI:",
+                "- 布局: layout.box(), layout.row(align=True), layout.column(align=True), layout.split(factor=0.35), layout.separator()。",
+                "- 文本: layout.label(text='状态', icon='INFO')。",
+                "- 属性: row.prop(data, 'prop_name', text='名称'), row.prop(scene, '[\"custom_key\"]', text='参数'), row.prop_menu_enum(data, 'enum_prop')。",
+                "- 搜索: row.prop_search(data, 'object_name', bpy.data, 'objects', text='目标')。",
+                "- 操作: row.operator('bworkflow.module_runtime_action', text='预览', icon='VIEWZOOM'), row.operator_menu_enum(...), row.operator_enum(...)。",
+                "- 菜单/弹窗: layout.menu(...), layout.menu_contents(...), layout.popover(...)。",
+                "- 模板: layout.template_list(...), layout.template_ID(...), layout.template_ID_preview(...), layout.template_search(...), layout.template_icon(...), layout.template_icon_view(...), layout.template_color_picker(...), layout.template_curve_mapping(...), layout.template_preview(...)。",
                 "",
-                "自定义面板 UI 骨架（字段 key 用英文，label 可用中文）:",
+                "形态键/Shape Key 必须遵守:",
+                "- 活动形态键索引在 Object 上: obj.active_shape_key_index；不要写 obj.data.shape_keys.active_index，Key 数据块没有 active_index。",
+                "- 形态键列表在 obj.data.shape_keys.key_blocks；Basis 通常是索引 0，处理非 Basis 时要求 active_shape_key_index > 0。",
+                "- 安全访问示例: key_data = getattr(obj.data, 'shape_keys', None); key_blocks = getattr(key_data, 'key_blocks', None); index = getattr(obj, 'active_shape_key_index', -1)。",
+                "- 推荐直接用 panel_api.active_shape_key(obj, include_basis=False)、panel_api.shape_key_blocks(obj)、panel_api.valid_shape_key_objects(require_active_non_basis=True)。",
+                "",
+                "panel_api 辅助接口:",
+                "- 原生透传: prop、prop_search、prop_menu_enum、prop_enum、operator、operator_menu_enum、operator_enum、menu、menu_contents、popover、context_pointer_set、split、grid_flow、template_list、template_id、template_id_preview、template_search、template_icon、template_icon_view、template_color_picker、template_curve_mapping、template_preview。",
+                "- 未显式列出的 Blender UILayout 方法也可用 panel_api.xxx(layout, ...) 透传，例如 panel_api.template_ID(layout, data, 'prop') 会调用 layout.template_ID(data, 'prop')。",
+                "- 布局辅助: box、row、column、separator、label、section、foldout_section、set_enabled、set_alert。",
+                "- 字段绘制: draw_runtime_prop、draw_scene_prop、draw_text_input_inline、draw_toggle_inline、draw_float_input_inline、draw_int_input_inline、draw_enum。",
+                "- 数值字段 draw_float_input/draw_float_input_inline/draw_int_input/draw_int_input_inline 支持 min、max、soft_min、soft_max、step、precision、slider、factor 等常用参数。",
+                "- 数据选择: draw_object_picker_inline、draw_active_object_capture、draw_material_picker、draw_collection_picker、draw_text_block_picker、draw_file_path_input。",
+                "- 按钮: draw_button、draw_icon_button、draw_run_button。",
+                "- 读取: get_text、get_bool、get_float、get_int、get_enum、get_object、get_material、get_collection、get_text_block。",
+                "- 写入: set_text、set_bool、set_float、set_int、set_enum、set_object、set_data_block、clear_value。",
+                "- 上下文: active_object()、selected_objects(type=None)、visible_objects(type=None)、selected_mesh_objects(require_shape_keys=False)、shape_key_data(obj=None)、shape_key_blocks(obj=None)、active_shape_key_index(obj=None)、active_shape_key(obj=None, include_basis=True)、valid_shape_key_objects(require_active_non_basis=False)、context_summary()。",
+                "",
+                "module_state 状态接口:",
+                "- 基础: module_state.get(key, default=None)、set(key, value)、pop(key, default=None)、update(dict)、clear()、keys()、items()、values()、copy()、as_dict()、to_dict()。",
+                "- 字典访问: module_state['last_result'] = text、text = module_state.get('last_result', '')、'last_result' in module_state。",
+                "- 类型读取: get_text(key, default='')、get_bool(key, default=False)、get_float(key, default=0.0)、get_int(key, default=0)、get_enum(key, default='')。",
+                "- 类型写入: set_text/set_bool/set_float/set_int/set_enum；日志: append_log(message, key='debug_log', max_items=20)。",
+                "- 不要把 module_state 当作 UI 绘制器；绘制控件用 layout 或 panel_api。",
+                "",
+                "推荐自定义面板骨架，原生 layout 优先:",
                 "```python",
                 "def draw_panel(layout, context, scene, workflow, module, panel_api, module_state):",
-                "    box = panel_api.section(layout, module.name or '参数', icon='TOOL_SETTINGS')",
-                "    panel_api.draw_object_picker(box, 'target_object', '目标对象')",
-                "    panel_api.draw_text_input(box, 'name_prefix', '名称前缀', default='')",
-                "    panel_api.draw_toggle(box, 'dry_run', '只检查不写入', default=True)",
-                "    panel_api.draw_float_input(box, 'strength', '强度', default=1.0, min=0.0, max=1.0)",
+                "    box = layout.box()",
+                "    box.label(text=module.panel_title or module.name or '参数', icon='TOOL_SETTINGS')",
+                "",
+                "    col = box.column(align=True)",
+                "    panel_api.draw_runtime_prop(col, 'strength', 1.0, kind='float', label='强度', slider=True)",
+                "    panel_api.draw_float_input_inline(col, 'duration_seconds', '时长(秒)', default=2.0, factor=0.28, min=0.1, step=0.1, precision=2)",
+                "    panel_api.draw_object_picker_inline(col, 'target_object', '目标对象', factor=0.28, show_active_button=True)",
+                "    panel_api.draw_file_path_input(col, 'input_file', '输入文件', default='', factor=0.28, filter_glob='*.json;*.txt')",
+                "",
+                "    key_obj = panel_api.active_object()",
+                "    key_block = panel_api.active_shape_key(key_obj, include_basis=False)",
+                "    if key_block is not None:",
+                "        col.label(text=f'当前非 Basis 形态键: {key_block.name}', icon='SHAPEKEY_DATA')",
+                "",
+                "    advanced = panel_api.foldout_section(layout, 'show_advanced', '高级', icon='PREFERENCES', default_open=False)",
+                "    if advanced is not None:",
+                "        panel_api.draw_int_input_inline(advanced, 'sample_index', '样本序号', default=0, factor=0.28)",
+                "        panel_api.draw_note(advanced, '高级参数只在需要时展开，避免 N 面板长期绘制大量文本。')",
+                "",
                 "    status = module_state.get('last_result', '')",
                 "    if status:",
-                "        panel_api.label(layout, status, icon='INFO')",
-                "    row = panel_api.row(layout, align=True)",
-                "    panel_api.draw_button(row, 'preview', '预览', icon='VIEWZOOM')",
+                "        status_box = layout.box()",
+                "        status_box.label(text=str(status), icon='INFO')",
+                "",
+                "    row = layout.row(align=True)",
+                "    op = row.operator('bworkflow.module_runtime_action', text='预览', icon='VIEWZOOM')",
+                "    op.workflow_name = workflow.name",
+                "    op.module_name = module.name",
+                "    op.action_name = 'preview'",
                 "    panel_api.draw_run_button(row, '运行', icon='PLAY')",
                 "",
                 "def on_panel_action(action, context, scene, workflow, module, panel_api, module_state):",
                 "    if action == 'preview':",
-                "        module_state.set('last_result', '预览完成')",
+                "        items = _selected(context)",
+                "        module_state.set('last_result', f'当前选择 {len(items)} 项')",
                 "        return {'FINISHED'}",
                 "    if action.startswith('FIELD_WRITE::'):",
                 "        return {'FINISHED'}",
-                "    return {'FINISHED'}",
+                "    return {'CANCELLED'}",
                 "```",
             ]
         )
@@ -5226,11 +7213,11 @@ def build_module_ai_doc(workflow, module):
         lines.extend(
             [
                 "",
-                "自定义面板已关闭:",
-                "- 不要生成 draw_panel。",
-                "- 不要生成 on_panel_action。",
-                "- 不要使用 panel_api 绘制输入 UI。",
-                "- 只输出 run 相关逻辑；需要参数时从模块说明或场景上下文读取。",
+                "当前模块未启用自定义面板:",
+                "- 不需要生成 draw_panel。",
+                "- 不需要生成 on_panel_action。",
+                "- 不要假设存在专属 UI；把主要逻辑放进 run。",
+                "- 如果用户之后启用“需要自定义面板”，再补 draw_panel/on_panel_action。",
             ]
         )
     return finalize_ai_doc(lines)
@@ -5489,9 +7476,1356 @@ def merge_module_runtime_store(scene, workflow, module, module_store):
     return merged
 
 
+class CachedModuleStateProxy:
+    __slots__ = ("_data",)
+
+    def __init__(self, initial):
+        self._data = dict(initial or {})
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+    def __contains__(self, key):
+        return key in self._data
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __setitem__(self, key, value):
+        self._data[key] = value
+
+    def __delitem__(self, key):
+        del self._data[key]
+
+    def __len__(self):
+        return len(self._data)
+
+    def values(self):
+        return self._data.values()
+
+    def copy(self):
+        return dict(self._data)
+
+    def as_dict(self):
+        return dict(self._data)
+
+    def set(self, key, value):
+        self._data[key] = value
+        return value
+
+    def has(self, key):
+        return key in self._data
+
+    def get_value(self, key, default=None):
+        return self.get(key, default)
+
+    def set_value(self, key, value):
+        return self.set(key, value)
+
+    def get_text(self, key, default=""):
+        return str(self.get(key, default))
+
+    def set_text(self, key, value):
+        return self.set(key, str(value))
+
+    def get_bool(self, key, default=False):
+        value = self.get(key, default)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on", "是", "开", "启用"}
+        return bool(value)
+
+    def set_bool(self, key, value):
+        return self.set(key, bool(value))
+
+    def get_float(self, key, default=0.0):
+        try:
+            return float(self.get(key, default))
+        except Exception:
+            return float(default)
+
+    def set_float(self, key, value):
+        try:
+            value = float(value)
+        except Exception:
+            value = 0.0
+        return self.set(key, value)
+
+    def get_int(self, key, default=0):
+        try:
+            return int(self.get(key, default))
+        except Exception:
+            return int(default)
+
+    def set_int(self, key, value):
+        try:
+            value = int(value)
+        except Exception:
+            value = 0
+        return self.set(key, value)
+
+    def get_enum(self, key, default=""):
+        return str(self.get(key, default))
+
+    def set_enum(self, key, value):
+        return self.set(key, str(value))
+
+    def pop(self, key, default=None):
+        return self._data.pop(key, default)
+
+    def update(self, values=None, **kwargs):
+        if isinstance(values, dict):
+            self._data.update(values)
+        elif values is not None:
+            try:
+                self._data.update(dict(values))
+            except Exception:
+                pass
+        if kwargs:
+            self._data.update(kwargs)
+        return dict(self._data)
+
+    def clear(self):
+        self._data.clear()
+
+    def keys(self):
+        return self._data.keys()
+
+    def items(self):
+        return self._data.items()
+
+    def append_log(self, message, key="debug_log", max_items=20):
+        items = self._data.get(key)
+        if not isinstance(items, list):
+            items = []
+        items.append(str(message))
+        if max_items and len(items) > max_items:
+            items = items[-max_items:]
+        self._data[key] = items
+        return items
+
+    def to_dict(self):
+        return dict(self._data)
+
+
+class CachedModulePanelAPI:
+    __slots__ = (
+        "context",
+        "scene",
+        "state",
+        "workflow",
+        "module",
+        "allow_writes",
+        "field_specs",
+        "workflow_name",
+        "module_name",
+        "module_index",
+    )
+
+    def __init__(self, ctx, scn, store_proxy, workflow, module, allow_writes=True, field_specs=None):
+        self.context = ctx
+        self.scene = scn
+        self.state = store_proxy
+        self.workflow = workflow
+        self.module = module
+        self.allow_writes = allow_writes
+        self.field_specs = field_specs if field_specs is not None else []
+        self.workflow_name = getattr(workflow, "name", "")
+        self.module_name = getattr(module, "name", "")
+        self.module_index = -1
+        try:
+            for item_index, item in enumerate(getattr(workflow, "modules", [])):
+                if item == module:
+                    self.module_index = item_index
+                    break
+        except Exception:
+            self.module_index = -1
+
+    def _prop_key(self, key, kind="value"):
+        return module_scene_prop_key(self.workflow, self.module, key, kind=kind)
+
+    def _prop_path(self, key, kind="value"):
+        return f'["{self._prop_key(key, kind=kind)}"]'
+
+    def _data_kind(self, collection_name):
+        return f"datablock_{slugify_filename(collection_name, 'data')}"
+
+    def compact_text(self, text, max_chars=UI_LABEL_MAX_CHARS, fallback=""):
+        return compact_inline_text(text, max_chars=max_chars, fallback=fallback)
+
+    def plain_text(self, text, fallback=""):
+        value = str(text if text is not None else fallback)
+        return value if value else str(fallback or "")
+
+    def _remember_field(self, key, default, kind="value"):
+        self.field_specs.append(
+            {
+                "key": key,
+                "kind": kind,
+                "default": default,
+                "prop_key": self._prop_key(key, kind=kind),
+            }
+        )
+
+    def _ensure_scene_value(self, key, default, kind="value"):
+        prop_key = self._prop_key(key, kind=kind)
+        self._remember_field(key, default, kind=kind)
+        if self.scene is None:
+            return prop_key
+        if module_scene_prop_key_usable(prop_key) and prop_key not in self.scene and self.allow_writes:
+            try:
+                self.scene[prop_key] = default
+            except Exception:
+                pass
+        return prop_key
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+
+        def layout_passthrough(layout, *args, **kwargs):
+            method = getattr(layout, name, None)
+            if method is None:
+                raise AttributeError(name)
+            try:
+                return method(*args, **kwargs)
+            except TypeError:
+                safe_kwargs = dict(kwargs)
+                if safe_kwargs.get("icon") == "NONE":
+                    safe_kwargs.pop("icon", None)
+                if safe_kwargs != kwargs:
+                    return method(*args, **safe_kwargs)
+                raise
+
+        return layout_passthrough
+
+    def box(self, layout):
+        return layout.box()
+
+    def row(self, layout, align=True):
+        return layout.row(align=align)
+
+    def column(self, layout, align=True):
+        return layout.column(align=align)
+
+    def separator(self, layout):
+        layout.separator()
+
+    def label(self, layout, text, icon="NONE"):
+        layout.label(text=self.plain_text(text), icon=icon)
+
+    def section(self, layout, title, icon="NONE", enabled=True, description=""):
+        box = layout.box()
+        try:
+            box.enabled = bool(enabled)
+        except Exception:
+            pass
+        if title:
+            box.label(text=self.plain_text(title), icon=icon)
+        if description:
+            self.draw_note(box, description, icon="NONE")
+        return box
+
+    def set_enabled(self, layout, enabled=True):
+        try:
+            layout.enabled = bool(enabled)
+        except Exception:
+            pass
+        return layout
+
+    def set_alert(self, layout, enabled=True):
+        try:
+            layout.alert = bool(enabled)
+        except Exception:
+            pass
+        return layout
+
+    def draw_note(self, layout, text, icon="INFO", limit=4, width=48):
+        for line in split_preview_lines(str(text or ""), limit=limit, width=width):
+            layout.label(text=self.plain_text(line), icon=icon)
+            icon = "NONE"
+
+    def draw_key_value(self, layout, label, value, icon="NONE", value_icon="NONE"):
+        row = layout.row(align=True)
+        row.label(text=self.compact_text(label), icon=icon)
+        row.label(text=self.compact_text(value, max_chars=UI_BUTTON_MAX_CHARS, fallback="-"), icon=value_icon)
+        return row
+
+    def draw_status_block(self, layout, title="状态", lines=None, icon="INFO", enabled=True):
+        box = self.section(layout, title, icon=icon, enabled=enabled)
+        for line in lines or []:
+            if isinstance(line, dict):
+                self.draw_key_value(
+                    box,
+                    line.get("label", ""),
+                    line.get("value", ""),
+                    icon=line.get("icon", "NONE"),
+                    value_icon=line.get("value_icon", "NONE"),
+                )
+            else:
+                box.label(text=self.plain_text(line), icon="NONE")
+        return box
+
+    def draw_image_preview(self, layout, image=None, label="", scale=8.0, fallback=""):
+        if label:
+            layout.label(text=self.plain_text(label), icon="IMAGE_REFERENCE")
+        if image is None:
+            if fallback:
+                layout.label(text=self.plain_text(fallback), icon="INFO")
+            return False
+        try:
+            icon_id = cached_image_preview_icon_id(image)
+            if icon_id:
+                layout.template_icon(icon_value=icon_id, scale=max(1.0, float(scale)))
+                return True
+        except Exception:
+            pass
+        fallback_name = getattr(image, "name", "") or fallback
+        if fallback_name:
+            layout.label(text=self.plain_text(fallback_name), icon="FILE_IMAGE")
+        return False
+
+    def prop(self, layout, data, prop_name, **kwargs):
+        if layout is None or data is None or not prop_name:
+            return None
+        try:
+            return layout.prop(data, prop_name, **kwargs)
+        except TypeError:
+            safe_kwargs = dict(kwargs)
+            if safe_kwargs.get("icon") == "NONE":
+                safe_kwargs.pop("icon", None)
+            try:
+                return layout.prop(data, prop_name, **safe_kwargs)
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    def prop_search(self, layout, data, prop_name, search_data, search_prop, **kwargs):
+        if layout is None or data is None or search_data is None or not prop_name or not search_prop:
+            return None
+        try:
+            return layout.prop_search(data, prop_name, search_data, search_prop, **kwargs)
+        except TypeError:
+            safe_kwargs = dict(kwargs)
+            if safe_kwargs.get("icon") == "NONE":
+                safe_kwargs.pop("icon", None)
+            try:
+                return layout.prop_search(data, prop_name, search_data, search_prop, **safe_kwargs)
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    def operator(self, layout, operator_id, text=None, icon="NONE", **properties):
+        if layout is None or not operator_id:
+            return None
+        kwargs = {}
+        if text is not None:
+            kwargs["text"] = self.compact_text(text, max_chars=UI_BUTTON_MAX_CHARS)
+        if icon != "NONE":
+            kwargs["icon"] = icon
+        try:
+            op = layout.operator(str(operator_id), **kwargs)
+        except Exception:
+            return None
+        for key, value in properties.items():
+            try:
+                setattr(op, key, value)
+            except Exception:
+                pass
+        return op
+
+    def menu(self, layout, menu_id, text=None, icon="NONE"):
+        if layout is None or not menu_id:
+            return None
+        kwargs = {}
+        if text is not None:
+            kwargs["text"] = self.compact_text(text, max_chars=UI_BUTTON_MAX_CHARS)
+        if icon != "NONE":
+            kwargs["icon"] = icon
+        try:
+            return layout.menu(str(menu_id), **kwargs)
+        except Exception:
+            return None
+
+    def operator_menu_enum(self, layout, operator_id, prop_name, text=None, icon="NONE"):
+        if layout is None or not operator_id or not prop_name:
+            return None
+        kwargs = {}
+        if text is not None:
+            kwargs["text"] = self.compact_text(text, max_chars=UI_BUTTON_MAX_CHARS)
+        if icon != "NONE":
+            kwargs["icon"] = icon
+        try:
+            return layout.operator_menu_enum(str(operator_id), str(prop_name), **kwargs)
+        except Exception:
+            return None
+
+    def operator_enum(self, layout, operator_id, prop_name):
+        if layout is None or not operator_id or not prop_name:
+            return None
+        try:
+            return layout.operator_enum(str(operator_id), str(prop_name))
+        except Exception:
+            return None
+
+    def prop_menu_enum(self, layout, data, prop_name, **kwargs):
+        if layout is None or data is None or not prop_name:
+            return None
+        try:
+            return layout.prop_menu_enum(data, prop_name, **kwargs)
+        except TypeError:
+            safe_kwargs = dict(kwargs)
+            if safe_kwargs.get("icon") == "NONE":
+                safe_kwargs.pop("icon", None)
+            try:
+                return layout.prop_menu_enum(data, prop_name, **safe_kwargs)
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    def prop_enum(self, layout, data, prop_name, value, **kwargs):
+        if layout is None or data is None or not prop_name:
+            return None
+        try:
+            return layout.prop_enum(data, prop_name, value, **kwargs)
+        except TypeError:
+            safe_kwargs = dict(kwargs)
+            if safe_kwargs.get("icon") == "NONE":
+                safe_kwargs.pop("icon", None)
+            try:
+                return layout.prop_enum(data, prop_name, value, **safe_kwargs)
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    def popover(self, layout, panel_id, text=None, icon="NONE"):
+        if layout is None or not panel_id:
+            return None
+        kwargs = {}
+        if text is not None:
+            kwargs["text"] = self.compact_text(text, max_chars=UI_BUTTON_MAX_CHARS)
+        if icon != "NONE":
+            kwargs["icon"] = icon
+        try:
+            return layout.popover(str(panel_id), **kwargs)
+        except Exception:
+            return None
+
+    def menu_contents(self, layout, menu_id):
+        if layout is None or not menu_id:
+            return None
+        try:
+            return layout.menu_contents(str(menu_id))
+        except Exception:
+            return None
+
+    def context_pointer_set(self, layout, name, data):
+        if layout is None or not name:
+            return None
+        try:
+            return layout.context_pointer_set(str(name), data)
+        except Exception:
+            return None
+
+    def split(self, layout, factor=0.5, align=False):
+        if layout is None:
+            return None
+        try:
+            return layout.split(factor=max(0.0, min(1.0, float(factor))), align=bool(align))
+        except Exception:
+            return None
+
+    def grid_flow(self, layout, **kwargs):
+        if layout is None:
+            return None
+        try:
+            return layout.grid_flow(**kwargs)
+        except Exception:
+            return None
+
+    def template_list(self, layout, *args, **kwargs):
+        if layout is None:
+            return None
+        try:
+            return layout.template_list(*args, **kwargs)
+        except Exception:
+            return None
+
+    def template_id(self, layout, data, prop_name, **kwargs):
+        if layout is None or data is None or not prop_name:
+            return None
+        try:
+            return layout.template_ID(data, prop_name, **kwargs)
+        except Exception:
+            return None
+
+    def template_icon(self, layout, icon_value=0, scale=1.0):
+        if layout is None:
+            return None
+        try:
+            return layout.template_icon(icon_value=int(icon_value or 0), scale=max(1.0, float(scale)))
+        except Exception:
+            return None
+
+    def template_id_preview(self, layout, data, prop_name, **kwargs):
+        if layout is None or data is None or not prop_name:
+            return None
+        try:
+            return layout.template_ID_preview(data, prop_name, **kwargs)
+        except Exception:
+            return None
+
+    def template_search(self, layout, data, prop_name, search_data, search_prop, **kwargs):
+        if layout is None or data is None or search_data is None or not prop_name or not search_prop:
+            return None
+        try:
+            return layout.template_search(data, prop_name, search_data, search_prop, **kwargs)
+        except Exception:
+            return None
+
+    def template_icon_view(self, layout, data, prop_name, **kwargs):
+        if layout is None or data is None or not prop_name:
+            return None
+        try:
+            return layout.template_icon_view(data, prop_name, **kwargs)
+        except Exception:
+            return None
+
+    def template_color_picker(self, layout, data, prop_name, **kwargs):
+        if layout is None or data is None or not prop_name:
+            return None
+        try:
+            return layout.template_color_picker(data, prop_name, **kwargs)
+        except Exception:
+            return None
+
+    def template_curve_mapping(self, layout, data, prop_name, **kwargs):
+        if layout is None or data is None or not prop_name:
+            return None
+        try:
+            return layout.template_curve_mapping(data, prop_name, **kwargs)
+        except Exception:
+            return None
+
+    def template_preview(self, layout, id_data, **kwargs):
+        if layout is None or id_data is None:
+            return None
+        try:
+            return layout.template_preview(id_data, **kwargs)
+        except Exception:
+            return None
+
+    def draw_prop(self, layout, data, prop_name, label=None, icon="NONE", slider=False, expand=False, toggle=-1, emboss=True):
+        if data is None or not prop_name:
+            return None
+        kwargs = {"text": "" if label is None else self.compact_text(label), "slider": slider, "expand": expand, "emboss": emboss}
+        if toggle in {0, 1}:
+            kwargs["toggle"] = bool(toggle)
+        if icon != "NONE":
+            kwargs["icon"] = icon
+        try:
+            return layout.prop(data, prop_name, **kwargs)
+        except TypeError:
+            kwargs.pop("icon", None)
+            kwargs.pop("toggle", None)
+            try:
+                return layout.prop(data, prop_name, **kwargs)
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    def draw_scene_prop(self, layout, prop_name, label=None, icon="NONE", slider=False, expand=False, toggle=-1, emboss=True):
+        return self.draw_prop(
+            layout,
+            self.scene,
+            prop_name,
+            label=label,
+            icon=icon,
+            slider=slider,
+            expand=expand,
+            toggle=toggle,
+            emboss=emboss,
+        )
+
+    def draw_runtime_prop(self, layout, key, default=None, kind="value", label=None, icon="NONE", slider=False, expand=False, toggle=-1, emboss=True):
+        prop_key = self._ensure_scene_value(key, default, kind=kind)
+        if self.scene is None or not prop_key:
+            return None
+        kwargs = {
+            "text": "" if label is None else self.compact_text(label),
+            "slider": slider,
+            "expand": expand,
+            "emboss": emboss,
+        }
+        if toggle in {0, 1}:
+            kwargs["toggle"] = bool(toggle)
+        if icon != "NONE":
+            kwargs["icon"] = icon
+        try:
+            return layout.prop(self.scene, f'["{prop_key}"]', **kwargs)
+        except TypeError:
+            kwargs.pop("icon", None)
+            kwargs.pop("toggle", None)
+            try:
+                return layout.prop(self.scene, f'["{prop_key}"]', **kwargs)
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    def split_field(self, layout, label="", factor=0.34, align=True):
+        split = layout.split(factor=max(0.1, min(0.9, float(factor))), align=align)
+        left = split.row(align=align)
+        right = split.row(align=align)
+        if label:
+            left.label(text=self.compact_text(label))
+        return left, right
+
+    def foldout_section(self, layout, key, title, icon="NONE", default_open=True, enabled=True):
+        prop_key = self._ensure_scene_value(key, bool(default_open), kind="bool")
+        is_open = bool(module_runtime_field_value(self.scene, self.workflow, self.module, key, "bool", bool(default_open)))
+        box = layout.box()
+        try:
+            box.enabled = bool(enabled)
+        except Exception:
+            pass
+        header = box.row(align=True)
+        if self.scene is not None and module_scene_prop_key_usable(prop_key):
+            try:
+                if prop_key not in self.scene:
+                    self.scene[prop_key] = bool(default_open)
+                header.prop(
+                    self.scene,
+                    f'["{prop_key}"]',
+                    text=self.plain_text(title),
+                    icon="TRIA_DOWN" if bool(self.scene.get(prop_key, default_open)) else "TRIA_RIGHT",
+                    emboss=False,
+                    toggle=False,
+                )
+                is_open = bool(self.scene.get(prop_key, default_open))
+                if self.allow_writes:
+                    self.state.set(key, is_open)
+            except Exception:
+                header.label(text=self.plain_text(title), icon=icon)
+        else:
+            header.label(text=self.plain_text(title), icon=icon)
+        if icon != "NONE":
+            header.label(text="", icon=icon)
+        content = box.column(align=True)
+        try:
+            content.enabled = bool(enabled)
+        except Exception:
+            pass
+        if not is_open:
+            return None
+        return content
+
+    def draw_button(self, layout, action, label=None, icon="NONE", tooltip=""):
+        op = layout.operator(
+            "bworkflow.module_runtime_action",
+            text=self.compact_text(label or action, max_chars=UI_BUTTON_MAX_CHARS),
+            icon=icon,
+        )
+        op.workflow_name = self.workflow_name
+        op.module_name = self.module_name
+        op.action_name = str(action)
+        op.tooltip_text = str(tooltip or "")
+        return op
+
+    def draw_icon_button(self, layout, action, icon="NONE", tooltip=""):
+        op = layout.operator(
+            "bworkflow.module_runtime_action",
+            text="",
+            icon=icon,
+            emboss=True,
+        )
+        op.workflow_name = self.workflow_name
+        op.module_name = self.module_name
+        op.action_name = str(action)
+        op.tooltip_text = str(tooltip or "")
+        return op
+
+    def draw_run_button(self, layout, label="运行模块", icon="PLAY"):
+        op = layout.operator(
+            "bworkflow.module_run",
+            text=self.compact_text(label, max_chars=UI_BUTTON_MAX_CHARS),
+            icon=icon,
+        )
+        op.module_index = self.module_index
+        return op
+
+    def get_value(self, key, default=None, kind="text"):
+        kind = str(kind or "text")
+        if kind == "bool":
+            return self.get_bool(key, bool(default))
+        if kind == "float":
+            return self.get_float(key, 0.0 if default is None else default)
+        if kind == "int":
+            return self.get_int(key, 0 if default is None else default)
+        if kind == "object":
+            return self.get_object(key, default)
+        if kind == "enum":
+            return self.get_enum(key, default)
+        return self.get_text(key, "" if default is None else default)
+
+    def set_value(self, key, value, kind="text"):
+        kind = str(kind or "text")
+        if kind == "bool":
+            return self.set_bool(key, value)
+        if kind == "float":
+            return self.set_float(key, value)
+        if kind == "int":
+            return self.set_int(key, value)
+        if kind == "object":
+            return self.set_object(key, value)
+        if kind == "enum":
+            return self.set_enum(key, value)
+        return self.set_text(key, value)
+
+    def clear_value(self, key, kind=None):
+        kinds = [kind] if kind else ["text", "bool", "float", "int", "object", "enum", "value"]
+        for item_kind in kinds:
+            prop_key = self._prop_key(key, kind=item_kind)
+            if (
+                self.scene is not None
+                and self.allow_writes
+                and module_scene_prop_key_usable(prop_key)
+                and prop_key in self.scene
+            ):
+                try:
+                    del self.scene[prop_key]
+                except Exception:
+                    pass
+        if self.allow_writes:
+            self.state.pop(key, None)
+        return None
+
+    def get_object(self, key, default=None):
+        scene_name = ""
+        if self.scene is not None:
+            scene_name, _scene_prop_key = module_runtime_field_scene_value(
+                self.scene, self.workflow, self.module, key, "object", ""
+            )
+        name = scene_name or self.state.get(key, "")
+        if not name:
+            return default
+        return bpy.data.objects.get(name, default)
+
+    def set_object(self, key, obj):
+        name = getattr(obj, "name", "") if obj is not None else ""
+        self._remember_field(key, name, kind="object")
+        if self.scene is not None and self.allow_writes:
+            prop_key = self._prop_key(key, kind="object")
+            if module_scene_prop_key_usable(prop_key):
+                try:
+                    self.scene[prop_key] = name
+                except Exception:
+                    pass
+        if self.allow_writes:
+            self.state.set(key, name)
+        return obj
+
+    def get_text(self, key, default=""):
+        self._remember_field(key, str(default), kind="text")
+        scene_value, scene_prop_key = module_runtime_field_scene_value(
+            self.scene, self.workflow, self.module, key, "text", self.state.get(key, default)
+        )
+        if scene_prop_key:
+            return str(scene_value)
+        return str(self.state.get(key, default))
+
+    def set_text(self, key, value):
+        text_value = str(value)
+        self._remember_field(key, text_value, kind="text")
+        if self.scene is not None and self.allow_writes:
+            prop_key = self._prop_key(key, kind="text")
+            if module_scene_prop_key_usable(prop_key):
+                try:
+                    self.scene[prop_key] = text_value
+                except Exception:
+                    pass
+        if self.allow_writes:
+            self.state.set(key, text_value)
+        return text_value
+
+    def get_bool(self, key, default=False):
+        self._remember_field(key, bool(default), kind="bool")
+        scene_value, scene_prop_key = module_runtime_field_scene_value(
+            self.scene, self.workflow, self.module, key, "bool", self.state.get(key, default)
+        )
+        if scene_prop_key:
+            return bool(scene_value)
+        return bool(self.state.get(key, default))
+
+    def set_bool(self, key, value):
+        bool_value = bool(value)
+        self._remember_field(key, bool_value, kind="bool")
+        if self.scene is not None and self.allow_writes:
+            prop_key = self._prop_key(key, kind="bool")
+            if module_scene_prop_key_usable(prop_key):
+                try:
+                    self.scene[prop_key] = bool_value
+                except Exception:
+                    pass
+        if self.allow_writes:
+            self.state.set(key, bool_value)
+        return bool_value
+
+    def get_float(self, key, default=0.0):
+        try:
+            self._remember_field(key, float(default), kind="float")
+            scene_value, scene_prop_key = module_runtime_field_scene_value(
+                self.scene, self.workflow, self.module, key, "float", self.state.get(key, default)
+            )
+            if scene_prop_key:
+                return float(scene_value)
+            return float(self.state.get(key, default))
+        except Exception:
+            return float(default)
+
+    def set_float(self, key, value):
+        float_value = float(value)
+        self._remember_field(key, float_value, kind="float")
+        if self.scene is not None and self.allow_writes:
+            prop_key = self._prop_key(key, kind="float")
+            if module_scene_prop_key_usable(prop_key):
+                try:
+                    self.scene[prop_key] = float_value
+                except Exception:
+                    pass
+        if self.allow_writes:
+            self.state.set(key, float_value)
+        return float_value
+
+    def get_int(self, key, default=0):
+        try:
+            self._remember_field(key, int(default), kind="int")
+            scene_value, scene_prop_key = module_runtime_field_scene_value(
+                self.scene, self.workflow, self.module, key, "int", self.state.get(key, default)
+            )
+            if scene_prop_key:
+                return int(scene_value)
+            return int(self.state.get(key, default))
+        except Exception:
+            return int(default)
+
+    def set_int(self, key, value):
+        int_value = int(value)
+        self._remember_field(key, int_value, kind="int")
+        if self.scene is not None and self.allow_writes:
+            prop_key = self._prop_key(key, kind="int")
+            if module_scene_prop_key_usable(prop_key):
+                try:
+                    self.scene[prop_key] = int_value
+                except Exception:
+                    pass
+        if self.allow_writes:
+            self.state.set(key, int_value)
+        return int_value
+
+    def get_enum(self, key, default=""):
+        default_value = str(default or "")
+        self._remember_field(key, default_value, kind="enum")
+        scene_value, scene_prop_key = module_runtime_field_scene_value(
+            self.scene, self.workflow, self.module, key, "enum", self.state.get(key, default_value)
+        )
+        if scene_prop_key:
+            return str(scene_value)
+        return str(self.state.get(key, default_value))
+
+    def set_enum(self, key, value):
+        text_value = str(value or "")
+        self._remember_field(key, text_value, kind="enum")
+        if self.scene is not None and self.allow_writes:
+            prop_key = self._prop_key(key, kind="enum")
+            if module_scene_prop_key_usable(prop_key):
+                try:
+                    self.scene[prop_key] = text_value
+                except Exception:
+                    pass
+        if self.allow_writes:
+            self.state.set(key, text_value)
+        return text_value
+
+    def data_collection(self, collection_name):
+        return getattr(bpy.data, str(collection_name or ""), None)
+
+    def get_data_block(self, key, collection_name="objects", default=None):
+        kind = self._data_kind(collection_name)
+        default_name = getattr(default, "name", "") if default is not None else ""
+        self._remember_field(key, default_name, kind=kind)
+        scene_value, scene_prop_key = module_runtime_field_scene_value(
+            self.scene, self.workflow, self.module, key, kind, self.state.get(key, default_name)
+        )
+        if scene_prop_key:
+            name = str(scene_value or "")
+        else:
+            name = str(self.state.get(key, default_name) or "")
+        collection = self.data_collection(collection_name)
+        if collection is None or not name:
+            return default
+        try:
+            return collection.get(name) or default
+        except Exception:
+            return default
+
+    def set_data_block(self, key, data_block, collection_name="objects"):
+        kind = self._data_kind(collection_name)
+        name = getattr(data_block, "name", "") if data_block is not None else ""
+        self._remember_field(key, name, kind=kind)
+        if self.scene is not None and self.allow_writes:
+            self.scene[self._prop_key(key, kind=kind)] = name
+        if self.allow_writes:
+            self.state.set(key, name)
+        return data_block
+
+    def get_material(self, key, default=None):
+        return self.get_data_block(key, "materials", default=default)
+
+    def get_collection(self, key, default=None):
+        return self.get_data_block(key, "collections", default=default)
+
+    def get_text_block(self, key, default=None):
+        return self.get_data_block(key, "texts", default=default)
+
+    def set_status(self, text, level="INFO"):
+        value = self.compact_text(text, max_chars=96)
+        if self.allow_writes:
+            self.state.set("last_status", value)
+            self.state.set("last_status_level", str(level or "INFO"))
+        return value
+
+    def get_status(self, default=""):
+        return str(self.state.get("last_status", default) or "")
+
+    def draw_status(self, layout, default="", icon=None):
+        status = self.get_status(default)
+        if not status:
+            return
+        level = str(self.state.get("last_status_level", "INFO") or "INFO").upper()
+        icon_name = icon or {"ERROR": "ERROR", "WARNING": "ERROR", "OK": "CHECKMARK"}.get(level, "INFO")
+        self.draw_note(layout, status, icon=icon_name, limit=3)
+
+    def log(self, message, key="debug_log", max_items=8, print_to_console=True):
+        text = self.compact_text(message, max_chars=160)
+        if print_to_console:
+            print(f"[GoWorkflow:{self.module_name}] {text}")
+        if self.allow_writes:
+            return self.state.append_log(text, key=key, max_items=max_items)
+        return []
+
+    def draw_log(self, layout, key="debug_log", limit=6):
+        entries = self.state.get(key, [])
+        if not isinstance(entries, (list, tuple)) or not entries:
+            return
+        for entry in list(entries)[-limit:]:
+            layout.label(text=self.compact_text(entry), icon="CONSOLE")
+
+    def active_object(self):
+        return getattr(self.context, "object", None)
+
+    def selected_objects(self, type=None):
+        items = list(getattr(self.context, "selected_objects", []) or [])
+        if type:
+            items = [obj for obj in items if getattr(obj, "type", None) == type]
+        return items
+
+    def visible_objects(self, type=None):
+        items = list(getattr(self.context, "visible_objects", []) or [])
+        if type:
+            items = [obj for obj in items if getattr(obj, "type", None) == type]
+        return items
+
+    def selected_mesh_objects(self, require_shape_keys=False):
+        items = self.selected_objects(type="MESH")
+        if require_shape_keys:
+            items = [obj for obj in items if self.shape_key_blocks(obj)]
+        return items
+
+    def shape_key_data(self, obj=None):
+        obj = obj or self.active_object()
+        data = getattr(obj, "data", None)
+        return getattr(data, "shape_keys", None)
+
+    def shape_key_blocks(self, obj=None):
+        key_data = self.shape_key_data(obj)
+        return getattr(key_data, "key_blocks", None)
+
+    def active_shape_key_index(self, obj=None):
+        obj = obj or self.active_object()
+        try:
+            return int(getattr(obj, "active_shape_key_index", -1))
+        except Exception:
+            return -1
+
+    def active_shape_key(self, obj=None, include_basis=True):
+        obj = obj or self.active_object()
+        key_blocks = self.shape_key_blocks(obj)
+        index = self.active_shape_key_index(obj)
+        if not key_blocks or index < 0:
+            return None
+        if not include_basis and index <= 0:
+            return None
+        try:
+            if index < len(key_blocks):
+                return key_blocks[index]
+        except Exception:
+            return None
+        return None
+
+    def valid_shape_key_objects(self, require_active_non_basis=False):
+        items = self.selected_mesh_objects(require_shape_keys=True)
+        if require_active_non_basis:
+            items = [obj for obj in items if self.active_shape_key(obj, include_basis=False) is not None]
+        return items
+
+    def context_summary(self):
+        active = self.active_object()
+        return {
+            "mode": getattr(self.context, "mode", ""),
+            "scene": getattr(getattr(self.context, "scene", None), "name", ""),
+            "active_object": getattr(active, "name", ""),
+            "active_type": getattr(active, "type", ""),
+            "selected_count": len(self.selected_objects()),
+            "visible_count": len(self.visible_objects()),
+        }
+
+    def draw_text_input(self, layout, key, label, default=""):
+        default_value = str(default)
+        self._ensure_scene_value(key, default_value, kind="text")
+        value = str(module_runtime_field_value(self.scene, self.workflow, self.module, key, "text", default_value) or "")
+        row = layout.row(align=True)
+        row.label(text=self.compact_text(label))
+        op = row.operator("bworkflow.module_runtime_field_write", text=self.compact_text(value, UI_BUTTON_MAX_CHARS, "编辑"), translate=False)
+        op.workflow_name = self.workflow_name
+        op.module_name = self.module_name
+        op.field_key = key
+        op.field_kind = "text"
+        op.text_value = value
+
+    def draw_text_input_inline(self, layout, key, label, default="", factor=0.34):
+        default_value = str(default)
+        prop_key = self._ensure_scene_value(key, default_value, kind="text")
+        value = str(module_runtime_field_value(self.scene, self.workflow, self.module, key, "text", default_value) or "")
+        _left, right = self.split_field(layout, label, factor=factor)
+        if self.scene is not None and module_scene_prop_key_usable(prop_key):
+            try:
+                if prop_key not in self.scene:
+                    self.scene[prop_key] = value
+                right.prop(self.scene, f'["{prop_key}"]', text="")
+                if self.allow_writes:
+                    self.state.set(key, str(self.scene.get(prop_key, value) or ""))
+                return
+            except Exception:
+                pass
+        op = right.operator("bworkflow.module_runtime_field_write", text=self.compact_text(value, UI_BUTTON_MAX_CHARS, ""), translate=False)
+        op.workflow_name = self.workflow_name
+        op.module_name = self.module_name
+        op.field_key = key
+        op.field_kind = "text"
+        op.text_value = value
+
+    def draw_toggle(self, layout, key, label, default=False):
+        default_value = bool(default)
+        self._ensure_scene_value(key, default_value, kind="bool")
+        value = bool(module_runtime_field_value(self.scene, self.workflow, self.module, key, "bool", default_value))
+        row = layout.row(align=True)
+        row.label(text=self.compact_text(label))
+        op = row.operator("bworkflow.module_runtime_field_write", text="开" if value else "关", depress=value)
+        op.workflow_name = self.workflow_name
+        op.module_name = self.module_name
+        op.field_key = key
+        op.field_kind = "bool"
+        op.bool_value = not value
+
+    def draw_toggle_inline(self, layout, key, label, default=False, factor=0.34):
+        default_value = bool(default)
+        prop_key = self._ensure_scene_value(key, default_value, kind="bool")
+        _left, right = self.split_field(layout, label, factor=factor)
+        if self.scene is not None and module_scene_prop_key_usable(prop_key):
+            try:
+                if prop_key not in self.scene:
+                    self.scene[prop_key] = default_value
+                right.prop(self.scene, f'["{prop_key}"]', text="")
+                if self.allow_writes:
+                    self.state.set(key, bool(self.scene.get(prop_key, default_value)))
+                return
+            except Exception:
+                pass
+        value = bool(module_runtime_field_value(self.scene, self.workflow, self.module, key, "bool", default_value))
+        op = right.operator("bworkflow.module_runtime_field_write", text="", icon="CHECKBOX_HLT" if value else "CHECKBOX_DEHLT", emboss=False)
+        op.workflow_name = self.workflow_name
+        op.module_name = self.module_name
+        op.field_key = key
+        op.field_kind = "bool"
+        op.bool_value = not value
+        return op
+
+    def draw_float_input(self, layout, key, label, default=0.0, **kwargs):
+        default_value = float(default)
+        prop_key = self._ensure_scene_value(key, default_value, kind="float")
+        value = float(module_runtime_field_value(self.scene, self.workflow, self.module, key, "float", default_value))
+        row = layout.row(align=True)
+        row.label(text=self.compact_text(label))
+        prop_kwargs = runtime_numeric_prop_kwargs(**kwargs)
+        if self.scene is not None and module_scene_prop_key_usable(prop_key):
+            try:
+                if prop_key not in self.scene:
+                    self.scene[prop_key] = value
+                row.prop(self.scene, f'["{prop_key}"]', text="", **prop_kwargs)
+                if self.allow_writes:
+                    self.state.set(key, float(self.scene.get(prop_key, value)))
+                return
+            except Exception:
+                pass
+        op = row.operator("bworkflow.module_runtime_field_write", text=f"{value:.3f}", translate=False)
+        op.workflow_name = self.workflow_name
+        op.module_name = self.module_name
+        op.field_key = key
+        op.field_kind = "float"
+        op.float_value = value
+
+    def draw_float_input_inline(self, layout, key, label, default=0.0, factor=0.34, **kwargs):
+        default_value = float(default)
+        prop_key = self._ensure_scene_value(key, default_value, kind="float")
+        value = float(module_runtime_field_value(self.scene, self.workflow, self.module, key, "float", default_value))
+        _left, right = self.split_field(layout, label, factor=factor)
+        prop_kwargs = runtime_numeric_prop_kwargs(**kwargs)
+        if self.scene is not None and module_scene_prop_key_usable(prop_key):
+            try:
+                if prop_key not in self.scene:
+                    self.scene[prop_key] = value
+                right.prop(self.scene, f'["{prop_key}"]', text="", **prop_kwargs)
+                if self.allow_writes:
+                    self.state.set(key, float(self.scene.get(prop_key, value)))
+                return
+            except Exception:
+                pass
+        op = right.operator("bworkflow.module_runtime_field_write", text=f"{value:.3f}", translate=False)
+        op.workflow_name = self.workflow_name
+        op.module_name = self.module_name
+        op.field_key = key
+        op.field_kind = "float"
+        op.float_value = value
+        return op
+
+    def draw_int_input(self, layout, key, label, default=0, **kwargs):
+        default_value = int(default)
+        self._ensure_scene_value(key, default_value, kind="int")
+        value = int(module_runtime_field_value(self.scene, self.workflow, self.module, key, "int", default_value))
+        prop_key = self._prop_key(key, kind="int")
+        row = layout.row(align=True)
+        row.label(text=self.compact_text(label))
+        prop_kwargs = runtime_numeric_prop_kwargs(**kwargs)
+        if self.scene is not None and module_scene_prop_key_usable(prop_key):
+            try:
+                row.prop(self.scene, f'["{prop_key}"]', text="", **prop_kwargs)
+                if self.allow_writes:
+                    self.state.set(key, int(self.scene.get(prop_key, value)))
+                return
+            except Exception:
+                pass
+        op = row.operator("bworkflow.module_runtime_field_write", text=str(value), translate=False)
+        op.workflow_name = self.workflow_name
+        op.module_name = self.module_name
+        op.field_key = key
+        op.field_kind = "int"
+        op.int_value = value
+
+    def draw_int_input_inline(self, layout, key, label, default=0, factor=0.34, **kwargs):
+        default_value = int(default)
+        prop_key = self._ensure_scene_value(key, default_value, kind="int")
+        value = int(module_runtime_field_value(self.scene, self.workflow, self.module, key, "int", default_value))
+        _left, right = self.split_field(layout, label, factor=factor)
+        prop_kwargs = runtime_numeric_prop_kwargs(**kwargs)
+        if self.scene is not None and module_scene_prop_key_usable(prop_key):
+            try:
+                if prop_key not in self.scene:
+                    self.scene[prop_key] = value
+                right.prop(self.scene, f'["{prop_key}"]', text="", **prop_kwargs)
+                if self.allow_writes:
+                    self.state.set(key, int(self.scene.get(prop_key, value)))
+                return
+            except Exception:
+                pass
+        op = right.operator("bworkflow.module_runtime_field_write", text=str(value), translate=False)
+        op.workflow_name = self.workflow_name
+        op.module_name = self.module_name
+        op.field_key = key
+        op.field_kind = "int"
+        op.int_value = value
+        return op
+
+    def draw_enum(self, layout, key, label, items, default=None, max_items=8, disabled_items=None, display_value=None):
+        normalized = []
+        for item in items or []:
+            if isinstance(item, str):
+                normalized.append((item, item))
+            elif isinstance(item, (list, tuple)) and item:
+                identifier = str(item[0])
+                item_label = str(item[1]) if len(item) > 1 else identifier
+                normalized.append((identifier, item_label))
+        if not normalized:
+            return
+
+        default_value = str(default if default is not None else normalized[0][0])
+        identifiers = {identifier for identifier, _label in normalized}
+        disabled_identifiers = {str(identifier) for identifier in (disabled_items or [])}
+        self._ensure_scene_value(key, default_value, kind="enum")
+        value = str(module_runtime_field_value(self.scene, self.workflow, self.module, key, "enum", default_value) or default_value)
+        if value not in identifiers:
+            value = default_value
+        active_value = str(display_value or value)
+        if active_value not in identifiers:
+            active_value = value
+
+        layout.label(text=self.compact_text(label))
+        row = layout.row(align=True)
+        for identifier, item_label in normalized[:max_items]:
+            item_row = row.row(align=True)
+            item_row.enabled = identifier not in disabled_identifiers
+            op = item_row.operator(
+                "bworkflow.module_runtime_field_write",
+                text=self.compact_text(item_label, max_chars=16),
+                depress=identifier == active_value,
+                translate=False,
+            )
+            op.workflow_name = self.workflow_name
+            op.module_name = self.module_name
+            op.field_key = key
+            op.field_kind = "enum"
+            op.text_value = identifier
+        if len(normalized) > max_items:
+            layout.label(text=f"还有 {len(normalized) - max_items} 项，建议用文本输入。", icon="INFO")
+
+    def draw_object_picker(self, layout, key, label="物体", default=None):
+        default_name = getattr(default, "name", "") if default is not None else ""
+        self._ensure_scene_value(key, default_name, kind="object")
+        value = str(module_runtime_field_value(self.scene, self.workflow, self.module, key, "object", default_name) or "")
+        row = layout.row(align=True)
+        row.label(text=self.compact_text(label))
+        op = row.operator("bworkflow.module_runtime_field_write", text=self.compact_text(value, UI_BUTTON_MAX_CHARS, "选择物体"), translate=False)
+        op.workflow_name = self.workflow_name
+        op.module_name = self.module_name
+        op.field_key = key
+        op.field_kind = "object"
+        op.object_name = value
+
+    def draw_object_picker_inline(self, layout, key, label="物体", default=None, factor=0.34, show_active_button=False):
+        default_name = getattr(default, "name", "") if default is not None else ""
+        prop_key = self._ensure_scene_value(key, default_name, kind="object")
+        value = str(module_runtime_field_value(self.scene, self.workflow, self.module, key, "object", default_name) or "")
+        _left, right = self.split_field(layout, label, factor=factor)
+        if self.scene is not None and module_scene_prop_key_usable(prop_key):
+            try:
+                if prop_key not in self.scene:
+                    self.scene[prop_key] = value
+                field_row = right.row(align=True)
+                field_row.prop(self.scene, f'["{prop_key}"]', text="")
+                if show_active_button:
+                    self.draw_active_object_capture(field_row, key, "", icon="EYEDROPPER")
+                if self.allow_writes:
+                    self.state.set(key, str(self.scene.get(prop_key, value) or ""))
+                return
+            except Exception:
+                pass
+        field_row = right.row(align=True)
+        op = field_row.operator("bworkflow.module_runtime_field_write", text=self.compact_text(value, UI_BUTTON_MAX_CHARS, ""), translate=False)
+        op.workflow_name = self.workflow_name
+        op.module_name = self.module_name
+        op.field_key = key
+        op.field_kind = "object"
+        op.object_name = value
+        if show_active_button:
+            self.draw_active_object_capture(field_row, key, "", icon="EYEDROPPER")
+        return op
+
+    def draw_file_path_input(self, layout, key, label, default="", factor=0.34, filter_glob="*.*", status_prefix="已选择文件"):
+        default_value = str(default)
+        prop_key = self._ensure_scene_value(key, default_value, kind="text")
+        value = str(module_runtime_field_value(self.scene, self.workflow, self.module, key, "text", default_value) or "")
+        _left, right = self.split_field(layout, label, factor=factor)
+        if self.scene is not None and module_scene_prop_key_usable(prop_key):
+            try:
+                if prop_key not in self.scene:
+                    self.scene[prop_key] = value
+                field_row = right.row(align=True)
+                field_row.prop(self.scene, f'["{prop_key}"]', text="")
+                op = field_row.operator("bworkflow.module_pick_file_path", text="", icon="FILE_FOLDER")
+                op.workflow_name = self.workflow_name
+                op.module_name = self.module_name
+                op.target_text_key = key
+                op.filter_glob = str(filter_glob or "*.*")
+                op.status_prefix = str(status_prefix or "已选择文件")
+                if self.allow_writes:
+                    self.state.set(key, str(self.scene.get(prop_key, value) or ""))
+                return op
+            except Exception:
+                pass
+        return self.draw_text_input_inline(layout, key, label, default=default, factor=factor)
+
+    def draw_active_object_capture(self, layout, key, label="吸取当前选中", icon="EYEDROPPER"):
+        active_name = getattr(getattr(self.context, "object", None), "name", "")
+        op = layout.operator(
+            "bworkflow.module_runtime_field_write",
+            text=self.compact_text(label, UI_BUTTON_MAX_CHARS),
+            icon=icon,
+        )
+        op.workflow_name = self.workflow_name
+        op.module_name = self.module_name
+        op.field_key = key
+        op.field_kind = "object"
+        op.object_name = active_name
+        return op
+
+    def draw_data_block_picker(self, layout, key, label, collection_name="objects", default=None):
+        kind = self._data_kind(collection_name)
+        default_name = getattr(default, "name", "") if default is not None else ""
+        self._ensure_scene_value(key, default_name, kind=kind)
+        value = str(module_runtime_field_value(self.scene, self.workflow, self.module, key, kind, default_name) or "")
+        row = layout.row(align=True)
+        row.label(text=self.compact_text(label))
+        op = row.operator(
+            "bworkflow.module_runtime_field_write",
+            text=self.compact_text(value, UI_BUTTON_MAX_CHARS, "选择"),
+            translate=False,
+        )
+        op.workflow_name = self.workflow_name
+        op.module_name = self.module_name
+        op.field_key = key
+        op.field_kind = kind
+        op.text_value = value
+        op.data_collection = str(collection_name or "")
+
+    def draw_material_picker(self, layout, key, label="材质", default=None):
+        return self.draw_data_block_picker(layout, key, label, "materials", default=default)
+
+    def draw_collection_picker(self, layout, key, label="集合", default=None):
+        return self.draw_data_block_picker(layout, key, label, "collections", default=default)
+
+    def draw_text_block_picker(self, layout, key, label="文本", default=None):
+        return self.draw_data_block_picker(layout, key, label, "texts", default=default)
+
+
 def module_runtime_context(context, scene, workflow, module, allow_writes=True, field_specs=None):
     module_store = ensure_module_runtime_store(scene, workflow, module, allow_writes=allow_writes)
+    proxy = CachedModuleStateProxy(module_store)
+    panel_api = CachedModulePanelAPI(
+        context,
+        scene,
+        proxy,
+        workflow,
+        module,
+        allow_writes=allow_writes,
+        field_specs=field_specs,
+    )
+    return proxy, panel_api
 
+    module_store = ensure_module_runtime_store(scene, workflow, module, allow_writes=allow_writes)
     class ModuleStateProxy:
         def __init__(self, initial):
             self._data = dict(initial or {})
@@ -5499,9 +8833,89 @@ def module_runtime_context(context, scene, workflow, module, allow_writes=True, 
         def get(self, key, default=None):
             return self._data.get(key, default)
 
+        def __contains__(self, key):
+            return key in self._data
+
+        def __getitem__(self, key):
+            return self._data[key]
+
+        def __setitem__(self, key, value):
+            self._data[key] = value
+
+        def __delitem__(self, key):
+            del self._data[key]
+
+        def __len__(self):
+            return len(self._data)
+
+        def values(self):
+            return self._data.values()
+
+        def copy(self):
+            return dict(self._data)
+
+        def as_dict(self):
+            return dict(self._data)
+
         def set(self, key, value):
             self._data[key] = value
             return value
+
+        def has(self, key):
+            return key in self._data
+
+        def get_value(self, key, default=None):
+            return self.get(key, default)
+
+        def set_value(self, key, value):
+            return self.set(key, value)
+
+        def get_text(self, key, default=""):
+            return str(self.get(key, default))
+
+        def set_text(self, key, value):
+            return self.set(key, str(value))
+
+        def get_bool(self, key, default=False):
+            value = self.get(key, default)
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "on", "是", "开", "启用"}
+            return bool(value)
+
+        def set_bool(self, key, value):
+            return self.set(key, bool(value))
+
+        def get_float(self, key, default=0.0):
+            try:
+                return float(self.get(key, default))
+            except Exception:
+                return float(default)
+
+        def set_float(self, key, value):
+            try:
+                value = float(value)
+            except Exception:
+                value = 0.0
+            return self.set(key, value)
+
+        def get_int(self, key, default=0):
+            try:
+                return int(self.get(key, default))
+            except Exception:
+                return int(default)
+
+        def set_int(self, key, value):
+            try:
+                value = int(value)
+            except Exception:
+                value = 0
+            return self.set(key, value)
+
+        def get_enum(self, key, default=""):
+            return str(self.get(key, default))
+
+        def set_enum(self, key, value):
+            return self.set(key, str(value))
 
         def pop(self, key, default=None):
             return self._data.pop(key, default)
@@ -5596,6 +9010,26 @@ def module_runtime_context(context, scene, workflow, module, allow_writes=True, 
                     pass
             return prop_key
 
+        def __getattr__(self, name):
+            if name.startswith("_"):
+                raise AttributeError(name)
+
+            def layout_passthrough(layout, *args, **kwargs):
+                method = getattr(layout, name, None)
+                if method is None:
+                    raise AttributeError(name)
+                try:
+                    return method(*args, **kwargs)
+                except TypeError:
+                    safe_kwargs = dict(kwargs)
+                    if safe_kwargs.get("icon") == "NONE":
+                        safe_kwargs.pop("icon", None)
+                    if safe_kwargs != kwargs:
+                        return method(*args, **safe_kwargs)
+                    raise
+
+            return layout_passthrough
+
         def box(self, layout):
             return layout.box()
 
@@ -5611,15 +9045,57 @@ def module_runtime_context(context, scene, workflow, module, allow_writes=True, 
         def label(self, layout, text, icon="NONE"):
             layout.label(text=self.plain_text(text), icon=icon)
 
-        def section(self, layout, title, icon="NONE"):
+        def section(self, layout, title, icon="NONE", enabled=True, description=""):
             box = layout.box()
-            box.label(text=self.plain_text(title), icon=icon)
+            try:
+                box.enabled = bool(enabled)
+            except Exception:
+                pass
+            if title:
+                box.label(text=self.plain_text(title), icon=icon)
+            if description:
+                self.draw_note(box, description, icon="NONE")
             return box
+
+        def set_enabled(self, layout, enabled=True):
+            try:
+                layout.enabled = bool(enabled)
+            except Exception:
+                pass
+            return layout
+
+        def set_alert(self, layout, enabled=True):
+            try:
+                layout.alert = bool(enabled)
+            except Exception:
+                pass
+            return layout
 
         def draw_note(self, layout, text, icon="INFO", limit=4, width=48):
             for line in split_preview_lines(str(text or ""), limit=limit, width=width):
                 layout.label(text=self.plain_text(line), icon=icon)
                 icon = "NONE"
+
+        def draw_key_value(self, layout, label, value, icon="NONE", value_icon="NONE"):
+            row = layout.row(align=True)
+            row.label(text=self.compact_text(label), icon=icon)
+            row.label(text=self.compact_text(value, max_chars=UI_BUTTON_MAX_CHARS, fallback="-"), icon=value_icon)
+            return row
+
+        def draw_status_block(self, layout, title="状态", lines=None, icon="INFO", enabled=True):
+            box = self.section(layout, title, icon=icon, enabled=enabled)
+            for line in lines or []:
+                if isinstance(line, dict):
+                    self.draw_key_value(
+                        box,
+                        line.get("label", ""),
+                        line.get("value", ""),
+                        icon=line.get("icon", "NONE"),
+                        value_icon=line.get("value_icon", "NONE"),
+                    )
+                else:
+                    box.label(text=self.plain_text(line), icon="NONE")
+            return box
 
         def draw_image_preview(self, layout, image=None, label="", scale=8.0, fallback=""):
             if label:
@@ -5629,11 +9105,7 @@ def module_runtime_context(context, scene, workflow, module, allow_writes=True, 
                     layout.label(text=self.plain_text(fallback), icon="INFO")
                 return False
             try:
-                preview_ensure = getattr(image, "preview_ensure", None)
-                if callable(preview_ensure):
-                    preview_ensure()
-                preview = getattr(image, "preview", None)
-                icon_id = getattr(preview, "icon_id", 0) if preview is not None else 0
+                icon_id = cached_image_preview_icon_id(image)
                 if icon_id:
                     layout.template_icon(icon_value=icon_id, scale=max(1.0, float(scale)))
                     return True
@@ -5644,11 +9116,364 @@ def module_runtime_context(context, scene, workflow, module, allow_writes=True, 
                 layout.label(text=self.plain_text(fallback_name), icon="FILE_IMAGE")
             return False
 
+        def prop(self, layout, data, prop_name, **kwargs):
+            if layout is None or data is None or not prop_name:
+                return None
+            try:
+                return layout.prop(data, prop_name, **kwargs)
+            except TypeError:
+                safe_kwargs = dict(kwargs)
+                if safe_kwargs.get("icon") == "NONE":
+                    safe_kwargs.pop("icon", None)
+                try:
+                    return layout.prop(data, prop_name, **safe_kwargs)
+                except Exception:
+                    return None
+            except Exception:
+                return None
+
+        def prop_search(self, layout, data, prop_name, search_data, search_prop, **kwargs):
+            if layout is None or data is None or search_data is None or not prop_name or not search_prop:
+                return None
+            try:
+                return layout.prop_search(data, prop_name, search_data, search_prop, **kwargs)
+            except TypeError:
+                safe_kwargs = dict(kwargs)
+                if safe_kwargs.get("icon") == "NONE":
+                    safe_kwargs.pop("icon", None)
+                try:
+                    return layout.prop_search(data, prop_name, search_data, search_prop, **safe_kwargs)
+                except Exception:
+                    return None
+            except Exception:
+                return None
+
+        def operator(self, layout, operator_id, text=None, icon="NONE", **properties):
+            if layout is None or not operator_id:
+                return None
+            kwargs = {}
+            if text is not None:
+                kwargs["text"] = self.compact_text(text, max_chars=UI_BUTTON_MAX_CHARS)
+            if icon != "NONE":
+                kwargs["icon"] = icon
+            try:
+                op = layout.operator(str(operator_id), **kwargs)
+            except Exception:
+                return None
+            for key, value in properties.items():
+                try:
+                    setattr(op, key, value)
+                except Exception:
+                    pass
+            return op
+
+        def menu(self, layout, menu_id, text=None, icon="NONE"):
+            if layout is None or not menu_id:
+                return None
+            kwargs = {}
+            if text is not None:
+                kwargs["text"] = self.compact_text(text, max_chars=UI_BUTTON_MAX_CHARS)
+            if icon != "NONE":
+                kwargs["icon"] = icon
+            try:
+                return layout.menu(str(menu_id), **kwargs)
+            except Exception:
+                return None
+
+        def operator_menu_enum(self, layout, operator_id, prop_name, text=None, icon="NONE"):
+            if layout is None or not operator_id or not prop_name:
+                return None
+            kwargs = {}
+            if text is not None:
+                kwargs["text"] = self.compact_text(text, max_chars=UI_BUTTON_MAX_CHARS)
+            if icon != "NONE":
+                kwargs["icon"] = icon
+            try:
+                return layout.operator_menu_enum(str(operator_id), str(prop_name), **kwargs)
+            except Exception:
+                return None
+
+        def operator_enum(self, layout, operator_id, prop_name):
+            if layout is None or not operator_id or not prop_name:
+                return None
+            try:
+                return layout.operator_enum(str(operator_id), str(prop_name))
+            except Exception:
+                return None
+
+        def prop_menu_enum(self, layout, data, prop_name, **kwargs):
+            if layout is None or data is None or not prop_name:
+                return None
+            try:
+                return layout.prop_menu_enum(data, prop_name, **kwargs)
+            except TypeError:
+                safe_kwargs = dict(kwargs)
+                if safe_kwargs.get("icon") == "NONE":
+                    safe_kwargs.pop("icon", None)
+                try:
+                    return layout.prop_menu_enum(data, prop_name, **safe_kwargs)
+                except Exception:
+                    return None
+            except Exception:
+                return None
+
+        def prop_enum(self, layout, data, prop_name, value, **kwargs):
+            if layout is None or data is None or not prop_name:
+                return None
+            try:
+                return layout.prop_enum(data, prop_name, value, **kwargs)
+            except TypeError:
+                safe_kwargs = dict(kwargs)
+                if safe_kwargs.get("icon") == "NONE":
+                    safe_kwargs.pop("icon", None)
+                try:
+                    return layout.prop_enum(data, prop_name, value, **safe_kwargs)
+                except Exception:
+                    return None
+            except Exception:
+                return None
+
+        def popover(self, layout, panel_id, text=None, icon="NONE"):
+            if layout is None or not panel_id:
+                return None
+            kwargs = {}
+            if text is not None:
+                kwargs["text"] = self.compact_text(text, max_chars=UI_BUTTON_MAX_CHARS)
+            if icon != "NONE":
+                kwargs["icon"] = icon
+            try:
+                return layout.popover(str(panel_id), **kwargs)
+            except Exception:
+                return None
+
+        def menu_contents(self, layout, menu_id):
+            if layout is None or not menu_id:
+                return None
+            try:
+                return layout.menu_contents(str(menu_id))
+            except Exception:
+                return None
+
+        def context_pointer_set(self, layout, name, data):
+            if layout is None or not name:
+                return None
+            try:
+                return layout.context_pointer_set(str(name), data)
+            except Exception:
+                return None
+
+        def split(self, layout, factor=0.5, align=False):
+            if layout is None:
+                return None
+            try:
+                return layout.split(factor=max(0.0, min(1.0, float(factor))), align=bool(align))
+            except Exception:
+                return None
+
+        def grid_flow(self, layout, **kwargs):
+            if layout is None:
+                return None
+            try:
+                return layout.grid_flow(**kwargs)
+            except Exception:
+                return None
+
+        def template_list(self, layout, *args, **kwargs):
+            if layout is None:
+                return None
+            try:
+                return layout.template_list(*args, **kwargs)
+            except Exception:
+                return None
+
+        def template_id(self, layout, data, prop_name, **kwargs):
+            if layout is None or data is None or not prop_name:
+                return None
+            try:
+                return layout.template_ID(data, prop_name, **kwargs)
+            except Exception:
+                return None
+
+        def template_icon(self, layout, icon_value=0, scale=1.0):
+            if layout is None:
+                return None
+            try:
+                return layout.template_icon(icon_value=int(icon_value or 0), scale=max(1.0, float(scale)))
+            except Exception:
+                return None
+
+        def template_id_preview(self, layout, data, prop_name, **kwargs):
+            if layout is None or data is None or not prop_name:
+                return None
+            try:
+                return layout.template_ID_preview(data, prop_name, **kwargs)
+            except Exception:
+                return None
+
+        def template_search(self, layout, data, prop_name, search_data, search_prop, **kwargs):
+            if layout is None or data is None or search_data is None or not prop_name or not search_prop:
+                return None
+            try:
+                return layout.template_search(data, prop_name, search_data, search_prop, **kwargs)
+            except Exception:
+                return None
+
+        def template_icon_view(self, layout, data, prop_name, **kwargs):
+            if layout is None or data is None or not prop_name:
+                return None
+            try:
+                return layout.template_icon_view(data, prop_name, **kwargs)
+            except Exception:
+                return None
+
+        def template_color_picker(self, layout, data, prop_name, **kwargs):
+            if layout is None or data is None or not prop_name:
+                return None
+            try:
+                return layout.template_color_picker(data, prop_name, **kwargs)
+            except Exception:
+                return None
+
+        def template_curve_mapping(self, layout, data, prop_name, **kwargs):
+            if layout is None or data is None or not prop_name:
+                return None
+            try:
+                return layout.template_curve_mapping(data, prop_name, **kwargs)
+            except Exception:
+                return None
+
+        def template_preview(self, layout, id_data, **kwargs):
+            if layout is None or id_data is None:
+                return None
+            try:
+                return layout.template_preview(id_data, **kwargs)
+            except Exception:
+                return None
+
+        def draw_prop(self, layout, data, prop_name, label=None, icon="NONE", slider=False, expand=False, toggle=-1, emboss=True):
+            if data is None or not prop_name:
+                return None
+            kwargs = {"text": "" if label is None else self.compact_text(label), "slider": slider, "expand": expand, "emboss": emboss}
+            if toggle in {0, 1}:
+                kwargs["toggle"] = bool(toggle)
+            if icon != "NONE":
+                kwargs["icon"] = icon
+            try:
+                return layout.prop(data, prop_name, **kwargs)
+            except TypeError:
+                kwargs.pop("icon", None)
+                kwargs.pop("toggle", None)
+                try:
+                    return layout.prop(data, prop_name, **kwargs)
+                except Exception:
+                    return None
+            except Exception:
+                return None
+
+        def draw_scene_prop(self, layout, prop_name, label=None, icon="NONE", slider=False, expand=False, toggle=-1, emboss=True):
+            return self.draw_prop(
+                layout,
+                self.scene,
+                prop_name,
+                label=label,
+                icon=icon,
+                slider=slider,
+                expand=expand,
+                toggle=toggle,
+                emboss=emboss,
+            )
+
+        def draw_runtime_prop(self, layout, key, default=None, kind="value", label=None, icon="NONE", slider=False, expand=False, toggle=-1, emboss=True):
+            prop_key = self._ensure_scene_value(key, default, kind=kind)
+            if self.scene is None or not prop_key:
+                return None
+            kwargs = {
+                "text": "" if label is None else self.compact_text(label),
+                "slider": slider,
+                "expand": expand,
+                "emboss": emboss,
+            }
+            if toggle in {0, 1}:
+                kwargs["toggle"] = bool(toggle)
+            if icon != "NONE":
+                kwargs["icon"] = icon
+            try:
+                return layout.prop(self.scene, f'["{prop_key}"]', **kwargs)
+            except TypeError:
+                kwargs.pop("icon", None)
+                kwargs.pop("toggle", None)
+                try:
+                    return layout.prop(self.scene, f'["{prop_key}"]', **kwargs)
+                except Exception:
+                    return None
+            except Exception:
+                return None
+
+        def split_field(self, layout, label="", factor=0.34, align=True):
+            split = layout.split(factor=max(0.1, min(0.9, float(factor))), align=align)
+            left = split.row(align=align)
+            right = split.row(align=align)
+            if label:
+                left.label(text=self.compact_text(label))
+            return left, right
+
+        def foldout_section(self, layout, key, title, icon="NONE", default_open=True, enabled=True):
+            prop_key = self._ensure_scene_value(key, bool(default_open), kind="bool")
+            is_open = bool(module_runtime_field_value(self.scene, workflow, module, key, "bool", bool(default_open)))
+            box = layout.box()
+            try:
+                box.enabled = bool(enabled)
+            except Exception:
+                pass
+            header = box.row(align=True)
+            if self.scene is not None and module_scene_prop_key_usable(prop_key):
+                try:
+                    if prop_key not in self.scene:
+                        self.scene[prop_key] = bool(default_open)
+                    header.prop(
+                        self.scene,
+                        f'["{prop_key}"]',
+                        text=self.plain_text(title),
+                        icon="TRIA_DOWN" if bool(self.scene.get(prop_key, default_open)) else "TRIA_RIGHT",
+                        emboss=False,
+                        toggle=False,
+                    )
+                    is_open = bool(self.scene.get(prop_key, default_open))
+                    if self.allow_writes:
+                        self.state.set(key, is_open)
+                except Exception:
+                    header.label(text=self.plain_text(title), icon=icon)
+            else:
+                header.label(text=self.plain_text(title), icon=icon)
+            if icon != "NONE":
+                header.label(text="", icon=icon)
+            content = box.column(align=True)
+            try:
+                content.enabled = bool(enabled)
+            except Exception:
+                pass
+            if not is_open:
+                return None
+            return content
+
         def draw_button(self, layout, action, label=None, icon="NONE", tooltip=""):
             op = layout.operator(
                 "bworkflow.module_runtime_action",
                 text=self.compact_text(label or action, max_chars=UI_BUTTON_MAX_CHARS),
                 icon=icon,
+            )
+            op.workflow_name = self.workflow_name
+            op.module_name = self.module_name
+            op.action_name = str(action)
+            op.tooltip_text = str(tooltip or "")
+            return op
+
+        def draw_icon_button(self, layout, action, icon="NONE", tooltip=""):
+            op = layout.operator(
+                "bworkflow.module_runtime_action",
+                text="",
+                icon=icon,
+                emboss=True,
             )
             op.workflow_name = self.workflow_name
             op.module_name = self.module_name
@@ -5947,6 +9772,49 @@ def module_runtime_context(context, scene, workflow, module, allow_writes=True, 
                 items = [obj for obj in items if getattr(obj, "type", None) == type]
             return items
 
+        def selected_mesh_objects(self, require_shape_keys=False):
+            items = self.selected_objects(type="MESH")
+            if require_shape_keys:
+                items = [obj for obj in items if self.shape_key_blocks(obj)]
+            return items
+
+        def shape_key_data(self, obj=None):
+            obj = obj or self.active_object()
+            data = getattr(obj, "data", None)
+            return getattr(data, "shape_keys", None)
+
+        def shape_key_blocks(self, obj=None):
+            key_data = self.shape_key_data(obj)
+            return getattr(key_data, "key_blocks", None)
+
+        def active_shape_key_index(self, obj=None):
+            obj = obj or self.active_object()
+            try:
+                return int(getattr(obj, "active_shape_key_index", -1))
+            except Exception:
+                return -1
+
+        def active_shape_key(self, obj=None, include_basis=True):
+            obj = obj or self.active_object()
+            key_blocks = self.shape_key_blocks(obj)
+            index = self.active_shape_key_index(obj)
+            if not key_blocks or index < 0:
+                return None
+            if not include_basis and index <= 0:
+                return None
+            try:
+                if index < len(key_blocks):
+                    return key_blocks[index]
+            except Exception:
+                return None
+            return None
+
+        def valid_shape_key_objects(self, require_active_non_basis=False):
+            items = self.selected_mesh_objects(require_shape_keys=True)
+            if require_active_non_basis:
+                items = [obj for obj in items if self.active_shape_key(obj, include_basis=False) is not None]
+            return items
+
         def context_summary(self):
             active = self.active_object()
             return {
@@ -5964,7 +9832,29 @@ def module_runtime_context(context, scene, workflow, module, allow_writes=True, 
             value = str(module_runtime_field_value(self.scene, workflow, module, key, "text", default_value) or "")
             row = layout.row(align=True)
             row.label(text=self.compact_text(label))
-            op = row.operator("bworkflow.module_runtime_field_write", text=self.compact_text(value, UI_BUTTON_MAX_CHARS, "编辑"))
+            op = row.operator("bworkflow.module_runtime_field_write", text=self.compact_text(value, UI_BUTTON_MAX_CHARS, "编辑"), translate=False)
+            op.workflow_name = self.workflow_name
+            op.module_name = self.module_name
+            op.field_key = key
+            op.field_kind = "text"
+            op.text_value = value
+
+        def draw_text_input_inline(self, layout, key, label, default="", factor=0.34):
+            default_value = str(default)
+            prop_key = self._ensure_scene_value(key, default_value, kind="text")
+            value = str(module_runtime_field_value(self.scene, workflow, module, key, "text", default_value) or "")
+            _left, right = self.split_field(layout, label, factor=factor)
+            if self.scene is not None and module_scene_prop_key_usable(prop_key):
+                try:
+                    if prop_key not in self.scene:
+                        self.scene[prop_key] = value
+                    right.prop(self.scene, f'["{prop_key}"]', text="")
+                    if self.allow_writes:
+                        self.state.set(key, str(self.scene.get(prop_key, value) or ""))
+                    return
+                except Exception:
+                    pass
+            op = right.operator("bworkflow.module_runtime_field_write", text=self.compact_text(value, UI_BUTTON_MAX_CHARS, ""), translate=False)
             op.workflow_name = self.workflow_name
             op.module_name = self.module_name
             op.field_key = key
@@ -5984,50 +9874,123 @@ def module_runtime_context(context, scene, workflow, module, allow_writes=True, 
             op.field_kind = "bool"
             op.bool_value = not value
 
-        def draw_float_input(self, layout, key, label, default=0.0):
+        def draw_toggle_inline(self, layout, key, label, default=False, factor=0.34):
+            default_value = bool(default)
+            prop_key = self._ensure_scene_value(key, default_value, kind="bool")
+            _left, right = self.split_field(layout, label, factor=factor)
+            if self.scene is not None and module_scene_prop_key_usable(prop_key):
+                try:
+                    if prop_key not in self.scene:
+                        self.scene[prop_key] = default_value
+                    right.prop(self.scene, f'["{prop_key}"]', text="")
+                    if self.allow_writes:
+                        self.state.set(key, bool(self.scene.get(prop_key, default_value)))
+                    return
+                except Exception:
+                    pass
+            value = bool(module_runtime_field_value(self.scene, workflow, module, key, "bool", default_value))
+            op = right.operator("bworkflow.module_runtime_field_write", text="", icon="CHECKBOX_HLT" if value else "CHECKBOX_DEHLT", emboss=False)
+            op.workflow_name = self.workflow_name
+            op.module_name = self.module_name
+            op.field_key = key
+            op.field_kind = "bool"
+            op.bool_value = not value
+            return op
+
+        def draw_float_input(self, layout, key, label, default=0.0, **kwargs):
             default_value = float(default)
             prop_key = self._ensure_scene_value(key, default_value, kind="float")
             value = float(module_runtime_field_value(self.scene, workflow, module, key, "float", default_value))
             row = layout.row(align=True)
             row.label(text=self.compact_text(label))
+            prop_kwargs = runtime_numeric_prop_kwargs(**kwargs)
             if self.scene is not None and module_scene_prop_key_usable(prop_key):
                 try:
                     if prop_key not in self.scene:
                         self.scene[prop_key] = value
-                    row.prop(self.scene, f'["{prop_key}"]', text="")
+                    row.prop(self.scene, f'["{prop_key}"]', text="", **prop_kwargs)
                     if self.allow_writes:
                         self.state.set(key, float(self.scene.get(prop_key, value)))
                     return
                 except Exception:
                     pass
-            op = row.operator("bworkflow.module_runtime_field_write", text=f"{value:.3f}")
+            op = row.operator("bworkflow.module_runtime_field_write", text=f"{value:.3f}", translate=False)
             op.workflow_name = self.workflow_name
             op.module_name = self.module_name
             op.field_key = key
             op.field_kind = "float"
             op.float_value = value
 
-        def draw_int_input(self, layout, key, label, default=0):
+        def draw_float_input_inline(self, layout, key, label, default=0.0, factor=0.34, **kwargs):
+            default_value = float(default)
+            prop_key = self._ensure_scene_value(key, default_value, kind="float")
+            value = float(module_runtime_field_value(self.scene, workflow, module, key, "float", default_value))
+            _left, right = self.split_field(layout, label, factor=factor)
+            prop_kwargs = runtime_numeric_prop_kwargs(**kwargs)
+            if self.scene is not None and module_scene_prop_key_usable(prop_key):
+                try:
+                    if prop_key not in self.scene:
+                        self.scene[prop_key] = value
+                    right.prop(self.scene, f'["{prop_key}"]', text="", **prop_kwargs)
+                    if self.allow_writes:
+                        self.state.set(key, float(self.scene.get(prop_key, value)))
+                    return
+                except Exception:
+                    pass
+            op = right.operator("bworkflow.module_runtime_field_write", text=f"{value:.3f}", translate=False)
+            op.workflow_name = self.workflow_name
+            op.module_name = self.module_name
+            op.field_key = key
+            op.field_kind = "float"
+            op.float_value = value
+            return op
+
+        def draw_int_input(self, layout, key, label, default=0, **kwargs):
             default_value = int(default)
             self._ensure_scene_value(key, default_value, kind="int")
             value = int(module_runtime_field_value(self.scene, workflow, module, key, "int", default_value))
             prop_key = self._prop_key(key, kind="int")
             row = layout.row(align=True)
             row.label(text=self.compact_text(label))
+            prop_kwargs = runtime_numeric_prop_kwargs(**kwargs)
             if self.scene is not None and module_scene_prop_key_usable(prop_key):
                 try:
-                    row.prop(self.scene, f'["{prop_key}"]', text="")
+                    row.prop(self.scene, f'["{prop_key}"]', text="", **prop_kwargs)
                     if self.allow_writes:
                         self.state.set(key, int(self.scene.get(prop_key, value)))
                     return
                 except Exception:
                     pass
-            op = row.operator("bworkflow.module_runtime_field_write", text=str(value))
+            op = row.operator("bworkflow.module_runtime_field_write", text=str(value), translate=False)
             op.workflow_name = self.workflow_name
             op.module_name = self.module_name
             op.field_key = key
             op.field_kind = "int"
             op.int_value = value
+
+        def draw_int_input_inline(self, layout, key, label, default=0, factor=0.34, **kwargs):
+            default_value = int(default)
+            prop_key = self._ensure_scene_value(key, default_value, kind="int")
+            value = int(module_runtime_field_value(self.scene, workflow, module, key, "int", default_value))
+            _left, right = self.split_field(layout, label, factor=factor)
+            prop_kwargs = runtime_numeric_prop_kwargs(**kwargs)
+            if self.scene is not None and module_scene_prop_key_usable(prop_key):
+                try:
+                    if prop_key not in self.scene:
+                        self.scene[prop_key] = value
+                    right.prop(self.scene, f'["{prop_key}"]', text="", **prop_kwargs)
+                    if self.allow_writes:
+                        self.state.set(key, int(self.scene.get(prop_key, value)))
+                    return
+                except Exception:
+                    pass
+            op = right.operator("bworkflow.module_runtime_field_write", text=str(value), translate=False)
+            op.workflow_name = self.workflow_name
+            op.module_name = self.module_name
+            op.field_key = key
+            op.field_kind = "int"
+            op.int_value = value
+            return op
 
         def draw_enum(self, layout, key, label, items, default=None, max_items=8, disabled_items=None, display_value=None):
             normalized = []
@@ -6061,6 +10024,7 @@ def module_runtime_context(context, scene, workflow, module, allow_writes=True, 
                     "bworkflow.module_runtime_field_write",
                     text=self.compact_text(item_label, max_chars=16),
                     depress=identifier == active_value,
+                    translate=False,
                 )
                 op.workflow_name = self.workflow_name
                 op.module_name = self.module_name
@@ -6076,12 +10040,65 @@ def module_runtime_context(context, scene, workflow, module, allow_writes=True, 
             value = str(module_runtime_field_value(self.scene, workflow, module, key, "object", default_name) or "")
             row = layout.row(align=True)
             row.label(text=self.compact_text(label))
-            op = row.operator("bworkflow.module_runtime_field_write", text=self.compact_text(value, UI_BUTTON_MAX_CHARS, "选择物体"))
+            op = row.operator("bworkflow.module_runtime_field_write", text=self.compact_text(value, UI_BUTTON_MAX_CHARS, "选择"), translate=False)
             op.workflow_name = self.workflow_name
             op.module_name = self.module_name
             op.field_key = key
             op.field_kind = "object"
             op.object_name = value
+
+        def draw_object_picker_inline(self, layout, key, label="物体", default=None, factor=0.34, show_active_button=False):
+            default_name = getattr(default, "name", "") if default is not None else ""
+            prop_key = self._ensure_scene_value(key, default_name, kind="object")
+            value = str(module_runtime_field_value(self.scene, workflow, module, key, "object", default_name) or "")
+            _left, right = self.split_field(layout, label, factor=factor)
+            if self.scene is not None and module_scene_prop_key_usable(prop_key):
+                try:
+                    if prop_key not in self.scene:
+                        self.scene[prop_key] = value
+                    field_row = right.row(align=True)
+                    field_row.prop(self.scene, f'["{prop_key}"]', text="")
+                    if show_active_button:
+                        self.draw_active_object_capture(field_row, key, "", icon="EYEDROPPER")
+                    if self.allow_writes:
+                        self.state.set(key, str(self.scene.get(prop_key, value) or ""))
+                    return
+                except Exception:
+                    pass
+            field_row = right.row(align=True)
+            op = field_row.operator("bworkflow.module_runtime_field_write", text=self.compact_text(value, UI_BUTTON_MAX_CHARS, ""), translate=False)
+            op.workflow_name = self.workflow_name
+            op.module_name = self.module_name
+            op.field_key = key
+            op.field_kind = "object"
+            op.object_name = value
+            if show_active_button:
+                self.draw_active_object_capture(field_row, key, "", icon="EYEDROPPER")
+            return op
+
+        def draw_file_path_input(self, layout, key, label, default="", factor=0.34, filter_glob="*.*", status_prefix="已选择文件"):
+            default_value = str(default)
+            prop_key = self._ensure_scene_value(key, default_value, kind="text")
+            value = str(module_runtime_field_value(self.scene, workflow, module, key, "text", default_value) or "")
+            _left, right = self.split_field(layout, label, factor=factor)
+            if self.scene is not None and module_scene_prop_key_usable(prop_key):
+                try:
+                    if prop_key not in self.scene:
+                        self.scene[prop_key] = value
+                    field_row = right.row(align=True)
+                    field_row.prop(self.scene, f'["{prop_key}"]', text="")
+                    op = field_row.operator("bworkflow.module_pick_file_path", text="", icon="FILE_FOLDER")
+                    op.workflow_name = self.workflow_name
+                    op.module_name = self.module_name
+                    op.target_text_key = key
+                    op.filter_glob = str(filter_glob or "*.*")
+                    op.status_prefix = str(status_prefix or "已选择文件")
+                    if self.allow_writes:
+                        self.state.set(key, str(self.scene.get(prop_key, value) or ""))
+                    return op
+                except Exception:
+                    pass
+            return self.draw_text_input_inline(layout, key, label, default=default, factor=factor)
 
         def draw_active_object_capture(self, layout, key, label="吸取当前选中", icon="EYEDROPPER"):
             active_name = getattr(getattr(self.context, "object", None), "name", "")
@@ -6107,6 +10124,7 @@ def module_runtime_context(context, scene, workflow, module, allow_writes=True, 
             op = row.operator(
                 "bworkflow.module_runtime_field_write",
                 text=self.compact_text(value, UI_BUTTON_MAX_CHARS, "选择"),
+                translate=False,
             )
             op.workflow_name = self.workflow_name
             op.module_name = self.module_name
@@ -6153,8 +10171,121 @@ def build_module_namespace(context, scene, workflow, module, name, allow_writes=
     }
 
 
+def source_cache_signature(source, name):
+    normalized = str(source or "").lstrip("\ufeff")
+    return (str(name or ""), hashlib.sha1(normalized.encode("utf-8", errors="replace")).hexdigest())
+
+
+def module_source_fast_token(module):
+    text_name = str(getattr(module, "text_block_name", "") or "").strip()
+    if text_name:
+        text_block = bpy.data.texts.get(text_name)
+        if text_block is not None:
+            try:
+                return ("text", text_name, len(text_block.lines))
+            except Exception:
+                return ("text", text_name, -1)
+    filepath = module_script_abspath(module)
+    if filepath and os.path.isfile(filepath):
+        try:
+            stat = os.stat(filepath)
+            return ("file", os.path.normcase(os.path.abspath(filepath)), int(stat.st_mtime_ns), int(stat.st_size))
+        except Exception:
+            return ("file", os.path.normcase(os.path.abspath(filepath)), 0, 0)
+    source = str(getattr(module, "script_source", "") or "")
+    if source:
+        return ("prop", len(source), source[:96], source[-96:])
+    return ("empty",)
+
+
+def get_cached_module_source(module, name):
+    """获取模块源代码及其签名，用行数做轻量级判断避免每次 draw 都读取大字符串。
+
+    每次 draw（滚轮滚动等）都会调用 load_module_namespace，如果不缓存，
+    每帧都会执行 text_block.as_string() + SHA1 计算，产生大量临时字符串，
+    导致 Blender 内存持续上升且不释放。
+    """
+    text_name = str(getattr(module, "text_block_name", "") or "").strip()
+    if text_name:
+        text_block = bpy.data.texts.get(text_name)
+        if text_block is not None:
+            try:
+                current_line_count = len(text_block.lines)
+            except Exception:
+                current_line_count = -1
+            cached = MODULE_SOURCE_TEXT_CACHE.get(text_name)
+            if cached is not None and cached.get("line_count") == current_line_count:
+                return cached["source"], cached["signature"]
+            source = text_block.as_string().lstrip("\ufeff")
+            signature = source_cache_signature(source, name)
+            MODULE_SOURCE_TEXT_CACHE[text_name] = {
+                "line_count": current_line_count,
+                "source": source,
+                "signature": signature,
+            }
+            return source, signature
+    source = str(getattr(module, "script_source", "") or "").lstrip("\ufeff")
+    if not source:
+        filepath = module_script_abspath(module)
+        if filepath and os.path.isfile(filepath):
+            try:
+                source = read_cached_text_file(filepath).lstrip("\ufeff")
+            except Exception:
+                source = ""
+    signature = source_cache_signature(source, name)
+    return source, signature
+
+def cached_module_namespace(scene, workflow, module, name, source_signature=None, source_token=None):
+    cache_key = module_runtime_namespace_cache_key(scene, workflow, module, name)
+    cached = MODULE_RUNTIME_NAMESPACE_CACHE.get(cache_key)
+    if not isinstance(cached, dict):
+        return None
+    if source_token is not None and cached.get("source_token") == source_token:
+        namespace = cached.get("namespace")
+        return namespace if isinstance(namespace, dict) else None
+    if source_signature is not None and cached.get("source_signature") != source_signature:
+        return None
+    if source_signature is None and source_token is None:
+        return None
+    namespace = cached.get("namespace")
+    return namespace if isinstance(namespace, dict) else None
+
+
+def store_module_namespace(scene, workflow, module, name, source_signature, namespace, source_token=None):
+    if not isinstance(namespace, dict):
+        return None
+    MODULE_RUNTIME_NAMESPACE_CACHE[module_runtime_namespace_cache_key(scene, workflow, module, name)] = {
+        "source_signature": source_signature,
+        "source_token": source_token,
+        "namespace": namespace,
+    }
+    return namespace
+
+
+def clear_cached_module_namespaces(scene=None, workflow=None, module=None):
+    if scene is None and workflow is None and module is None:
+        MODULE_RUNTIME_NAMESPACE_CACHE.clear()
+        MODULE_SOURCE_TEXT_CACHE.clear()
+        MODULE_RUNTIME_FIELD_INIT_CACHE.clear()
+        return 0
+    target_prefix = module_runtime_cleanup_cache_key(scene, workflow, module)
+    removed = 0
+    for key in list(MODULE_RUNTIME_NAMESPACE_CACHE.keys()):
+        if tuple(key[:3]) != tuple(target_prefix):
+            continue
+        MODULE_RUNTIME_NAMESPACE_CACHE.pop(key, None)
+        removed += 1
+    for key in list(MODULE_RUNTIME_FIELD_INIT_CACHE.keys()):
+        if tuple(key[:3]) != tuple(target_prefix):
+            continue
+        MODULE_RUNTIME_FIELD_INIT_CACHE.pop(key, None)
+        removed += 1
+    return removed
+
+
 def execute_module_source(source, context, scene, workflow, module, name, allow_writes=True, persist_state=True, field_specs=None):
     source = str(source or "").lstrip("\ufeff")
+    source_signature = source_cache_signature(source, name)
     module_state, panel_api = module_runtime_context(
         context,
         scene,
@@ -6177,6 +10308,16 @@ def execute_module_source(source, context, scene, workflow, module, name, allow_
         "panel_api": panel_api,
     }
     exec(compile(source, name, "exec"), namespace, namespace)
+    if not allow_writes and not persist_state:
+        store_module_namespace(
+            scene,
+            workflow,
+            module,
+            name,
+            source_signature,
+            namespace,
+            source_token=module_source_fast_token(module),
+        )
     if persist_state:
         merge_module_runtime_store(scene, workflow, module, namespace["module_state"].to_dict())
     cleanup_fn = namespace.get("cleanup_runtime") or namespace.get("cleanup")
@@ -6185,9 +10326,55 @@ def execute_module_source(source, context, scene, workflow, module, name, allow_
     return namespace
 
 
-def load_module_namespace(context, scene, workflow, module, name, allow_writes=False, persist_state=False):
-    source = current_module_script_source(workflow, module, prefer_text_block=True, allow_initialize=False).strip()
+def reuse_cached_module_namespace(cached, context, scene, workflow, module, name, allow_writes=False):
+    panel_api = cached.get("panel_api")
+    module_state = cached.get("module_state")
+    if panel_api is not None:
+        panel_api.context = context
+        panel_api.scene = scene
+        panel_api.workflow = workflow
+        panel_api.module = module
+        panel_api.allow_writes = allow_writes
+        try:
+            panel_api.field_specs.clear()
+        except Exception:
+            panel_api.field_specs = []
+    else:
+        module_state, panel_api = module_runtime_context(
+            context,
+            scene,
+            workflow,
+            module,
+            allow_writes=allow_writes,
+        )
+    script_path = module_script_abspath(module)
+    module_file = script_path if script_path else name
+    cached["__name__"] = name
+    cached["__file__"] = module_file
+    cached["bpy"] = bpy
+    cached["context"] = context
+    cached["scene"] = scene
+    cached["workflow"] = workflow
+    cached["module"] = module
+    cached["module_state"] = module_state
+    cached["panel_api"] = panel_api
+    return cached
+
+
+def load_module_namespace(context, scene, workflow, module, name, allow_writes=False, persist_state=False, source_token=None):
+    if source_token is None:
+        source_token = module_source_fast_token(module)
+    if not allow_writes and not persist_state:
+        cached = cached_module_namespace(scene, workflow, module, name, source_token=source_token)
+        if cached is not None:
+            return reuse_cached_module_namespace(cached, context, scene, workflow, module, name, allow_writes=allow_writes)
+    source, source_signature = get_cached_module_source(module, name)
+    source = source.strip()
     if source:
+        if not allow_writes and not persist_state:
+            cached = cached_module_namespace(scene, workflow, module, name, source_signature)
+            if cached is not None:
+                return reuse_cached_module_namespace(cached, context, scene, workflow, module, name, allow_writes=allow_writes)
         return execute_module_source(
             source,
             context,
@@ -6203,8 +10390,43 @@ def load_module_namespace(context, scene, workflow, module, name, allow_writes=F
     if not filepath or not os.path.isfile(filepath):
         raise FileNotFoundError("自定义模块脚本文件不存在，且当前模板里没有可执行代码。")
     with open(filepath, "r", encoding="utf-8") as handle:
+        source = handle.read()
+        source_signature = source_cache_signature(source, filepath)
+        if not allow_writes and not persist_state:
+            cached = cached_module_namespace(scene, workflow, module, filepath, source_signature)
+            if cached is not None:
+                panel_api = cached.get("panel_api")
+                module_state = cached.get("module_state")
+                if panel_api is not None:
+                    panel_api.context = context
+                    panel_api.scene = scene
+                    panel_api.workflow = workflow
+                    panel_api.module = module
+                    panel_api.allow_writes = allow_writes
+                    try:
+                        panel_api.field_specs.clear()
+                    except Exception:
+                        panel_api.field_specs = []
+                else:
+                    module_state, panel_api = module_runtime_context(
+                        context,
+                        scene,
+                        workflow,
+                        module,
+                        allow_writes=allow_writes,
+                    )
+                cached["__name__"] = filepath
+                cached["__file__"] = filepath
+                cached["bpy"] = bpy
+                cached["context"] = context
+                cached["scene"] = scene
+                cached["workflow"] = workflow
+                cached["module"] = module
+                cached["module_state"] = module_state
+                cached["panel_api"] = panel_api
+                return cached
         return execute_module_source(
-            handle.read(),
+            source,
             context,
             scene,
             workflow,
@@ -6259,7 +10481,7 @@ def cleanup_module_runtimes(context=None):
                 continue
             for workflow in state.workflows:
                 for module in workflow.modules:
-                    key = (id(scene), workflow.name, module.name)
+                    key = (str(getattr(scene, "as_pointer", lambda: 0)() if scene is not None else 0), workflow.name, module.name)
                     if key in seen:
                         continue
                     source = current_module_script_source(workflow, module, prefer_text_block=True, allow_initialize=False).strip()
@@ -6268,6 +10490,7 @@ def cleanup_module_runtimes(context=None):
                     seen.add(key)
                     try:
                         cached_cleanup = pop_module_runtime_cleanup(scene, workflow, module)
+                        clear_cached_module_namespaces(scene, workflow, module)
                         if cached_cleanup is not None:
                             cleanup_fn = cached_cleanup.get("cleanup_runtime")
                             module_state = cached_cleanup.get("module_state")
@@ -6433,6 +10656,31 @@ def sync_module_source_from_file(module):
         return False
 
 
+def apply_module_script_source_update(context, workflow, module, source, sync_text_block=True, refresh_runtime=True):
+    state = get_state(context=context)
+    module.script_source = str(source or "").lstrip("\ufeff")
+    if state is not None:
+        state.module_editor_text = module.script_source
+
+    old_text_name = str(getattr(module, "text_block_name", "") or "").strip()
+    if old_text_name:
+        MODULE_SOURCE_TEXT_CACHE.pop(old_text_name, None)
+
+    text_block = None
+    if sync_text_block:
+        text_block = ensure_module_text_block(workflow, module)
+        MODULE_SOURCE_TEXT_CACHE.pop(getattr(text_block, "name", ""), None)
+
+    clear_cached_module_namespaces(getattr(context, "scene", None), workflow, module)
+    if refresh_runtime:
+        initialize_module_runtime_fields(context.scene, workflow, module, context=context)
+        rebuild_runtime_panels(scene=context.scene, rebuild_cache=False)
+        schedule_deferred_runtime_refresh(scene=context.scene, intervals=(0.1, 0.35))
+        tag_redraw_all()
+    save_global_workflow_state(context.scene)
+    return text_block
+
+
 def sync_all_module_sources_from_text_blocks(scene=None):
     target_scene = scene or safe_context_scene()
     if target_scene is None:
@@ -6480,13 +10728,49 @@ def module_needs_runtime_panel(module):
     return bool(module.use_custom_panel)
 
 
-def initialize_module_runtime_fields(scene, workflow, module, context=None):
+def initialize_module_runtime_fields(scene, workflow, module, context=None, source_token=None):
     if scene is None or workflow is None or module is None:
         return False
 
-    source = current_module_script_source(workflow, module, prefer_text_block=True, allow_initialize=True).strip()
+    cache_key = module_runtime_cleanup_cache_key(scene, workflow, module)
+    if source_token is None:
+        source_token = module_source_fast_token(module)
+    cached = MODULE_RUNTIME_FIELD_INIT_CACHE.get(cache_key)
+    if isinstance(cached, dict) and cached.get("source_token") == source_token:
+        cached_specs = cached.get("field_specs")
+        field_specs = list(cached_specs if isinstance(cached_specs, (list, tuple)) else load_module_runtime_specs(scene, workflow, module))
+        changed = False
+        for spec in field_specs:
+            prop_key = spec.get("prop_key")
+            if not prop_key or not module_scene_prop_key_usable(prop_key) or prop_key in scene:
+                continue
+            try:
+                scene[prop_key] = normalize_module_field_default(spec.get("kind", "text"), spec.get("default"))
+                changed = True
+            except Exception:
+                continue
+        return changed
+
+    source, source_signature = get_cached_module_source(module, "__go_workflow_init__")
+    source = source.strip()
     if not source:
         return False
+
+    if isinstance(cached, dict) and cached.get("source_signature") == source_signature:
+        cached["source_token"] = source_token
+        cached_specs = cached.get("field_specs")
+        field_specs = list(cached_specs if isinstance(cached_specs, (list, tuple)) else load_module_runtime_specs(scene, workflow, module))
+        changed = False
+        for spec in field_specs:
+            prop_key = spec.get("prop_key")
+            if not prop_key or not module_scene_prop_key_usable(prop_key) or prop_key in scene:
+                continue
+            try:
+                scene[prop_key] = normalize_module_field_default(spec.get("kind", "text"), spec.get("default"))
+                changed = True
+            except Exception:
+                continue
+        return changed
 
     field_specs = []
     try:
@@ -6503,9 +10787,15 @@ def initialize_module_runtime_fields(scene, workflow, module, context=None):
         )
     except Exception:
         return False
+    MODULE_RUNTIME_NAMESPACE_CACHE.pop(module_runtime_namespace_cache_key(scene, workflow, module, "__go_workflow_init__"), None)
 
     migrate_module_runtime_scene_values(scene, workflow, module, field_specs)
     save_module_runtime_specs(scene, workflow, module, field_specs)
+    MODULE_RUNTIME_FIELD_INIT_CACHE[cache_key] = {
+        "source_signature": source_signature,
+        "source_token": source_token,
+        "field_specs": list(field_specs),
+    }
     changed = False
     for spec in field_specs:
         prop_key = spec.get("prop_key")
@@ -6835,7 +11125,14 @@ class BWFLOW_OT_open_runtime_error_report(Operator):
 
 def draw_module_runtime_panel(card, context, workflow, module):
     try:
-        result = load_module_namespace(context, context.scene, workflow, module, "__go_workflow_panel__")
+        source_token = module_source_fast_token(module)
+        # 原生 layout.prop(...) 依赖 scene 上已经存在对应的运行时字段。
+        # 面板绘制阶段仍保持模块自身 allow_writes=False，但先由宿主补齐字段初始化。
+        try:
+            initialize_module_runtime_fields(context.scene, workflow, module, context=context, source_token=source_token)
+        except Exception:
+            pass
+        result = load_module_namespace(context, context.scene, workflow, module, "__go_workflow_panel__", source_token=source_token)
         draw_fn = result.get("draw_panel")
         if callable(draw_fn):
             if callable_accepts_panel_api(draw_fn):
@@ -6872,6 +11169,39 @@ def find_workspace_by_name(name):
         return None
 
 
+def startup_blend_candidates():
+    candidates = []
+    for resource_type in ("USER", "LOCAL", "SYSTEM"):
+        try:
+            path = bpy.utils.user_resource("CONFIG", path="startup.blend") if resource_type == "USER" else os.path.join(bpy.utils.resource_path(resource_type), "startup.blend")
+            if path and path not in candidates:
+                candidates.append(path)
+        except Exception:
+            pass
+    return [path for path in candidates if os.path.isfile(path)]
+
+
+def ensure_scripting_workspace(context=None):
+    workspace = find_workspace_by_name("Scripting")
+    if workspace is not None:
+        return workspace
+
+    window = getattr(context or bpy.context, "window", None)
+    for filepath in startup_blend_candidates():
+        try:
+            if window is not None:
+                with (context or bpy.context).temp_override(window=window):
+                    bpy.ops.workspace.append_activate(idname="Scripting", filepath=filepath)
+            else:
+                bpy.ops.workspace.append_activate(idname="Scripting", filepath=filepath)
+        except Exception:
+            continue
+        workspace = find_workspace_by_name("Scripting")
+        if workspace is not None:
+            return workspace
+    return find_workspace_by_name("Scripting")
+
+
 def assign_text_to_screen(screen, text_block):
     if screen is None:
         return False
@@ -6884,6 +11214,28 @@ def assign_text_to_screen(screen, text_block):
                 return True
             except Exception:
                 traceback.print_exc()
+    return False
+
+
+def assign_text_to_converted_area(screen, text_block, preferred_area=None):
+    if screen is None or text_block is None:
+        return False
+    candidates = []
+    preferred_area_in_screen = preferred_area is not None and any(area == preferred_area for area in screen.areas)
+    if preferred_area_in_screen and getattr(preferred_area, "type", None) not in {"TOPBAR", "STATUSBAR"}:
+        candidates.append(preferred_area)
+    for area in screen.areas:
+        if area not in candidates and area.type not in {"TOPBAR", "STATUSBAR"}:
+            candidates.append(area)
+    candidates.sort(key=lambda area: (0 if area is preferred_area else 1, -(area.width * area.height)))
+    for area in candidates:
+        try:
+            area.type = "TEXT_EDITOR"
+            area.spaces.active.text = text_block
+            area.tag_redraw()
+            return True
+        except Exception:
+            traceback.print_exc()
     return False
 
 
@@ -6919,13 +11271,11 @@ def activate_text_editor_for_text(context, text_block, workspace=None):
         if window is None:
             return None
         previous_workspace = getattr(window, "workspace", None)
-        workspace_switched = False
         if previous_workspace != workspace:
             try:
                 window.workspace = workspace
-                workspace_switched = True
             except Exception:
-                workspace_switched = False
+                return None
         try:
             with context.temp_override(window=window, screen=window.screen):
                 if assign_text_to_screen(window.screen, text_block):
@@ -6934,11 +11284,6 @@ def activate_text_editor_for_text(context, text_block, workspace=None):
             traceback.print_exc()
         if assign_text_to_screen(window.screen, text_block):
             return "scripting_workspace"
-        if workspace_switched and previous_workspace is not None:
-            try:
-                window.workspace = previous_workspace
-            except Exception:
-                pass
         return None
 
     if window is not None and assign_text_to_screen(window.screen, text_block):
@@ -7030,6 +11375,7 @@ def open_module_script_directory(workflow, module):
 
 def force_reload_script_panels(scene=None, space_type=None, restore_first=True):
     initialize_all_module_runtime_fields(scene=scene)
+    changed = False
     target_spaces = (space_type,) if space_type else iter_supported_space_types()
     for target_space in target_spaces:
         state = get_state(scene=scene, space_type=target_space)
@@ -7043,7 +11389,14 @@ def force_reload_script_panels(scene=None, space_type=None, restore_first=True):
 
         if restore_first:
             restore_unregistered_panels(space_type=target_space)
+            changed = True
+        if getattr(state, "panel_order_pending_apply", False):
+            continue
+        previous_order_signature = PANEL_ORDER_SIGNATURE_BY_SPACE.get(target_space)
         apply_panel_order_overrides(ordered_ids, space_type=target_space)
+        if previous_order_signature != PANEL_ORDER_SIGNATURE_BY_SPACE.get(target_space):
+            changed = True
+    return changed
 
 
 def on_workflow_changed(self, context):
@@ -7097,7 +11450,33 @@ def on_module_runtime_panel_expanded_changed(self, context):
     if IS_INITIALIZING_ADDON:
         return
     try:
-        save_global_workflow_state(getattr(context, "scene", None))
+        scene = getattr(context, "scene", None)
+        if scene is not None and not bool(getattr(self, "runtime_panel_expanded", True)):
+            for space_type in iter_supported_space_types():
+                state = get_state(scene=scene, space_type=space_type)
+                if state is None:
+                    continue
+                for workflow in state.workflows:
+                    for module in workflow.modules:
+                        if module != self:
+                            continue
+                        namespace = load_module_namespace(
+                            context,
+                            scene,
+                            workflow,
+                            module,
+                            "__go_workflow_panel_collapse__",
+                            allow_writes=True,
+                            persist_state=False,
+                        )
+                        cleanup_fn = namespace.get("on_panel_collapse")
+                        if callable(cleanup_fn):
+                            cleanup_fn(scene=scene, workflow=workflow, module=module, module_state=namespace.get("module_state"))
+                        break
+                    else:
+                        continue
+                    break
+        save_global_workflow_state(scene)
     except Exception:
         traceback.print_exc()
     tag_redraw_all()
@@ -7136,6 +11515,7 @@ class BWFLOW_PG_PanelRecord(PropertyGroup):
         update=on_filter_config_changed,
     )
     source_module: StringProperty()
+    addon_version: StringProperty(default="")
     discovered: BoolProperty(default=False)
 
 
@@ -7285,6 +11665,7 @@ class BWFLOW_PG_Workflow(PropertyGroup):
         description="用英文逗号分隔；带这些标签的面板会自动加入该工作流显示结果",
         update=on_filter_config_changed,
     )
+    missing_warning_dismissed: BoolProperty(default=False)
     panels: CollectionProperty(type=BWFLOW_PG_WorkflowPanel)
     active_panel_index: IntProperty(default=0)
     modules: CollectionProperty(type=BWFLOW_PG_WorkflowModule)
@@ -7345,6 +11726,18 @@ class BWFLOW_PG_Settings(PropertyGroup):
         items=SETTINGS_TABS,
         default="WORKFLOWS",
     )
+    auto_gc_enabled: BoolProperty(
+        name="自动定时释放内存",
+        description="面板滚动后定期调用 gc.collect() 回收不再使用的对象",
+        default=False,
+    )
+    auto_gc_interval: IntProperty(
+        name="自动释放间隔（秒）",
+        description="两次自动内存回收之间的最小间隔",
+        default=15,
+        min=5,
+        max=120,
+    )
 
 
 class BWFLOW_PG_State(PropertyGroup):
@@ -7360,6 +11753,12 @@ class BWFLOW_PG_State(PropertyGroup):
     panel_library_last_click_target: StringProperty(default="")
     panel_group_expanded_keys: StringProperty(default="")
     selected_group_expanded_keys: StringProperty(default="")
+    panel_group_filter_text: StringProperty(default="")
+    selected_panel_group_filter_text: StringProperty(default="")
+    panel_group_page: IntProperty(default=0, min=0)
+    selected_panel_group_page: IntProperty(default=0, min=0)
+    panel_order_pending_apply: BoolProperty(default=False)
+    panel_visibility_pending_apply: BoolProperty(default=False)
     preset_filepath: StringProperty(name="预设文件", default="", subtype="FILE_PATH")
     preset_workflows: CollectionProperty(type=BWFLOW_PG_PresetWorkflowItem)
     preset_workflow_index: IntProperty(default=0)
@@ -7370,6 +11769,47 @@ class BWFLOW_PG_State(PropertyGroup):
         description="用于当前模块脚本内容编辑窗口的临时文本缓存",
     )
     settings: PointerProperty(type=BWFLOW_PG_Settings)
+
+
+def on_shape_key_inspector_index_changed(self, context):
+    items = getattr(self, "bwflow_shape_key_inspector_items", None)
+    if items is None:
+        return
+    index = int(getattr(self, "bwflow_shape_key_inspector_index", -1) or -1)
+    if index < 0 or index >= len(items):
+        return
+    item = items[index]
+    object_name = str(getattr(item, "object_name", "") or "")
+    key_index = int(getattr(item, "key_index", -1) or -1)
+    if not object_name or key_index < 0:
+        return
+    obj = bpy.data.objects.get(object_name)
+    if obj is None or getattr(obj, "type", None) != "MESH":
+        return
+    key_blocks = getattr(getattr(obj.data, "shape_keys", None), "key_blocks", None)
+    if key_blocks is None or key_index >= len(key_blocks):
+        return
+    try:
+        context.view_layer.objects.active = obj
+    except Exception:
+        pass
+    try:
+        obj.select_set(True)
+    except Exception:
+        pass
+    try:
+        obj.active_shape_key_index = key_index
+    except Exception:
+        pass
+
+
+class BWFLOW_PG_ShapeKeyInspectorItem(PropertyGroup):
+    object_name: StringProperty(default="")
+    key_index: IntProperty(default=-1)
+    key_name: StringProperty(default="")
+    is_empty: BoolProperty(default=False)
+    max_delta: FloatProperty(default=0.0)
+    reference_name: StringProperty(default="Basis")
 
 
 class BWFLOW_UL_workflows(UIList):
@@ -7453,10 +11893,22 @@ class BWFLOW_UL_preset_workflows(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         row = layout.row(align=True)
         row.prop(item, "selected", text="")
-        row.label(text=item.name or f"Workflow {index + 1}", icon="HOME" if item.is_default else "FILE_FOLDER")
-        row.label(text=item.source_label or item.source_space_type)
+        entry = preset_import_entry_at(data, index)
+        workflow = entry.get("workflow", {}) if isinstance(entry, dict) else {}
+        name = workflow.get("name", "") or f"Workflow {index + 1}"
+        space_type = entry.get("space_type", "VIEW_3D") if isinstance(entry, dict) else "VIEW_3D"
+        source_label = entry.get("source_label", "") if isinstance(entry, dict) else ""
+        row.label(text=name, icon="HOME" if item.is_default else "FILE_FOLDER")
+        row.label(text=source_label or SPACE_LABELS.get(space_type, space_type))
         row.label(text=f"{item.panel_count} 面板")
         row.label(text=f"{item.module_count} 模块")
+
+
+class BWFLOW_UL_shape_key_inspector_results(UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        row.label(text=f"{int(getattr(item, 'key_index', index))}. {getattr(item, 'key_name', '')}", icon="SHAPEKEY_DATA")
+        row.label(text=f"{float(getattr(item, 'max_delta', 0.0)):.6g}", icon="DRIVER_DISTANCE")
 
 
 class BWFLOW_OT_refresh_registry(Operator):
@@ -7499,6 +11951,29 @@ class BWFLOW_OT_initialize_defaults(Operator):
         schedule_deferred_runtime_refresh(scene=context.scene, intervals=(0.25,), space_type=space_type)
         save_global_workflow_state(context.scene)
         self.report({"INFO"}, "默认工作流已初始化" if created else "默认工作流已存在")
+        return {"FINISHED"}
+
+
+class BWFLOW_OT_release_memory(Operator):
+    bl_idname = "bworkflow.release_memory"
+    bl_label = "释放内存"
+    bl_description = "调用 Windows EmptyWorkingSet 释放 Blender 占用的物理内存（与 Mem Reduct 原理相同）"
+
+    @classmethod
+    def poll(cls, context):
+        return True
+
+    def execute(self, context):
+        result = _empty_working_set()
+        if result is not None:
+            before, after = result
+            dropped = before - after
+            if dropped > 0.5:
+                self.report({"INFO"}, f"已释放 {dropped:.1f} MB（{before:.0f} → {after:.0f} MB）")
+            else:
+                self.report({"INFO"}, f"Working Set 已 trim（{before:.0f} → {after:.0f} MB，当前已较紧凑）")
+        else:
+            self.report({"WARNING"}, "EmptyWorkingSet 调用失败（仅支持 Windows）")
         return {"FINISHED"}
 
 
@@ -7562,6 +12037,7 @@ class BWFLOW_OT_restore_default_n_panels(Operator):
         return self.execute(context)
 
     def execute(self, context):
+        quarantine_broken_panel_polls()
         scenes = list(iter_available_scenes())
         for scene in scenes:
             restore_default_n_panel_state(scene=scene, disable_filters=True, sync_registry_after_restore=False)
@@ -7576,6 +12052,7 @@ class BWFLOW_OT_restore_default_n_panels(Operator):
             uninstall_addon = bool(self.uninstall_addon)
 
             def _disable_addon():
+                quarantine_broken_panel_polls()
                 for module_name in addon_module_candidates():
                     if uninstall_addon:
                         try:
@@ -7602,6 +12079,51 @@ class BWFLOW_OT_restore_default_n_panels(Operator):
         else:
             self.report({"INFO"}, "已恢复默认 N 面板")
         return {"FINISHED"}
+def _safe_restore_default_n_panels_execute(self, context):
+    quarantine_broken_panel_polls()
+    scenes = list(iter_available_scenes())
+    for scene in scenes:
+        restore_default_n_panel_state(scene=scene, disable_filters=True, sync_registry_after_restore=False)
+    try:
+        save_global_workflow_state(context.scene)
+    except Exception:
+        traceback.print_exc()
+    tag_redraw_all()
+
+    if self.disable_addon or self.uninstall_addon:
+        uninstall_addon = bool(self.uninstall_addon)
+
+        def _disable_addon():
+            quarantine_broken_panel_polls()
+            for module_name in addon_module_candidates():
+                if uninstall_addon:
+                    try:
+                        bpy.ops.preferences.addon_remove(module=module_name)
+                        return None
+                    except Exception:
+                        pass
+                try:
+                    bpy.ops.preferences.addon_disable(module=module_name)
+                    return None
+                except Exception:
+                    pass
+            print("[GoWorkflow] unable to disable or remove addon via Blender Python API")
+            return None
+
+        try:
+            _register_one_shot_timer(_disable_addon, first_interval=0.1)
+        except Exception:
+            traceback.print_exc()
+        if uninstall_addon:
+            self.report({"INFO"}, "已恢复默认 N 面板，并安排在 Blender 退出后删除插件目录。当前会话先安全禁用，避免闪退。")
+        else:
+            self.report({"INFO"}, "已恢复默认 N 面板，并准备安全禁用 Go Workflow。")
+    else:
+        self.report({"INFO"}, "已恢复默认 N 面板")
+    return {"FINISHED"}
+
+
+BWFLOW_OT_restore_default_n_panels.execute = _safe_restore_default_n_panels_execute
 
 
 class BWFLOW_OT_workflow_activate(Operator):
@@ -7697,6 +12219,7 @@ class BWFLOW_OT_workflow_duplicate(Operator):
         workflow.is_default = False
         workflow.description = source.description
         workflow.tag_filter = source.tag_filter
+        workflow.missing_warning_dismissed = bool(getattr(source, "missing_warning_dismissed", False))
 
         for panel_id in workflow_explicit_panel_ids(source):
             item = workflow.panels.add()
@@ -7956,15 +12479,18 @@ class BWFLOW_OT_module_edit_script_source(Operator):
         scripting_workspace = find_workspace_by_name("Scripting")
         if scripting_workspace is not None:
             result = activate_text_editor_for_text(context, text_block, workspace=scripting_workspace)
-            if result in {"scripting_workspace", "workspace_window"}:
+            if result in {"workspace_window", "scripting_workspace"}:
                 self.report({"INFO"}, "已切换到 Scripting 工作区并打开当前模块")
                 return {"FINISHED"}
 
-        if activate_text_editor_for_text(context, text_block) == "current_window":
-            self.report({"INFO"}, "已在当前工作区的文本编辑器中打开当前模块")
-            return {"FINISHED"}
+        scripting_workspace = ensure_scripting_workspace(context)
+        if scripting_workspace is not None:
+            result = activate_text_editor_for_text(context, text_block, workspace=scripting_workspace)
+            if result in {"scripting_workspace", "workspace_window"}:
+                self.report({"INFO"}, "已创建 Scripting 工作区并打开当前模块")
+                return {"FINISHED"}
 
-        self.report({"INFO"}, "已同步脚本到 Blender 文本数据块；未找到可用的 Scripting 文本窗口")
+        self.report({"WARNING"}, "已同步脚本到 Blender 文本数据块；Scripting 工作区没有可用文本编辑器，未改动当前布局")
         return {"FINISHED"}
 
 
@@ -8068,7 +12594,7 @@ class BWFLOW_OT_module_import_text_file(Operator, ImportHelper):
         if workflow is None or module is None:
             workflow = get_active_workflow(get_state(context=context))
             if workflow is None or not workflow.modules:
-                self.report({"ERROR"}, "鎵句笉鍒板彂璧峰鍏ョ殑宸ヤ綔娴佹ā鍧?")
+                self.report({"ERROR"}, "找不到发起导入的工作流模块")
                 return {"CANCELLED"}
             module = workflow.modules[clamp_index(workflow.active_module_index, len(workflow.modules))]
         filepath = bpy.path.abspath(self.filepath)
@@ -8162,7 +12688,7 @@ class BWFLOW_OT_module_export_text_file(Operator, ExportHelper):
         if workflow is None or module is None:
             workflow = get_active_workflow(get_state(context=context))
             if workflow is None or not workflow.modules:
-                self.report({"ERROR"}, "鎵句笉鍒板彂璧峰鍑虹殑宸ヤ綔娴佹ā鍧?")
+                self.report({"ERROR"}, "找不到发起导出的工作流模块")
                 return {"CANCELLED"}
             module = workflow.modules[clamp_index(workflow.active_module_index, len(workflow.modules))]
         filepath = bpy.path.abspath(self.filepath)
@@ -8216,6 +12742,50 @@ class BWFLOW_OT_module_export_text_file(Operator, ExportHelper):
                     traceback.print_exc()
                     self.report({"ERROR"}, f"导出处理失败: {exc}")
                     return {"CANCELLED"}
+        self.report({"INFO"}, f"{self.status_prefix}: {filepath}")
+        return {"FINISHED"}
+
+
+class BWFLOW_OT_module_pick_file_path(Operator, ImportHelper):
+    bl_idname = "bworkflow.module_pick_file_path"
+    bl_label = "选择文件路径"
+    bl_description = "通过 Blender 原生文件浏览器为模块字段写入文件路径"
+
+    filter_glob: StringProperty(default="*.*", options={"HIDDEN"})
+    workflow_name: StringProperty(default="")
+    module_name: StringProperty(default="")
+    target_text_key: StringProperty(default="")
+    status_prefix: StringProperty(default="已选择文件")
+
+    @classmethod
+    def poll(cls, context):
+        workflow = get_active_workflow(get_state(context=context))
+        return workflow is not None and bool(workflow.modules)
+
+    def execute(self, context):
+        workflow, module = resolve_workflow_module(context.scene, self.workflow_name, self.module_name)
+        if workflow is None or module is None:
+            self.report({"ERROR"}, "找不到发起选择的工作流模块")
+            return {"CANCELLED"}
+        filepath = bpy.path.abspath(self.filepath)
+        if not filepath:
+            self.report({"ERROR"}, "文件路径为空")
+            return {"CANCELLED"}
+        save_module_runtime_store(context.scene, workflow, module, ensure_module_runtime_store(context.scene, workflow, module, allow_writes=True))
+        namespace = load_module_namespace(
+            context,
+            context.scene,
+            workflow,
+            module,
+            "__go_workflow_pick_file_path__",
+            allow_writes=True,
+            persist_state=False,
+        )
+        panel_api = namespace.get("panel_api")
+        if panel_api is not None and self.target_text_key:
+            panel_api.set_text(self.target_text_key, filepath)
+        if namespace.get("module_state") is not None and hasattr(namespace["module_state"], "to_dict"):
+            merge_module_runtime_store(context.scene, workflow, module, namespace["module_state"].to_dict())
         self.report({"INFO"}, f"{self.status_prefix}: {filepath}")
         return {"FINISHED"}
 
@@ -8276,10 +12846,8 @@ class BWFLOW_OT_module_paste_script_source(Operator):
         if not clipboard_text.strip():
             self.report({"WARNING"}, "剪贴板里没有可用代码")
             return {"CANCELLED"}
-        module.script_source = clipboard_text
-        state.module_editor_text = clipboard_text
-        ensure_module_text_block(workflow, module)
-        self.report({"INFO"}, "已从剪贴板载入代码到当前模块")
+        apply_module_script_source_update(context, workflow, module, clipboard_text)
+        self.report({"INFO"}, "已从剪贴板载入代码并刷新自定义面板")
         return {"FINISHED"}
 
 
@@ -8343,12 +12911,12 @@ class BWFLOW_OT_module_load_script_file(Operator):
         module = workflow.modules[clamp_index(workflow.active_module_index, len(workflow.modules))]
         filepath = module_script_abspath(module)
         try:
-            module.script_source = read_cached_text_file(filepath, encodings=("utf-8", "utf-8-sig"))
+            source = read_cached_text_file(filepath, encodings=("utf-8", "utf-8-sig"))
         except Exception as exc:
             self.report({"ERROR"}, f"读取脚本失败: {exc}")
             return {"CANCELLED"}
-        ensure_module_text_block(workflow, module)
-        self.report({"INFO"}, "脚本文件内容已加载到编辑区")
+        apply_module_script_source_update(context, workflow, module, source)
+        self.report({"INFO"}, "脚本文件内容已加载并刷新自定义面板")
         return {"FINISHED"}
 
 
@@ -8503,7 +13071,7 @@ class BWFLOW_OT_script_library_apply_to_module(Operator):
         schedule_deferred_runtime_refresh(scene=context.scene, intervals=(0.25,))
         save_global_workflow_state(context.scene)
         tag_redraw_all()
-        self.report({"INFO"}, f"已载入脚本库条目: {item.name}")
+        self.report({"INFO"}, f"已添加脚本库条目: {item.name}")
         return {"FINISHED"}
 
 
@@ -8689,19 +13257,56 @@ class BWFLOW_OT_panel_toggle_for_workflow(Operator):
         if has_any:
             kept_ids = [item.panel_id for item in workflow.panels if item.panel_id not in workflow_panel_ids]
             replace_workflow_panels(workflow, kept_ids)
-            rebuild_runtime_panels(scene=context.scene)
-            schedule_deferred_runtime_refresh(scene=context.scene, intervals=(0.25,))
-            save_global_workflow_state(context.scene)
+            mark_panel_visibility_pending(state, scene=context.scene, context=context)
             clear_panel_library_click_state(state)
             self.report({"INFO"}, f"已移出当前抽屉面板，共 {len(workflow_panel_ids)} 个。")
             return {"FINISHED"}
 
         added = append_panel_ids_to_workflow(workflow, workflow_panel_ids)
-        rebuild_runtime_panels(scene=context.scene)
-        save_global_workflow_state(context.scene)
+        mark_panel_visibility_pending(state, scene=context.scene, context=context)
         clear_panel_library_click_state(state)
         self.report({"INFO"}, f"已加入当前抽屉面板，共 {added} 个。")
         return {"FINISHED"}
+
+
+def toggle_panel_group_for_workflow(context, state, workflow, group_key="", panel_index=-1):
+    if state is None or workflow is None or workflow.is_default or not state.panel_registry:
+        return {"CANCELLED"}, ""
+    groups = build_panel_library_groups(state, workflow)
+    target_group = next((group for group in groups if group.get("key") == group_key), None)
+
+    if target_group is None and panel_index >= 0:
+        index = clamp_index(panel_index, len(state.panel_registry))
+        state.panel_registry_index = index
+        record = state.panel_registry[index]
+        target_key = workflow_group_key_for_panel(state, record.panel_id)
+        target_group = next((group for group in groups if group.get("key") == target_key), None)
+
+    if target_group is None:
+        return {"CANCELLED"}, ""
+
+    entries = panel_library_group_entries(state, workflow, target_group)
+    drawer_ids = workflow_toggleable_panel_ids(
+        state,
+        (entry.get("panel_id", "") for entry in entries),
+    )
+    if not drawer_ids:
+        return {"CANCELLED"}, ""
+
+    selected_ids = {item.panel_id for item in workflow.panels}
+    if all(panel_id in selected_ids for panel_id in drawer_ids):
+        kept_ids = [item.panel_id for item in workflow.panels if item.panel_id not in set(drawer_ids)]
+        replace_workflow_panels(workflow, kept_ids)
+        message = f"已移出面板大组: {target_group.get('title', '')}"
+    else:
+        append_panel_ids_to_workflow(workflow, drawer_ids)
+        message = f"已加入面板大组: {target_group.get('title', '')}"
+
+    set_active_workflow_panel_by_id(workflow, drawer_ids[0])
+    scene = getattr(context, "scene", None)
+    mark_panel_visibility_pending(state, scene=scene, context=context)
+    clear_panel_library_click_state(state)
+    return {"FINISHED"}, message
 
 
 class BWFLOW_OT_panel_toggle_group_for_workflow(Operator):
@@ -8721,42 +13326,16 @@ class BWFLOW_OT_panel_toggle_group_for_workflow(Operator):
     def execute(self, context):
         state = get_state(context=context)
         workflow = get_active_workflow(state)
-        groups = build_panel_library_groups(state, workflow)
-        target_group = next((group for group in groups if group.get("key") == self.group_key), None)
-
-        if target_group is None and self.panel_index >= 0:
-            index = clamp_index(self.panel_index, len(state.panel_registry))
-            state.panel_registry_index = index
-            record = state.panel_registry[index]
-            target_key = workflow_group_key_for_panel(state, record.panel_id)
-            target_group = next((group for group in groups if group.get("key") == target_key), None)
-
-        if target_group is None:
-            return {"CANCELLED"}
-
-        entries = panel_library_group_entries(state, workflow, target_group)
-        drawer_ids = workflow_toggleable_panel_ids(
+        result, message = toggle_panel_group_for_workflow(
+            context,
             state,
-            (entry.get("panel_id", "") for entry in entries),
+            workflow,
+            group_key=self.group_key,
+            panel_index=self.panel_index,
         )
-        if not drawer_ids:
-            return {"CANCELLED"}
-
-        selected_ids = {item.panel_id for item in workflow.panels}
-        if all(panel_id in selected_ids for panel_id in drawer_ids):
-            kept_ids = [item.panel_id for item in workflow.panels if item.panel_id not in set(drawer_ids)]
-            replace_workflow_panels(workflow, kept_ids)
-            message = f"已移出面板大组: {target_group.get('title', '')}"
-        else:
-            append_panel_ids_to_workflow(workflow, drawer_ids)
-            message = f"已加入面板大组: {target_group.get('title', '')}"
-
-        set_active_workflow_panel_by_id(workflow, drawer_ids[0])
-        rebuild_runtime_panels(scene=context.scene)
-        save_global_workflow_state(context.scene)
-        clear_panel_library_click_state(state)
-        self.report({"INFO"}, message)
-        return {"FINISHED"}
+        if message:
+            self.report({"INFO"}, message)
+        return result
 
 
 class BWFLOW_OT_panel_library_click(Operator):
@@ -8803,8 +13382,8 @@ class BWFLOW_OT_panel_library_click(Operator):
 
 class BWFLOW_OT_panel_add_all_to_workflow(Operator):
     bl_idname = "bworkflow.panel_add_all_to_workflow"
-    bl_label = "全部加入当前工作流"
-    bl_description = "把当前已发现的第三方 N 面板全部加入当前工作流"
+    bl_label = "按默认 N 面板加入"
+    bl_description = "按当前默认 N 面板顺序把已发现的第三方抽屉面板加入当前工作流"
 
     @classmethod
     def poll(cls, context):
@@ -8823,10 +13402,8 @@ class BWFLOW_OT_panel_add_all_to_workflow(Operator):
                 if record.discovered and record.panel_id != "BWFLOW_PT_workflow" and panel_drawer_workflow_ids(state, record.panel_id)
             ),
         )
-        rebuild_runtime_panels(scene=context.scene)
-        schedule_deferred_runtime_refresh(scene=context.scene, intervals=(0.25,))
-        save_global_workflow_state(context.scene)
-        self.report({"INFO"}, f"已加入 {added} 个面板组")
+        mark_panel_visibility_pending(state, scene=context.scene, context=context)
+        self.report({"INFO"}, f"已按默认 N 面板顺序加入 {added} 个面板组")
         return {"FINISHED"}
 
 
@@ -8852,9 +13429,7 @@ class BWFLOW_OT_panel_add_current_plugin_to_workflow(Operator):
         record = state.panel_registry[index]
         panel_ids = panel_drawer_workflow_ids(state, record.panel_id)
         added = append_panel_ids_to_workflow(workflow, panel_ids)
-        rebuild_runtime_panels(scene=context.scene)
-        schedule_deferred_runtime_refresh(scene=context.scene, intervals=(0.25,))
-        save_global_workflow_state(context.scene)
+        mark_panel_visibility_pending(state, scene=context.scene, context=context)
         self.report({"INFO"}, f"已添加当前抽屉面板，共 {added} 个。")
         return {"FINISHED"}
 
@@ -8890,17 +13465,13 @@ class BWFLOW_OT_panel_toggle_single_for_workflow(Operator):
         if panel_id in selected_ids:
             kept_ids = [item.panel_id for item in workflow.panels if item.panel_id != panel_id]
             replace_workflow_panels(workflow, kept_ids)
-            rebuild_runtime_panels(scene=context.scene)
-            schedule_deferred_runtime_refresh(scene=context.scene, intervals=(0.25,))
-            save_global_workflow_state(context.scene)
+            mark_panel_visibility_pending(state, scene=context.scene, context=context)
             clear_panel_library_click_state(state)
             self.report({"INFO"}, "已移出当前面板。")
             return {"FINISHED"}
 
         added = append_panel_ids_to_workflow(workflow, [panel_id])
-        rebuild_runtime_panels(scene=context.scene)
-        schedule_deferred_runtime_refresh(scene=context.scene, intervals=(0.25,))
-        save_global_workflow_state(context.scene)
+        mark_panel_visibility_pending(state, scene=context.scene, context=context)
         clear_panel_library_click_state(state)
         self.report({"INFO"}, f"已加入当前面板，共 {added} 个。")
         return {"FINISHED"}
@@ -8917,7 +13488,85 @@ class BWFLOW_OT_group_expand_toggle(Operator):
     def execute(self, context):
         state = get_state(context=context)
         toggle_group_expanded(state, self.group_key, selected=self.target == "SELECTED")
-        tag_redraw_all()
+        if not tag_redraw_context_area(context):
+            tag_redraw_all()
+        return {"FINISHED"}
+
+
+class BWFLOW_OT_panel_match_imported_by_name(Operator):
+    bl_idname = "bworkflow.panel_match_imported_by_name"
+    bl_label = "重新查找缺失插件面板"
+    bl_description = "插件启用后，按插件名称、面板标题和分类重新对齐导入时缺失的面板"
+
+    @classmethod
+    def poll(cls, context):
+        state = get_state(context=context)
+        workflow = get_active_workflow(state)
+        return workflow_can_reveal_or_match_missing_panels(state, workflow)
+
+    def execute(self, context):
+        state = get_state(context=context)
+        if state is None:
+            return {"CANCELLED"}
+        workflow = get_active_workflow(state)
+        if not workflow_can_reveal_or_match_missing_panels(state, workflow):
+            return {"CANCELLED"}
+        restored_warning = False
+        if bool(getattr(workflow, "missing_warning_dismissed", False)) and workflow_missing_panel_ids(state, workflow):
+            workflow.missing_warning_dismissed = False
+            state.settings.show_missing_summary = True
+            restored_warning = True
+        space_type = getattr(state, "space_type", current_space_type(context=context))
+        rebuild_panel_cache(scene=context.scene, space_type=space_type)
+        validate_panel_registry_against_runtime(state, space_type=space_type, prune_missing_unreferenced=False)
+
+        total_changed = 0
+        total_missing = 0
+        if workflow_has_imported_missing_panel_matches(state, workflow):
+            changed, missing = rematch_workflow_panels_by_name(state, workflow)
+            total_changed += changed
+            total_missing += missing
+
+        if total_changed or restored_warning:
+            normalize_state_data(state)
+            mark_panel_visibility_pending(state, scene=context.scene, context=context)
+            save_global_workflow_state(context.scene)
+        else:
+            tag_redraw_context_area(context)
+
+        unresolved = max(0, total_missing - total_changed)
+        if total_changed:
+            self.report({"INFO"}, f"已按名称匹配 {total_changed} 个导入面板；未解决 {unresolved} 个")
+        elif restored_warning:
+            self.report({"INFO"}, "已恢复当前工作流缺失提示")
+        elif total_missing:
+            self.report({"WARNING"}, f"没有匹配到缺失的导入面板；未解决 {total_missing} 个")
+        else:
+            self.report({"INFO"}, "当前没有需要匹配的缺失导入面板")
+        return {"FINISHED"}
+
+
+class BWFLOW_OT_panel_group_page(Operator):
+    bl_idname = "bworkflow.panel_group_page"
+    bl_label = "切换面板组页"
+    bl_description = "切换面板组列表当前页"
+
+    target: StringProperty(default="LIBRARY")
+    direction: StringProperty(default="NEXT")
+
+    def execute(self, context):
+        state = get_state(context=context)
+        if state is None:
+            return {"CANCELLED"}
+        prop_name = "selected_panel_group_page" if self.target == "SELECTED" else "panel_group_page"
+        current = int(getattr(state, prop_name, 0) or 0)
+        if self.direction == "PREV":
+            current = max(0, current - 1)
+        else:
+            current = current + 1
+        setattr(state, prop_name, current)
+        if not tag_redraw_context_area(context):
+            tag_redraw_all()
         return {"FINISHED"}
 
 
@@ -8942,6 +13591,8 @@ class BWFLOW_OT_select_workflow_panel(Operator):
     def _handle(self, context, event=None):
         state = get_state(context=context)
         workflow = get_active_workflow(state)
+        if state is None or workflow is None:
+            return {"CANCELLED"}
         click_target = f"selected:{self.panel_id}"
         group_key = workflow_group_key_for_panel(state, self.panel_id)
 
@@ -8954,12 +13605,16 @@ class BWFLOW_OT_select_workflow_panel(Operator):
             drawer_ids = workflow_family_drawer_ids(state, workflow, group_key)
             registry_index = workflow_panel_registry_index(state, workflow, drawer_ids[0] if drawer_ids else self.panel_id)
             if registry_index >= 0 and group_key:
-                clear_panel_library_click_state(state)
-                return bpy.ops.bworkflow.panel_toggle_group_for_workflow(
-                    "EXEC_DEFAULT",
-                    panel_index=registry_index,
+                result, message = toggle_panel_group_for_workflow(
+                    context,
+                    state,
+                    workflow,
                     group_key=group_key,
+                    panel_index=registry_index,
                 )
+                if message:
+                    self.report({"INFO"}, message)
+                return result
         return {"FINISHED"}
 
 
@@ -8980,6 +13635,9 @@ class BWFLOW_OT_panel_group_click(Operator):
 
     def _handle(self, context, event=None):
         state = get_state(context=context)
+        workflow = get_active_workflow(state)
+        if state is None or workflow is None:
+            return {"CANCELLED"}
         click_target = f"group:{self.group_key}"
 
         if self.panel_index >= 0:
@@ -8988,18 +13646,24 @@ class BWFLOW_OT_panel_group_click(Operator):
 
         if self.target == "LIBRARY":
             if should_treat_as_double_click(state, click_target, event=event):
-                return bpy.ops.bworkflow.panel_toggle_group_for_workflow(
-                    "EXEC_DEFAULT",
+                result, message = toggle_panel_group_for_workflow(
+                    context,
+                    state,
+                    workflow,
                     group_key=self.group_key,
                     panel_index=self.panel_index,
                 )
+                if message:
+                    self.report({"INFO"}, message)
+                return result
         else:
             if self.panel_index >= 0 and self.panel_index < len(state.panel_registry):
                 record = state.panel_registry[self.panel_index]
                 if is_builtin_default_panel_record(record):
                     return {"FINISHED"}
             register_click_target(state, click_target)
-        tag_redraw_all()
+        if not tag_redraw_context_area(context):
+            tag_redraw_all()
         return {"FINISHED"}
 
 
@@ -9030,17 +13694,15 @@ class BWFLOW_OT_panel_add_tagged_to_workflow(Operator):
                 )
             ),
         )
-        rebuild_runtime_panels(scene=context.scene)
-        schedule_deferred_runtime_refresh(scene=context.scene, intervals=(0.25,))
-        save_global_workflow_state(context.scene)
+        mark_panel_visibility_pending(state, scene=context.scene, context=context)
         self.report({"INFO"}, f"已按标签加入 {added} 个面板组")
         return {"FINISHED"}
 
 
 class BWFLOW_OT_panel_clear_workflow(Operator):
     bl_idname = "bworkflow.panel_clear_workflow"
-    bl_label = "清空当前工作流面板"
-    bl_description = "清空当前工作流的面板勾选；切换到该工作流时将隐藏全部第三方 N 面板"
+    bl_label = "清空全部"
+    bl_description = "清空当前工作流的全部面板勾选"
 
     @classmethod
     def poll(cls, context):
@@ -9048,14 +13710,13 @@ class BWFLOW_OT_panel_clear_workflow(Operator):
         return workflow is not None and not workflow.is_default and bool(workflow.panels)
 
     def execute(self, context):
-        workflow = get_active_workflow(get_state(context=context))
+        state = get_state(context=context)
+        workflow = get_active_workflow(state)
         go_panel_entry = [item.panel_id for item in workflow.panels if item.panel_id == "BWFLOW_PT_workflow"]
         replace_workflow_panels(workflow, go_panel_entry)
         workflow.active_panel_index = 0
-        rebuild_runtime_panels(scene=context.scene)
-        schedule_deferred_runtime_refresh(scene=context.scene, intervals=(0.25,))
-        save_global_workflow_state(context.scene)
-        self.report({"INFO"}, "当前工作流面板勾选已清空")
+        mark_panel_visibility_pending(state, scene=context.scene, context=context)
+        self.report({"INFO"}, "已清空全部面板勾选")
         return {"FINISHED"}
 
 
@@ -9068,19 +13729,124 @@ class BWFLOW_OT_panel_remove_missing_from_workflow(Operator):
     def poll(cls, context):
         state = get_state(context=context)
         workflow = get_active_workflow(state)
-        return workflow is not None and not workflow.is_default and bool(workflow_missing_panel_ids(state, workflow))
+        return state is not None and workflow is not None and not workflow.is_default and bool(workflow.panels)
 
     def execute(self, context):
         state = get_state(context=context)
         workflow = get_active_workflow(state)
         missing_ids = set(workflow_missing_panel_ids(state, workflow))
+        if not missing_ids:
+            self.report({"INFO"}, "当前工作流没有缺失面板")
+            return {"FINISHED"}
         kept_ids = [item.panel_id for item in workflow.panels if item.panel_id not in missing_ids]
         removed = len(workflow.panels) - len(kept_ids)
         replace_workflow_panels(workflow, kept_ids)
-        rebuild_runtime_panels(scene=context.scene)
-        schedule_deferred_runtime_refresh(scene=context.scene, intervals=(0.25,))
-        save_global_workflow_state(context.scene)
+        mark_panel_visibility_pending(state, scene=context.scene, context=context)
         self.report({"INFO"}, f"已移除 {removed} 个缺失面板")
+        return {"FINISHED"}
+
+
+class BWFLOW_OT_workflow_dismiss_missing_warning(Operator):
+    bl_idname = "bworkflow.workflow_dismiss_missing_warning"
+    bl_label = "忽略缺失提示"
+    bl_description = "仅隐藏当前工作流的缺失面板提示，不移除预设里的面板记录"
+
+    dismiss: BoolProperty(default=True)
+
+    @classmethod
+    def poll(cls, context):
+        state = get_state(context=context)
+        workflow = get_active_workflow(state)
+        return state is not None and workflow is not None and not workflow.is_default
+
+    def execute(self, context):
+        state = get_state(context=context)
+        workflow = get_active_workflow(state)
+        workflow.missing_warning_dismissed = bool(self.dismiss)
+        save_global_workflow_state(context.scene)
+        tag_redraw_all(space_type=getattr(state, "space_type", None))
+        self.report({"INFO"}, "已忽略当前工作流缺失提示" if self.dismiss else "已恢复当前工作流缺失提示")
+        return {"FINISHED"}
+
+
+class BWFLOW_OT_export_missing_plugins_csv(Operator, ExportHelper):
+    bl_idname = "bworkflow.export_missing_plugins_csv"
+    bl_label = "导出缺失插件 CSV"
+    bl_description = "导出当前工作流缺失面板对应的插件名称和版本信息"
+
+    filename_ext = ".csv"
+    filter_glob: StringProperty(default="*.csv", options={"HIDDEN"})
+
+    @classmethod
+    def poll(cls, context):
+        state = get_state(context=context)
+        workflow = get_active_workflow(state)
+        return state is not None and workflow is not None and not workflow.is_default
+
+    def invoke(self, context, event):
+        state = get_state(context=context)
+        workflow = get_active_workflow(state)
+        workflow_name = safe_filename_component(getattr(workflow, "name", "") if workflow is not None else "workflow", "workflow")
+        self.filepath = os.path.join(os.path.expanduser("~"), f"{workflow_name}_missing_plugins.csv")
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        state = get_state(context=context)
+        workflow = get_active_workflow(state)
+        if state is None or workflow is None:
+            return {"CANCELLED"}
+        records = workflow_missing_records(state, workflow)
+        rows = []
+        seen = set()
+        for record in records:
+            if record is None:
+                continue
+            panel_id = getattr(record, "panel_id", "")
+            source_module = getattr(record, "source_module", "")
+            plugin_key = panel_plugin_key_from_module(source_module) or panel_plugin_key(panel_id) or source_module
+            required_version = version_tuple_to_text(getattr(record, "addon_version", ""))
+            current_version = addon_version_from_module_name(source_module)
+            key = (plugin_key, required_version, panel_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                {
+                    "workflow": getattr(workflow, "name", ""),
+                    "plugin_key": plugin_key,
+                    "required_version": required_version,
+                    "current_version": current_version,
+                    "panel_id": panel_id,
+                    "panel_title": clean_panel_title(getattr(record, "title", ""), panel_id),
+                    "source_module": source_module,
+                    "category": getattr(record, "category", ""),
+                }
+            )
+        try:
+            folder = os.path.dirname(bpy.path.abspath(self.filepath))
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            with open(bpy.path.abspath(self.filepath), "w", newline="", encoding="utf-8-sig") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "workflow",
+                        "plugin_key",
+                        "required_version",
+                        "current_version",
+                        "panel_id",
+                        "panel_title",
+                        "source_module",
+                        "category",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+        except Exception as exc:
+            self.report({"ERROR"}, f"导出缺失插件 CSV 失败: {exc}")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"已导出 {len(rows)} 条缺失插件记录")
         return {"FINISHED"}
 
 
@@ -9102,9 +13868,7 @@ class BWFLOW_OT_panel_reset_workflow_order(Operator):
         groups = workflow_family_order_groups(state, workflow)
         groups.sort(key=lambda group: (group["title"].casefold(), group["key"]))
         replace_workflow_groups(workflow, groups, active_panel_id=active_panel_id)
-        rebuild_runtime_panels(scene=context.scene)
-        schedule_deferred_runtime_refresh(scene=context.scene, intervals=(0.25,))
-        save_global_workflow_state(context.scene)
+        mark_panel_order_pending(state, scene=context.scene, context=context)
         self.report({"INFO"}, "当前工作流面板组顺序已重置")
         return {"FINISHED"}
 
@@ -9121,7 +13885,7 @@ class BWFLOW_OT_panel_jump_in_workflow(Operator):
     def poll(cls, context):
         state = get_state(context=context)
         workflow = get_active_workflow(state)
-        return workflow is not None and len(workflow_family_order_groups(state, workflow)) > 1
+        return workflow is not None and len(workflow.panels) > 1
 
     def execute(self, context):
         state = get_state(context=context)
@@ -9142,8 +13906,7 @@ class BWFLOW_OT_panel_jump_in_workflow(Operator):
         group = groups.pop(old_pos)
         groups.insert(new_pos, group)
         replace_workflow_groups(workflow, groups, active_panel_id=group["ids"][0] if group["ids"] else "")
-        rebuild_runtime_panels(scene=context.scene)
-        save_global_workflow_state(context.scene)
+        mark_panel_order_pending(state, scene=context.scene, context=context)
         return {"FINISHED"}
 
 
@@ -9156,7 +13919,7 @@ class BWFLOW_OT_panel_reverse_workflow_order(Operator):
     def poll(cls, context):
         state = get_state(context=context)
         workflow = get_active_workflow(state)
-        return workflow is not None and len(workflow_family_order_groups(state, workflow)) > 1
+        return workflow is not None and len(workflow.panels) > 1
 
     def execute(self, context):
         state = get_state(context=context)
@@ -9165,9 +13928,7 @@ class BWFLOW_OT_panel_reverse_workflow_order(Operator):
         active_panel_id = workflow.panels[active_index].panel_id if workflow.panels else ""
         groups = list(reversed(workflow_family_order_groups(state, workflow)))
         replace_workflow_groups(workflow, groups, active_panel_id=active_panel_id)
-        rebuild_runtime_panels(scene=context.scene)
-        schedule_deferred_runtime_refresh(scene=context.scene, intervals=(0.25,))
-        save_global_workflow_state(context.scene)
+        mark_panel_order_pending(state, scene=context.scene, context=context)
         self.report({"INFO"}, "当前工作流面板组顺序已反转")
         return {"FINISHED"}
 
@@ -9184,7 +13945,7 @@ class BWFLOW_OT_panel_move_in_workflow(Operator):
     def poll(cls, context):
         state = get_state(context=context)
         workflow = get_active_workflow(state)
-        return workflow is not None and len(workflow_family_order_groups(state, workflow)) > 1
+        return workflow is not None and len(workflow.panels) > 1
 
     def execute(self, context):
         state = get_state(context=context)
@@ -9202,9 +13963,7 @@ class BWFLOW_OT_panel_move_in_workflow(Operator):
         group = groups.pop(old_pos)
         groups.insert(new_pos, group)
         replace_workflow_groups(workflow, groups, active_panel_id=group["ids"][0] if group["ids"] else "")
-        rebuild_runtime_panels(scene=context.scene)
-        schedule_deferred_runtime_refresh(scene=context.scene, intervals=(0.25,))
-        save_global_workflow_state(context.scene)
+        mark_panel_order_pending(state, scene=context.scene, context=context)
         return {"FINISHED"}
 
 
@@ -9259,9 +14018,7 @@ class BWFLOW_OT_panel_move_child_in_group(Operator):
         ids.insert(new_pos, moved_id)
         group["ids"] = ids
         replace_workflow_groups(workflow, groups, active_panel_id=moved_id)
-        rebuild_runtime_panels(scene=context.scene)
-        schedule_deferred_runtime_refresh(scene=context.scene, intervals=(0.25,))
-        save_global_workflow_state(context.scene)
+        mark_panel_order_pending(state, scene=context.scene, context=context)
         return {"FINISHED"}
 
 
@@ -9276,9 +14033,7 @@ class BWFLOW_OT_panel_sort_children_by_default_order(Operator):
     def poll(cls, context):
         state = get_state(context=context)
         workflow = get_active_workflow(state)
-        if workflow is None or workflow.is_default:
-            return False
-        return any(len(group.get("ids", [])) > 1 for group in workflow_family_order_groups(state, workflow))
+        return workflow is not None and not workflow.is_default and len(workflow.panels) > 1
 
     def execute(self, context):
         state = get_state(context=context)
@@ -9286,13 +14041,15 @@ class BWFLOW_OT_panel_sort_children_by_default_order(Operator):
         if state is None or workflow is None or workflow.is_default:
             return {"CANCELLED"}
 
+        space_type = getattr(state, "space_type", "VIEW_3D")
+        quarantine_broken_panel_polls(space_type=space_type)
+        repair_missing_panel_poll_callbacks(space_type=space_type)
         groups = workflow_family_order_groups(state, workflow)
         if not groups:
             return {"CANCELLED"}
 
         active_index = clamp_index(workflow.active_panel_index, len(workflow.panels))
         active_panel_id = workflow.panels[active_index].panel_id if workflow.panels else ""
-        space_type = getattr(state, "space_type", "VIEW_3D")
         changed_count = 0
 
         for group in groups:
@@ -9323,10 +14080,63 @@ class BWFLOW_OT_panel_sort_children_by_default_order(Operator):
             return {"FINISHED"}
 
         replace_workflow_groups(workflow, groups, active_panel_id=active_panel_id)
-        rebuild_runtime_panels(scene=context.scene)
-        schedule_deferred_runtime_refresh(scene=context.scene, intervals=(0.25,))
-        save_global_workflow_state(context.scene)
+        mark_panel_order_pending(state, scene=context.scene, context=context)
+        quarantine_broken_panel_polls(space_type=space_type)
         self.report({"INFO"}, f"已按插件默认顺序整理 {changed_count} 个面板组")
+        return {"FINISHED"}
+
+
+class BWFLOW_OT_panel_apply_workflow_order(Operator):
+    bl_idname = "bworkflow.panel_apply_workflow_order"
+    bl_label = "应用面板顺序"
+    bl_description = "把当前勾选列表里的顺序应用到 Blender N 面板；调整顺序时不会自动应用"
+
+    @classmethod
+    def poll(cls, context):
+        state = get_state(context=context)
+        workflow = get_active_workflow(state)
+        return state is not None and workflow is not None and not workflow.is_default and bool(workflow.panels)
+
+    def execute(self, context):
+        state = get_state(context=context)
+        workflow = get_active_workflow(state)
+        if state is None or workflow is None or workflow.is_default:
+            return {"CANCELLED"}
+
+        space_type = getattr(state, "space_type", "VIEW_3D")
+        PANEL_VISIBILITY_DATA_CACHE_BY_SPACE.pop(space_type, None)
+        ordered_ids = workflow_ordered_panel_ids(state, workflow)
+        apply_panel_order_overrides(ordered_ids, space_type=space_type)
+        state.panel_order_pending_apply = False
+        save_global_workflow_state(context.scene)
+        tag_redraw_all(space_type=space_type)
+        self.report({"INFO"}, "已应用当前 N 面板顺序")
+        return {"FINISHED"}
+
+
+    bl_label = "应用到 N 面板"
+    bl_description = "把当前勾选列表和排序一次性应用到 Blender N 面板；连续调整时不会自动应用"
+
+    @classmethod
+    def poll(cls, context):
+        state = get_state(context=context)
+        workflow = get_active_workflow(state)
+        return state is not None and workflow is not None and not workflow.is_default
+
+    def execute(self, context):
+        state = get_state(context=context)
+        if state is None:
+            return {"CANCELLED"}
+        space_type = getattr(state, "space_type", "VIEW_3D")
+        PANEL_VISIBILITY_DATA_CACHE_BY_SPACE.pop(space_type, None)
+        state.panel_order_pending_apply = False
+        changed = rebuild_runtime_panels(scene=context.scene, space_type=space_type)
+        schedule_deferred_runtime_refresh(scene=context.scene, intervals=(0.5,), space_type=space_type)
+        state.panel_visibility_pending_apply = False
+        state.panel_order_pending_apply = False
+        save_global_workflow_state(context.scene)
+        tag_redraw_all(space_type=space_type)
+        self.report({"INFO"}, "已应用当前 N 面板配置" if changed else "当前 N 面板配置已是最新")
         return {"FINISHED"}
 
 
@@ -9352,23 +14162,166 @@ class BWFLOW_OT_debug_dump_panels(Operator):
         return {"FINISHED"}
 
 
-class BWFLOW_OT_preset_export(Operator, ExportHelper):
+def native_windows_file_dialog_open(title="Select preset", default_ext="gwpreset"):
+    if not hasattr(ctypes, "windll"):
+        return ""
+    try:
+        from ctypes import wintypes
+
+        class OPENFILENAMEW(ctypes.Structure):
+            _fields_ = (
+                ("lStructSize", wintypes.DWORD),
+                ("hwndOwner", wintypes.HWND),
+                ("hInstance", wintypes.HINSTANCE),
+                ("lpstrFilter", wintypes.LPCWSTR),
+                ("lpstrCustomFilter", wintypes.LPWSTR),
+                ("nMaxCustFilter", wintypes.DWORD),
+                ("nFilterIndex", wintypes.DWORD),
+                ("lpstrFile", wintypes.LPWSTR),
+                ("nMaxFile", wintypes.DWORD),
+                ("lpstrFileTitle", wintypes.LPWSTR),
+                ("nMaxFileTitle", wintypes.DWORD),
+                ("lpstrInitialDir", wintypes.LPCWSTR),
+                ("lpstrTitle", wintypes.LPCWSTR),
+                ("Flags", wintypes.DWORD),
+                ("nFileOffset", wintypes.WORD),
+                ("nFileExtension", wintypes.WORD),
+                ("lpstrDefExt", wintypes.LPCWSTR),
+                ("lCustData", wintypes.LPARAM),
+                ("lpfnHook", wintypes.LPVOID),
+                ("lpTemplateName", wintypes.LPCWSTR),
+                ("pvReserved", wintypes.LPVOID),
+                ("dwReserved", wintypes.DWORD),
+                ("FlagsEx", wintypes.DWORD),
+            )
+
+        buffer = ctypes.create_unicode_buffer(32768)
+        filters = "Go Workflow Preset (*.gwpreset)\0*.gwpreset\0Legacy Preset (*.goworkflow;*.bworkflow;*.zip)\0*.goworkflow;*.bworkflow;*.zip\0All Files (*.*)\0*.*\0\0"
+        ofn = OPENFILENAMEW()
+        ofn.lStructSize = ctypes.sizeof(OPENFILENAMEW)
+        ofn.lpstrFilter = filters
+        ofn.nFilterIndex = 1
+        ofn.lpstrFile = ctypes.cast(buffer, wintypes.LPWSTR)
+        ofn.nMaxFile = len(buffer)
+        ofn.lpstrTitle = str(title or "Select preset")
+        ofn.lpstrDefExt = str(default_ext or "gwpreset")
+        ofn.Flags = 0x00080000 | 0x00001000 | 0x00000800 | 0x00000400
+        if ctypes.windll.comdlg32.GetOpenFileNameW(ctypes.byref(ofn)):
+            return buffer.value
+    except Exception:
+        traceback.print_exc()
+    return ""
+
+
+def native_windows_file_dialog_save(default_path="", title="Save preset", default_ext="gwpreset"):
+    if not hasattr(ctypes, "windll"):
+        return ""
+    try:
+        from ctypes import wintypes
+
+        class OPENFILENAMEW(ctypes.Structure):
+            _fields_ = (
+                ("lStructSize", wintypes.DWORD),
+                ("hwndOwner", wintypes.HWND),
+                ("hInstance", wintypes.HINSTANCE),
+                ("lpstrFilter", wintypes.LPCWSTR),
+                ("lpstrCustomFilter", wintypes.LPWSTR),
+                ("nMaxCustFilter", wintypes.DWORD),
+                ("nFilterIndex", wintypes.DWORD),
+                ("lpstrFile", wintypes.LPWSTR),
+                ("nMaxFile", wintypes.DWORD),
+                ("lpstrFileTitle", wintypes.LPWSTR),
+                ("nMaxFileTitle", wintypes.DWORD),
+                ("lpstrInitialDir", wintypes.LPCWSTR),
+                ("lpstrTitle", wintypes.LPCWSTR),
+                ("Flags", wintypes.DWORD),
+                ("nFileOffset", wintypes.WORD),
+                ("nFileExtension", wintypes.WORD),
+                ("lpstrDefExt", wintypes.LPCWSTR),
+                ("lCustData", wintypes.LPARAM),
+                ("lpfnHook", wintypes.LPVOID),
+                ("lpTemplateName", wintypes.LPCWSTR),
+                ("pvReserved", wintypes.LPVOID),
+                ("dwReserved", wintypes.DWORD),
+                ("FlagsEx", wintypes.DWORD),
+            )
+
+        initial = str(default_path or "")
+        buffer = ctypes.create_unicode_buffer(32768)
+        buffer.value = initial[: len(buffer) - 1]
+        filters = "Go Workflow Preset (*.gwpreset)\0*.gwpreset\0All Files (*.*)\0*.*\0\0"
+        ofn = OPENFILENAMEW()
+        ofn.lStructSize = ctypes.sizeof(OPENFILENAMEW)
+        ofn.lpstrFilter = filters
+        ofn.nFilterIndex = 1
+        ofn.lpstrFile = ctypes.cast(buffer, wintypes.LPWSTR)
+        ofn.nMaxFile = len(buffer)
+        ofn.lpstrTitle = str(title or "Save preset")
+        ofn.lpstrDefExt = str(default_ext or "gwpreset")
+        ofn.Flags = 0x00080000 | 0x00001000 | 0x00000800 | 0x00000002 | 0x00000400
+        if ctypes.windll.comdlg32.GetSaveFileNameW(ctypes.byref(ofn)):
+            filepath = buffer.value
+            if filepath and not os.path.splitext(filepath)[1]:
+                filepath += "." + str(default_ext or "gwpreset").lstrip(".")
+            return filepath
+    except Exception:
+        traceback.print_exc()
+    return ""
+
+
+def import_preset_file_direct(context, filepath):
+    try:
+        payload = read_preset_archive(filepath, max_bytes=MAX_PRESET_FILE_BYTES)
+    except Exception as exc:
+        print(f"[Go Workflow] Preset read failed: {exc}")
+        return False
+    if not isinstance(payload, dict):
+        print("[Go Workflow] Invalid preset payload.")
+        return False
+    state = get_state(context=context)
+    if state is None:
+        print("[Go Workflow] No available state.")
+        return False
+    ensure_minimum_setup(context.scene)
+    preferred_space_type = current_space_type(context=context)
+    entries = prepare_safe_preset_entries(workflow_preset_entries_from_payload(payload, preferred_space_type=preferred_space_type))
+    entries = direct_import_workflow_entries(entries, preferred_space_type=preferred_space_type)[:1]
+    imported = []
+    imported_workflows = []
+    for entry in entries:
+        workflow = import_single_preset_entry(context, state, entry)
+        if workflow is None:
+            continue
+        imported.append(workflow.name)
+        imported_workflows.append(workflow)
+    if not imported:
+        print("[Go Workflow] No workflow imported.")
+        return False
+    missing_count, missing_suffix, low_version_count, low_version_suffix = finish_current_space_preset_import(context, state, imported_workflows)
+    if missing_count:
+        print(f"[Go Workflow] Imported {len(imported)} workflow(s); missing panels {missing_count}{missing_suffix}{low_version_suffix}.")
+    elif low_version_count:
+        print(f"[Go Workflow] Imported {len(imported)} workflow(s){low_version_suffix}.")
+    else:
+        print(f"[Go Workflow] Imported {len(imported)} workflow(s).")
+    return True
+
+
+class BWFLOW_OT_preset_export(Operator):
     bl_idname = "bworkflow.preset_export"
     bl_label = "导出预设"
-    bl_description = "将勾选的工作流、面板顺序和脚本模块导出为 .goworkflow 文件"
-
-    filename_ext = PRESET_FILE_EXTENSION
-    filter_glob: StringProperty(default=PRESET_FILE_FILTER, options={"HIDDEN"})
+    bl_description = "将勾选的工作流和脚本模块导出为 .gwpreset 压缩预设包"
 
     def invoke(self, context, event):
-        state = get_state(context=context)
-        if state is not None:
-            self.filepath = default_preset_export_path(context, state)
-        context.window_manager.fileselect_add(self)
-        return {"RUNNING_MODAL"}
+        return self.execute(context)
 
     def execute(self, context):
         state = get_state(context=context)
+        default_path = default_preset_export_path(context, state) if state is not None else ""
+        filepath = native_windows_file_dialog_save(default_path, title="Save Go Workflow preset")
+        if not filepath:
+            print("[Go Workflow] Preset export cancelled.")
+            return {"CANCELLED"}
         if normalize_workflow_texts(state):
             save_global_workflow_state(context.scene)
             tag_redraw_all()
@@ -9379,184 +14332,98 @@ class BWFLOW_OT_preset_export(Operator, ExportHelper):
         refresh_script_library_sources_for_workflows(state, workflows)
         payload = build_selected_workflows_preset_payload(context.scene, context=context)
         if payload is None:
-            self.report({"ERROR"}, "没有勾选可导出的工作流")
+            print("[Go Workflow] No workflow selected for export.")
             return {"CANCELLED"}
-        write_json_payload_file(self.filepath, payload)
+        write_preset_archive(filepath, payload)
 
         workflow_count = len(workflows)
-        self.report({"INFO"}, f"已导出 {workflow_count} 个工作流")
+        print(f"[Go Workflow] Exported {workflow_count} workflow(s): {filepath}")
         return {"FINISHED"}
 
 
-class BWFLOW_OT_preset_import(Operator, ImportHelper):
+class BWFLOW_OT_preset_import(Operator):
     bl_idname = "bworkflow.preset_import"
     bl_label = "导入预设"
-    bl_description = "导入 .goworkflow 文件并恢复工作流、面板和脚本模块"
-
-    filename_ext = PRESET_FILE_EXTENSION
-    filter_glob: StringProperty(default=f"{PRESET_FILE_FILTER};{LEGACY_PRESET_FILE_FILTER}", options={"HIDDEN"})
+    bl_description = "导入 .gwpreset 压缩预设包；旧 .goworkflow/.bworkflow 仍可读取"
 
     def execute(self, context):
-        try:
-            payload = load_json_payload_file(self.filepath, max_bytes=MAX_PRESET_FILE_BYTES)
-        except Exception as exc:
-            self.report({"ERROR"}, f"预设读取失败: {exc}")
+        filepath = native_windows_file_dialog_open(title="Import Go Workflow preset")
+        if not filepath:
+            print("[Go Workflow] Preset import cancelled.")
             return {"CANCELLED"}
-
-        if not isinstance(payload, dict):
-            self.report({"ERROR"}, "预设文件格式无效")
-            return {"CANCELLED"}
-
-        ensure_minimum_setup(context.scene)
-        preferred_space_type = current_space_type(context=context)
-        entries = workflow_preset_entries_from_payload(payload, preferred_space_type=preferred_space_type)
-        if entries:
-            entries = direct_import_workflow_entries(entries, preferred_space_type=preferred_space_type)
-            state = get_state(context=context)
-            imported = []
-            missing_count = 0
-            merge_preset_entries_shared_payloads(state, entries)
-            for entry in entries:
-                workflow_payload = current_workflow_preset_payload_from_entry(entry)
-                workflow = apply_current_workflow_preset_payload(state, workflow_payload, merge_shared=False)
-                if workflow is None:
-                    continue
-                imported.append(workflow.name)
-                missing_count += len(workflow_missing_panel_ids(state, workflow))
-
-            if not imported:
-                self.report({"ERROR"}, "没有导入任何工作流")
-                return {"CANCELLED"}
-
-            space_type = current_space_type(context=context)
-            rebuild_panel_cache(scene=context.scene, space_type=space_type)
-            rebuild_runtime_panels(scene=context.scene, space_type=space_type, rebuild_cache=False)
-            save_global_workflow_state(context.scene)
-            tag_redraw_all()
-            if missing_count:
-                self.report({"WARNING"}, f"已导入 {len(imported)} 个工作流；缺失面板 {missing_count} 个")
-            else:
-                self.report({"INFO"}, f"已导入 {len(imported)} 个工作流")
-            return {"FINISHED"}
-
-        if is_current_workflow_preset_payload(payload):
-            state = get_state(context=context)
-            workflow = apply_current_workflow_preset_payload(state, payload)
-            if workflow is None:
-                self.report({"ERROR"}, "当前工作流预设无效")
-                return {"CANCELLED"}
-            space_type = current_space_type(context=context)
-            rebuild_panel_cache(scene=context.scene, space_type=space_type)
-            rebuild_runtime_panels(scene=context.scene, space_type=space_type, rebuild_cache=False)
-            save_global_workflow_state(context.scene)
-            missing_count = len(workflow_missing_panel_ids(state, workflow))
-            if missing_count:
-                self.report({"WARNING"}, f"已导入工作流: {workflow.name}；缺失面板 {missing_count} 个")
-            else:
-                self.report({"INFO"}, f"已导入工作流: {workflow.name}")
-            return {"FINISHED"}
-
-        space_payloads = payload.get("space_states")
-        if isinstance(space_payloads, dict) and space_payloads:
-            sanitized_payload = sanitize_full_payload(payload)
-            target_space_payloads = sanitized_payload.get("space_states", {}) if sanitized_payload else {}
-        else:
-            fallback_space = sanitize_space_payload(
-                {
-                    "active_workflow_index": payload.get("active_workflow_index", 0),
-                    "settings": payload.get("settings", {}),
-                    "panel_registry": payload.get("panel_registry", []),
-                    "script_library": payload.get("script_library", []),
-                    "workflows": payload.get("workflows", []),
-                }
-            )
-            target_space_payloads = {"VIEW_3D": fallback_space} if fallback_space is not None else {}
-
-        imported_spaces = []
-        failed_spaces = []
-        for space_type in iter_supported_space_types():
-            state = get_state(scene=context.scene, space_type=space_type)
-            if state is None:
-                continue
-
-            space_payload = target_space_payloads.get(space_type)
-            if not isinstance(space_payload, dict):
-                continue
-
-            try:
-                apply_space_state_payload(state, space_payload)
-                imported_spaces.append(space_type)
-            except Exception:
-                traceback.print_exc()
-                failed_spaces.append(space_type)
-
-        if not imported_spaces:
-            if failed_spaces:
-                self.report({"ERROR"}, "预设导入失败：工作流数据无法应用，请检查文件是否损坏")
-            else:
-                self.report({"ERROR"}, "预设中没有可导入到当前版本的工作流空间")
-            return {"CANCELLED"}
-
-        ensure_minimum_setup(context.scene)
-        refresh_all_panel_registries(context.scene)
-        refresh_runtime(scene=context.scene)
-        save_global_workflow_state(context.scene)
-        missing_count = 0
-        missing_workflow_count = 0
-        for space_type in imported_spaces:
-            state = get_state(scene=context.scene, space_type=space_type)
-            if state is None:
-                continue
-            for workflow in state.workflows:
-                if workflow.is_default:
-                    continue
-                count = len(workflow_missing_panel_ids(state, workflow))
-                if count:
-                    missing_count += count
-                    missing_workflow_count += 1
-
-        if failed_spaces:
-            self.report(
-                {"WARNING"},
-                f"预设已部分导入，成功 {len(imported_spaces)} 个空间，失败 {len(failed_spaces)} 个空间",
-            )
-        elif missing_count:
-            self.report(
-                {"WARNING"},
-                f"预设已导入，但有 {missing_workflow_count} 个工作流共 {missing_count} 个面板暂时缺失",
-            )
-        else:
-            self.report({"INFO"}, f"预设已导入，覆盖 {len(imported_spaces)} 个编辑器空间")
-        return {"FINISHED"}
+        return {"FINISHED"} if import_preset_file_direct(context, filepath) else {"CANCELLED"}
 
 
-class BWFLOW_OT_preset_load(Operator, ImportHelper):
+class BWFLOW_OT_preset_load(Operator):
     bl_idname = "bworkflow.preset_load"
     bl_label = "载入预设"
-    bl_description = "读取 .goworkflow 文件，并列出可多选导入的工作流"
-
-    filename_ext = PRESET_FILE_EXTENSION
-    filter_glob: StringProperty(default=f"{PRESET_FILE_FILTER};{LEGACY_PRESET_FILE_FILTER}", options={"HIDDEN"})
+    bl_description = "读取 .gwpreset 压缩预设包，并列出可单独导入的工作流"
 
     def execute(self, context):
         state = get_state(context=context)
         if state is None:
-            self.report({"ERROR"}, "没有可用的 Go工作流 状态")
+            print("[Go Workflow] No available state.")
+            return {"CANCELLED"}
+        filepath = native_windows_file_dialog_open(title="Load Go Workflow preset")
+        if not filepath:
+            print("[Go Workflow] Preset load cancelled.")
             return {"CANCELLED"}
         try:
-            payload = load_json_payload_file(self.filepath, max_bytes=MAX_PRESET_FILE_BYTES)
+            payload = read_preset_archive(filepath, max_bytes=MAX_PRESET_FILE_BYTES)
         except Exception as exc:
-            self.report({"ERROR"}, f"预设读取失败: {exc}")
+            print(f"[Go Workflow] Preset read failed: {exc}")
             return {"CANCELLED"}
 
-        entries = workflow_preset_entries_from_payload(payload, preferred_space_type=current_space_type(context=context))
-        count = populate_preset_workflow_list(state, entries)
-        state.preset_filepath = self.filepath
-        state.preset_status = f"已从预设读取 {count} 个工作流"
+        preferred_space_type = current_space_type(context=context)
+        entries = prepare_safe_preset_entries(workflow_preset_entries_from_payload(payload, preferred_space_type=preferred_space_type))
+        set_preset_import_cache(state, filepath, entries, selected_index=0)
+        count = populate_preset_workflow_list(state, entries, preferred_space_type=preferred_space_type)
+        selected_count, _total_count = preset_workflow_selection_counts(state)
         if count <= 0:
-            self.report({"WARNING"}, "预设中没有工作流")
+            print("[Go Workflow] No workflow found in preset.")
             return {"CANCELLED"}
-        self.report({"INFO"}, state.preset_status)
+        print(f"[Go Workflow] Loaded {count} workflow(s); selected {selected_count}.")
+        return {"FINISHED"}
+
+
+def load_preset_entries_from_filepath(context, state, filepath):
+    payload = read_preset_archive(filepath, max_bytes=MAX_PRESET_FILE_BYTES)
+    preferred_space_type = current_space_type(context=context)
+    entries = prepare_safe_preset_entries(workflow_preset_entries_from_payload(payload, preferred_space_type=preferred_space_type))
+    set_preset_import_cache(state, filepath, entries, selected_index=0)
+    count = populate_preset_workflow_list(state, entries, preferred_space_type=preferred_space_type)
+    return count, preset_workflow_selection_counts(state)[0]
+
+
+class BWFLOW_OT_preset_load_from_clipboard(Operator):
+    bl_idname = "bworkflow.preset_load_from_clipboard"
+    bl_label = "从剪贴板加载预设"
+    bl_description = "从剪贴板读取 .gwpreset 路径，绕过 Blender 文件浏览器"
+
+    @classmethod
+    def poll(cls, context):
+        return get_state(context=context) is not None
+
+    def execute(self, context):
+        state = get_state(context=context)
+        if state is None:
+            return {"CANCELLED"}
+        filepath = str(getattr(context.window_manager, "clipboard", "") or "").strip().strip('"')
+        if not filepath:
+            print("[Go Workflow] Clipboard is empty.")
+            return {"CANCELLED"}
+        try:
+            count, selected = load_preset_entries_from_filepath(context, state, filepath)
+        except Exception as exc:
+            traceback.print_exc()
+            print(f"[Go Workflow] Preset clipboard load failed: {exc}")
+            return {"CANCELLED"}
+        if count <= 0:
+            print("[Go Workflow] No workflow found in preset.")
+            return {"CANCELLED"}
+        print(f"[Go Workflow] Loaded {count} workflow(s); selected {selected}.")
+        if not tag_redraw_context_area(context):
+            tag_redraw_all()
         return {"FINISHED"}
 
 
@@ -9587,8 +14454,80 @@ class BWFLOW_OT_preset_select_all(Operator):
         state = get_state(context=context)
         if state is None:
             return {"CANCELLED"}
-        for item in state.preset_workflows:
-            item.selected = bool(self.select)
+        active_index = preset_import_selected_index(state)
+        if active_index >= 0:
+            set_preset_import_selected_index(state, active_index if self.select else 0)
+        selected_count, total_count = preset_workflow_selection_counts(state)
+        print(f"[Go Workflow] Selected {selected_count}/{total_count}.")
+        return {"FINISHED"}
+        state.preset_status = f"已勾选 {selected_count}/{total_count} 个工作流"
+        return {"FINISHED"}
+
+
+class BWFLOW_OT_preset_select_current_space(Operator):
+    bl_idname = "bworkflow.preset_select_current_space"
+    bl_label = "只选当前编辑器"
+    bl_description = "只勾选预设中属于当前编辑器空间的非默认工作流"
+
+    def execute(self, context):
+        state = get_state(context=context)
+        if state is None:
+            return {"CANCELLED"}
+        space_type = current_space_type(context=context)
+        entries = get_preset_import_entries(state)
+        for index, entry in enumerate(entries):
+            workflow = entry.get("workflow", {}) if isinstance(entry, dict) else {}
+            if entry.get("space_type", "VIEW_3D") == space_type and not bool(workflow.get("is_default", False)):
+                set_preset_import_selected_index(state, index)
+                break
+        selected_count, total_count = preset_workflow_selection_counts(state)
+        print(f"[Go Workflow] Selected {selected_count}/{total_count}.")
+        return {"FINISHED"}
+        state.preset_status = f"已勾选当前编辑器 {selected_count}/{total_count} 个工作流"
+        return {"FINISHED"}
+
+
+class BWFLOW_OT_preset_clear_loaded(Operator):
+    bl_idname = "bworkflow.preset_clear_loaded"
+    bl_label = "清空预设列表"
+    bl_description = "清空当前已载入的预设预览列表"
+
+    def execute(self, context):
+        state = get_state(context=context)
+        if state is None:
+            return {"CANCELLED"}
+        clear_preset_import_cache(state)
+        try:
+            state.preset_workflow_index = 0
+        except Exception:
+            pass
+        return {"FINISHED"}
+        state.preset_filepath = ""
+        state.preset_status = ""
+        return {"FINISHED"}
+
+
+class BWFLOW_OT_preset_select_cached(Operator):
+    bl_idname = "bworkflow.preset_select_cached"
+    bl_label = "选择预设工作流"
+    bl_description = "选择一个已载入的预设工作流用于导入"
+
+    index: IntProperty(default=0, min=0)
+
+    @classmethod
+    def poll(cls, context):
+        state = get_state(context=context)
+        return state is not None and bool(get_preset_import_entries(state))
+
+    def execute(self, context):
+        state = get_state(context=context)
+        if state is None:
+            return {"CANCELLED"}
+        selected_index = set_preset_import_selected_index(state, int(self.index))
+        if selected_index < 0:
+            return {"CANCELLED"}
+        if not tag_redraw_context_area(context):
+            tag_redraw_all()
         return {"FINISHED"}
 
 
@@ -9600,31 +14539,64 @@ class BWFLOW_OT_preset_import_selected(Operator):
     @classmethod
     def poll(cls, context):
         state = get_state(context=context)
-        return state is not None and bool(state.preset_filepath) and len(state.preset_workflows) > 0
+        return state is not None and bool(get_preset_import_entries(state))
 
     def execute(self, context):
         state = get_state(context=context)
         if state is None:
             return {"CANCELLED"}
-        selected_keys = {item.source_key for item in state.preset_workflows if item.selected and item.source_key}
-        if not selected_keys:
+        selected_index = preset_import_selected_index(state)
+        selected_entry = preset_import_entry_at(state, selected_index)
+        selected_entries = [selected_entry] if isinstance(selected_entry, dict) else []
+        if not selected_entries:
+            print("[Go Workflow] No selected workflow to import.")
+            return {"CANCELLED"}
+
+        ensure_minimum_setup(context.scene)
+        imported = []
+        imported_workflows = []
+        for entry in selected_entries:
+            workflow = import_single_preset_entry(context, state, entry)
+            if workflow is None:
+                continue
+            imported.append(workflow.name)
+            imported_workflows.append(workflow)
+
+        if not imported:
+            print("[Go Workflow] No workflow imported.")
+            return {"CANCELLED"}
+
+        missing_count, missing_suffix, low_version_count, low_version_suffix = finish_current_space_preset_import(context, state, imported_workflows)
+        if missing_count:
+            print(f"[Go Workflow] Imported {len(imported)} workflow(s); missing panels {missing_count}{missing_suffix}{low_version_suffix}.")
+        elif low_version_count:
+            print(f"[Go Workflow] Imported {len(imported)} workflow(s){low_version_suffix}.")
+        else:
+            print(f"[Go Workflow] Imported {len(imported)} workflow(s).")
+        return {"FINISHED"}
+        selected_key = ""
+        for item in state.preset_workflows:
+            if item.selected and item.source_key:
+                selected_key = item.source_key
+                break
+        if not selected_key:
             self.report({"WARNING"}, "没有勾选要导入的工作流")
             return {"CANCELLED"}
         try:
-            payload = load_json_payload_file(state.preset_filepath, max_bytes=MAX_PRESET_FILE_BYTES)
+            payload = read_preset_archive(state.preset_filepath, max_bytes=MAX_PRESET_FILE_BYTES)
         except Exception as exc:
             self.report({"ERROR"}, f"预设读取失败: {exc}")
             return {"CANCELLED"}
 
         entries = workflow_preset_entries_from_payload(payload, preferred_space_type=current_space_type(context=context))
-        selected_entries = [entry for entry in entries if entry.get("key", "") in selected_keys]
+        selected_entries = [entry for entry in entries if entry.get("key", "") == selected_key][:1]
         if not selected_entries:
             self.report({"WARNING"}, "预设中没有找到已勾选的工作流")
             return {"CANCELLED"}
 
         ensure_minimum_setup(context.scene)
         imported = []
-        missing_count = 0
+        imported_workflows = []
         merge_preset_entries_shared_payloads(state, selected_entries)
         for entry in selected_entries:
             workflow_payload = current_workflow_preset_payload_from_entry(entry)
@@ -9632,21 +14604,18 @@ class BWFLOW_OT_preset_import_selected(Operator):
             if workflow is None:
                 continue
             imported.append(workflow.name)
-            missing_count += len(workflow_missing_panel_ids(state, workflow))
+            imported_workflows.append(workflow)
 
         if not imported:
             self.report({"ERROR"}, "没有导入任何工作流")
             return {"CANCELLED"}
 
-        space_type = current_space_type(context=context)
-        rebuild_panel_cache(scene=context.scene, space_type=space_type)
-        rebuild_runtime_panels(scene=context.scene, space_type=space_type, rebuild_cache=False)
-        save_global_workflow_state(context.scene)
-        tag_redraw_all()
-
-        state.preset_status = f"已导入 {len(imported)} 个工作流"
+        missing_count, missing_suffix, low_version_count, low_version_suffix = finish_current_space_preset_import(context, state, imported_workflows)
+        state.preset_status = f"已导入 {len(imported)} 个工作流" + (f"；缺失面板 {missing_count} 个" if missing_count else "") + (f"；低版本插件 {low_version_count} 个" if low_version_count else "")
         if missing_count:
-            self.report({"WARNING"}, f"已导入 {len(imported)} 个工作流；缺失面板 {missing_count} 个")
+            self.report({"WARNING"}, f"已导入 {len(imported)} 个工作流；缺失面板 {missing_count} 个{missing_suffix}{low_version_suffix}。未自动应用到 N 面板")
+        elif low_version_count:
+            self.report({"WARNING"}, f"已导入 {len(imported)} 个工作流{low_version_suffix}。未自动应用到 N 面板")
         else:
             self.report({"INFO"}, state.preset_status)
         return {"FINISHED"}
@@ -9750,10 +14719,21 @@ def draw_workflow_runtime(layout, state):
         if missing_records:
             warning = layout.box()
             warning.alert = True
-            warning.label(text=f"当前 Go工作流有 {len(missing_records)} 个缺失面板", icon="ERROR")
+            row = warning.row(align=True)
+            row.label(text=f"当前 Go工作流有 {len(missing_records)} 个缺失面板", icon="ERROR")
+            op = row.operator("bworkflow.workflow_dismiss_missing_warning", text="忽略提示", icon="HIDE_ON")
+            op.dismiss = True
+            row.operator("bworkflow.export_missing_plugins_csv", text="导出 CSV", icon="EXPORT")
             for record in missing_records[: min(len(missing_records), preview_lines)]:
                 label = record.title if record and record.title else (record.panel_id if record else "未知面板")
                 warning.label(text=label)
+            if len(missing_records) > preview_lines:
+                warning.label(text=f"其余 {len(missing_records) - preview_lines} 项请导出 CSV 查看", icon="INFO")
+        elif bool(getattr(workflow, "missing_warning_dismissed", False)) and workflow_missing_panel_ids(state, workflow):
+            row = layout.row(align=True)
+            row.label(text="当前工作流的缺失面板提示已忽略", icon="HIDE_ON")
+            op = row.operator("bworkflow.workflow_dismiss_missing_warning", text="恢复提示", icon="HIDE_OFF")
+            op.dismiss = False
 
     modules_box = layout.box()
     modules_box.label(text="自定义脚本模块", icon="CONSOLE")
@@ -9859,18 +14839,24 @@ def draw_workflow_settings(layout, state):
     detail.label(text="当前工作流设置", icon="SETTINGS")
     detail.prop(workflow, "name", text="名称")
     detail.prop(workflow, "description", text="说明")
-    detail.prop(workflow, "tag_filter", text="按标签自动加入")
-    detail.label(text="写法: 用英文逗号分隔，例如 model, uv, render", icon="INFO")
-    detail.label(text="含义: 面板库里带这些标签的面板，会自动出现在当前工作流里。", icon="BOOKMARKS")
     row = detail.row(align=True)
     row.operator("bworkflow.workflow_set_default", text="设为默认", icon="HOME")
     row.operator("bworkflow.workflow_clear_description", text="清空说明", icon="TRASH")
     if workflow.is_default:
         detail.label(text="当前 Go工作流就是默认 Go工作流。", icon="CHECKMARK")
         return
-    elif workflow_missing_panel_ids(state, workflow):
-        detail.label(text=f"当前 Go工作流存在 {len(workflow_missing_panel_ids(state, workflow))} 个缺失面板。", icon="ERROR")
-        return
+    missing_panel_ids = workflow_missing_panel_ids(state, workflow)
+    if missing_panel_ids:
+        row = detail.row(align=True)
+        if bool(getattr(workflow, "missing_warning_dismissed", False)):
+            row.label(text=f"缺失面板提示已忽略（{len(missing_panel_ids)} 个）", icon="HIDE_ON")
+            op = row.operator("bworkflow.workflow_dismiss_missing_warning", text="恢复提示", icon="HIDE_OFF")
+            op.dismiss = False
+        else:
+            row.label(text=f"当前 Go工作流存在 {len(missing_panel_ids)} 个缺失面板。", icon="ERROR")
+            op = row.operator("bworkflow.workflow_dismiss_missing_warning", text="忽略提示", icon="HIDE_ON")
+            op.dismiss = True
+            row.operator("bworkflow.export_missing_plugins_csv", text="导出 CSV", icon="EXPORT")
 
 
 def draw_panel_library_editor(layout, state):
@@ -9880,13 +14866,13 @@ def draw_panel_library_editor(layout, state):
         return
 
     groups = build_panel_library_groups(state, workflow)
+    expanded_library_keys = parse_expanded_group_keys(getattr(state, "panel_group_expanded_keys", ""))
+    expanded_selected_keys = parse_expanded_group_keys(getattr(state, "selected_group_expanded_keys", ""))
 
     header = layout.box()
     header.label(text=f"当前 Go工作流配置目标: {workflow.name}", icon="OUTLINER_COLLECTION")
     if workflow.is_default:
         header.label(text="默认 Go工作流不需要勾选，默认显示全部面板。", icon="HOME")
-    else:
-        header.label(text="切换到这个 Go工作流 后，只保留下面勾选的面板组，其余全部隐藏。", icon="CHECKMARK")
 
     split = layout.split(factor=0.52)
     left = split.column(align=True)
@@ -9894,16 +14880,65 @@ def draw_panel_library_editor(layout, state):
 
     selected_ids = {item.panel_id for item in workflow.panels}
 
-    library_box = left.box()
-    library_box.label(text="面板组", icon="PLUGIN")
-    library_box.label(text="按 N 面板抽屉标题栏统计；也就是右侧带 8 点拖拽手柄的折叠面板。", icon="INFO")
-    library_box.label(text=f"共有 {len(groups)} 个面板组", icon="OUTLINER_COLLECTION")
-    tool_row = library_box.row(align=True)
-    tool_row.operator("bworkflow.refresh_registry", text="刷新面板库")
+    space_type = getattr(state, "space_type", "VIEW_3D")
 
-    if groups:
-        for group in groups:
-            group_box = library_box.box()
+    if not state.panel_registry:
+        left.label(text="面板库为空，请先刷新。", icon="INFO")
+        return
+
+    record = state.panel_registry[clamp_index(state.panel_registry_index, len(state.panel_registry))]
+    record_discovered = panel_drawer_discovered(state, panel_drawer_root_id(record.panel_id, space_type=space_type))
+    component_ids = set(panel_drawer_workflow_ids(state, record.panel_id))
+    is_checked = bool(component_ids.intersection(selected_ids)) or record.panel_id in selected_ids
+
+    detail = left.box()
+    detail.label(text="面板详情", icon="MENU_PANEL")
+    detail.label(text=f"名称: {clean_panel_title(record.title, record.panel_id)}")
+    status_row = detail.row(align=True)
+    if is_checked:
+        status_row.label(text="已加入", icon="CHECKMARK")
+    elif not record_discovered:
+        status_row.label(text="缺失", icon="ERROR")
+    else:
+        status_row.label(text=" ", icon="BLANK1")
+    detail.label(text=f"所属抽屉面板: {panel_drawer_title(state, panel_drawer_root_id(record.panel_id, space_type=space_type))}")
+    if not workflow.is_default:
+        action_row = detail.row(align=True)
+        toggle_plugin_op = action_row.operator("bworkflow.panel_toggle_for_workflow", text="抽屉面板加入/移出")
+        toggle_plugin_op.panel_index = clamp_index(state.panel_registry_index, len(state.panel_registry))
+
+    library_box = left.box()
+    library_box.prop(state, "panel_group_filter_text", text="搜索")
+    filtered_groups = filtered_panel_groups(
+        groups,
+        getattr(state, "panel_group_filter_text", ""),
+        cache_key=f"{space_type}:library",
+    )
+    library_box.label(text=f"共有 {len(filtered_groups)} / {len(groups)} 个面板组", icon="OUTLINER_COLLECTION")
+    tool_row = library_box.row(align=True)
+    tool_row.operator("bworkflow.panel_match_imported_by_name", text="重新查找缺失插件面板", icon="VIEWZOOM")
+    tool_row.operator("bworkflow.refresh_registry", text="刷新面板库")
+    tool_row.operator("bworkflow.panel_add_all_to_workflow", text="按默认 N 面板加入")
+    if getattr(state, "panel_group_filter_text", ""):
+        tool_row.prop(state, "panel_group_filter_text", text="", icon="X")
+
+    visible_groups, library_page, library_page_count = paged_panel_groups(
+        state, filtered_groups, "panel_group_page", PANEL_GROUP_DRAW_LIMIT
+    )
+    if library_page_count > 1:
+        page_row = library_box.row(align=True)
+        page_row.alignment = "CENTER"
+        prev_page = page_row.operator("bworkflow.panel_group_page", text="", icon="TRIA_LEFT")
+        prev_page.target = "LIBRARY"
+        prev_page.direction = "PREV"
+        page_row.label(text=f"{library_page + 1}/{library_page_count}")
+        next_page = page_row.operator("bworkflow.panel_group_page", text="", icon="TRIA_RIGHT")
+        next_page.target = "LIBRARY"
+        next_page.direction = "NEXT"
+    if visible_groups:
+        for group in visible_groups:
+            expanded = group["key"] in expanded_library_keys
+            group_box = library_box.box() if expanded else library_box
             header_row = group_box.row(align=True)
             header_row.operator_context = "INVOKE_DEFAULT"
             selected_count = group.get("selected_count", 0)
@@ -9911,7 +14946,7 @@ def draw_panel_library_editor(layout, state):
                 status_icon = "CHECKBOX_HLT"
             else:
                 status_icon = "CHECKBOX_DEHLT"
-            expand_icon = "TRIA_DOWN" if is_group_expanded(state, group["key"]) else "TRIA_RIGHT"
+            expand_icon = "TRIA_DOWN" if expanded else "TRIA_RIGHT"
             expand_op = header_row.operator(
                 "bworkflow.group_expand_toggle",
                 text="",
@@ -9931,7 +14966,7 @@ def draw_panel_library_editor(layout, state):
             group_op.target = "LIBRARY"
             header_row.label(text="", icon=status_icon)
             header_row.label(text=panel_count_label(group.get("panel_count", 0)), icon="MENU_PANEL")
-            if is_group_expanded(state, group["key"]):
+            if expanded:
                 for entry in panel_library_group_entries(state, workflow, group):
                     record = entry["record"]
                     row = group_box.row(align=True)
@@ -9946,39 +14981,11 @@ def draw_panel_library_editor(layout, state):
                     )
                     op.index = entry["index"]
 
-    if not state.panel_registry:
-        left.label(text="面板库为空，请先刷新。", icon="INFO")
-        return
-
-    record = state.panel_registry[clamp_index(state.panel_registry_index, len(state.panel_registry))]
-    record_discovered = panel_drawer_discovered(state, panel_drawer_root_id(record.panel_id, space_type=getattr(state, "space_type", "VIEW_3D")))
-    component_ids = set(panel_drawer_workflow_ids(state, record.panel_id))
-    is_checked = bool(component_ids.intersection(selected_ids)) or record.panel_id in selected_ids
-
-    detail = left.box()
-    detail.label(text="面板详情", icon="MENU_PANEL")
-    detail.label(text=f"名称: {clean_panel_title(record.title, record.panel_id)}")
-    status_row = detail.row(align=True)
-    status_row.label(
-        text="已加入" if is_checked else ("已发现" if record_discovered else "缺失"),
-        icon="CHECKMARK" if is_checked else ("PLUGIN" if record_discovered else "ERROR"),
-    )
-    detail.label(text=f"所属大组: {panel_family_title(state, record)}")
-    detail.label(text=f"所属抽屉面板: {panel_drawer_title(state, panel_drawer_root_id(record.panel_id, space_type=getattr(state, 'space_type', 'VIEW_3D')))}")
-    detail.label(text=f"模块: {record.source_module or '-'}")
-    detail.prop(record, "tags", text="面板标签")
-    detail.label(text="标签用于自动匹配到工作流。")
-    if not workflow.is_default:
-        action_row = detail.row(align=True)
-        toggle_plugin_op = action_row.operator("bworkflow.panel_toggle_for_workflow", text="抽屉面板加入/移出")
-        toggle_plugin_op.panel_index = clamp_index(state.panel_registry_index, len(state.panel_registry))
-
     selected = right.box()
     selected.label(text=f"{workflow.name} 当前勾选")
     if workflow.is_default:
         selected.label(text="默认工作流不显示勾选限制。", icon="INFO")
     elif workflow.panels:
-        selected.label(text="当前列表按组管理；选中组后，上移/下移会移动整组。")
         active_title = ""
         active_panel_id = ""
         if workflow.panels:
@@ -9992,12 +14999,49 @@ def draw_panel_library_editor(layout, state):
             text=f"当前高亮: {active_title}" if active_title else "当前没有高亮面板",
             icon="LAYER_ACTIVE" if active_title else "INFO",
         )
+        order_box = selected.box()
+        order_box.label(text="抽屉顺序操作", icon="SORTALPHA")
+        jump_row = order_box.row(align=True)
+        top = jump_row.operator("bworkflow.panel_jump_in_workflow", text="置顶当前组", icon="TRIA_UP_BAR")
+        top.target = "TOP"
+        bottom = jump_row.operator("bworkflow.panel_jump_in_workflow", text="置底当前组", icon="TRIA_DOWN_BAR")
+        bottom.target = "BOTTOM"
+        move_row = order_box.row(align=True)
+        up = move_row.operator("bworkflow.panel_move_in_workflow", text="上移当前组")
+        up.direction = "UP"
+        down = move_row.operator("bworkflow.panel_move_in_workflow", text="下移当前组")
+        down.direction = "DOWN"
+        row = order_box.row(align=True)
+        row.operator("bworkflow.panel_sort_children_by_default_order", text="子抽屉默认排序", icon="SORTALPHA")
+        row = order_box.row(align=True)
+        row.operator("bworkflow.panel_clear_workflow", text="清空全部")
+
         selected_groups = build_selected_panel_groups(state, workflow)
-        for group in selected_groups:
-            group_box = selected.box()
+        selected.prop(state, "selected_panel_group_filter_text", text="搜索")
+        filtered_selected_groups = filtered_panel_groups(
+            selected_groups,
+            getattr(state, "selected_panel_group_filter_text", ""),
+            cache_key=f"{space_type}:selected",
+        )
+        visible_selected_groups, selected_page, selected_page_count = paged_panel_groups(
+            state, filtered_selected_groups, "selected_panel_group_page", SELECTED_PANEL_GROUP_DRAW_LIMIT
+        )
+        if selected_page_count > 1:
+            page_row = selected.row(align=True)
+            page_row.alignment = "CENTER"
+            prev_page = page_row.operator("bworkflow.panel_group_page", text="", icon="TRIA_LEFT")
+            prev_page.target = "SELECTED"
+            prev_page.direction = "PREV"
+            page_row.label(text=f"{selected_page + 1}/{selected_page_count}")
+            next_page = page_row.operator("bworkflow.panel_group_page", text="", icon="TRIA_RIGHT")
+            next_page.target = "SELECTED"
+            next_page.direction = "NEXT"
+        for group in visible_selected_groups:
+            expanded = group["key"] in expanded_selected_keys
+            group_box = selected.box() if expanded else selected
             header_row = group_box.row(align=True)
             header_row.operator_context = "INVOKE_DEFAULT"
-            expand_icon = "TRIA_DOWN" if is_group_expanded(state, group["key"], selected=True) else "TRIA_RIGHT"
+            expand_icon = "TRIA_DOWN" if expanded else "TRIA_RIGHT"
             group_toggle = header_row.operator(
                 "bworkflow.group_expand_toggle",
                 text="",
@@ -10012,7 +15056,7 @@ def draw_panel_library_editor(layout, state):
                 icon="LAYER_ACTIVE" if group.get("is_active") else "OUTLINER_COLLECTION",
                 emboss=False,
             )
-            group_select.panel_id = group.get("panel_id", "") or (group["entries"][0]["panel_id"] if group["entries"] else "")
+            group_select.panel_id = group.get("panel_id", "")
             header_row.label(text=panel_count_label(group.get("panel_count", 0)), icon="DOT")
             group_up = header_row.operator(
                 "bworkflow.panel_move_in_workflow",
@@ -10030,8 +15074,8 @@ def draw_panel_library_editor(layout, state):
             )
             group_down.direction = "DOWN"
             group_down.group_key = group["key"]
-            if is_group_expanded(state, group["key"], selected=True):
-                for entry in group["entries"]:
+            if expanded:
+                for entry in selected_panel_group_entries(state, workflow, group):
                     row_host = group_box.box() if entry.get("is_active", False) else group_box
                     row = row_host.row(align=True)
                     row.operator_context = "INVOKE_DEFAULT"
@@ -10061,36 +15105,11 @@ def draw_panel_library_editor(layout, state):
                     child_down.direction = "DOWN"
                     child_down.group_key = group["key"]
                     child_down.panel_id = entry["panel_id"]
-        order_box = selected.box()
-        order_box.label(text="抽屉顺序操作", icon="SORTALPHA")
-        move_row = order_box.row(align=True)
-        up = move_row.operator("bworkflow.panel_move_in_workflow", text="上移当前组")
-        up.direction = "UP"
-        down = move_row.operator("bworkflow.panel_move_in_workflow", text="下移当前组")
-        down.direction = "DOWN"
-        row = order_box.row(align=True)
-        row.operator("bworkflow.panel_sort_children_by_default_order", text="子抽屉默认排序", icon="SORTALPHA")
-        row = order_box.row(align=True)
-        row.operator("bworkflow.panel_clear_workflow", text="清空当前勾选")
     else:
         selected.label(text="当前 Go工作流还没有勾选任何面板。", icon="INFO")
         row = selected.row(align=True)
-        row.operator("bworkflow.panel_add_all_to_workflow", text="加入全部抽屉面板")
+        row.operator("bworkflow.panel_add_all_to_workflow", text="按默认 N 面板加入")
         row.operator("bworkflow.panel_add_tagged_to_workflow", text="加入标签命中")
-
-    note = right.box()
-    draw_folded_text_block(
-        note,
-        state.settings,
-        "show_help_text_blocks",
-        "说明",
-        "手动勾选和标签自动命中的面板，都会进入当前 Go工作流 的显示结果。\n"
-        "显示顺序以当前 Go工作流 勾选列表为准，自动加入的面板排在后面。\n"
-        "缺失面板会保留在预设里，方便跨机器恢复。",
-        icon="INFO",
-        expanded_limit=3,
-        width=56,
-    )
 
 
 def draw_module_template_editor(layout, state):
@@ -10213,13 +15232,63 @@ def draw_preset_editor(layout, state):
 
     import_box = col.box()
     import_box.label(text="从预设导入工作流", icon="IMPORT")
-    import_box.operator("bworkflow.preset_load", text="选择 .goworkflow 文件", icon="FILE_FOLDER")
-    if state.preset_filepath:
-        import_box.label(text=os.path.basename(bpy.path.abspath(state.preset_filepath)), icon="FILE")
-    if state.preset_status:
-        import_box.label(text=state.preset_status, icon="INFO")
+    load_row = import_box.row(align=True)
+    load_row.operator("bworkflow.preset_load", text="选择 .gwpreset 预设包", icon="FILE_FOLDER")
+    load_row.operator("bworkflow.preset_load_from_clipboard", text="", icon="PASTEDOWN")
+    if get_preset_import_entries(state):
+        load_row.operator("bworkflow.preset_clear_loaded", text="", icon="X")
+    preset_cache = get_preset_import_cache(state)
+    preset_filepath = preset_cache.get("filepath", "")
+    if preset_filepath:
+        import_box.label(text=os.path.basename(bpy.path.abspath(preset_filepath)), icon="FILE")
+
+    preset_entries = get_preset_import_entries(state)
+    if preset_entries:
+        selected_count, total_count = preset_workflow_selection_counts(state)
+        import_box.label(text=f"已选择 {selected_count}/{total_count}", icon="CHECKBOX_HLT" if selected_count else "CHECKBOX_DEHLT")
+        selected_index = preset_import_selected_index(state)
+        list_box = import_box.box()
+        for index, entry in enumerate(preset_entries[:8]):
+            workflow = entry.get("workflow", {}) if isinstance(entry, dict) else {}
+            name = workflow.get("name", "") or f"工作流 {index + 1}"
+            space_type = entry.get("space_type", "VIEW_3D") if isinstance(entry, dict) else "VIEW_3D"
+            module_count = len(workflow.get("modules", [])) if isinstance(workflow, dict) else 0
+            panel_count = len(workflow.get("panels", [])) if isinstance(workflow, dict) else 0
+            row = list_box.row(align=True)
+            op = row.operator(
+                "bworkflow.preset_select_cached",
+                text=name,
+                icon="RADIOBUT_ON" if index == selected_index else "RADIOBUT_OFF",
+                depress=index == selected_index,
+            )
+            op.index = index
+            row.label(text=SPACE_LABELS.get(space_type, space_type))
+            row.label(text=f"{panel_count} 面板")
+            row.label(text=f"{module_count} 模块")
+        if len(preset_entries) > 8:
+            list_box.label(text=f"仅显示前 8/{len(preset_entries)} 个工作流", icon="INFO")
+        import_row = import_box.row(align=True)
+        import_row.enabled = selected_count > 0
+        import_row.operator("bworkflow.preset_import_selected", text="导入当前选中工作流", icon="IMPORT")
+    else:
+        import_box.label(text="请选择 .gwpreset 预设包，先预览再单独导入。", icon="INFO")
+
+    info = col.box()
+    draw_folded_text_block(
+        info,
+        state.settings,
+        "show_help_text_blocks",
+        "预设说明",
+        "导出会生成 .gwpreset 压缩包；脚本按 .py 文件保存。面板组只使用轻量名称匹配信息，导入时不会覆盖当前 N 面板顺序。",
+        icon="INFO",
+        expanded_limit=3,
+        width=56,
+    )
+    return
 
     if state.preset_workflows:
+        selected_count, total_count = preset_workflow_selection_counts(state)
+        import_box.label(text=f"已勾选 {selected_count}/{total_count} 个工作流", icon="CHECKBOX_HLT" if selected_count else "CHECKBOX_DEHLT")
         row = import_box.row()
         row.template_list(
             "BWFLOW_UL_preset_workflows",
@@ -10231,11 +15300,14 @@ def draw_preset_editor(layout, state):
             rows=6,
         )
         ops = row.column(align=True)
+        ops.operator("bworkflow.preset_select_current_space", text="", icon="RESTRICT_SELECT_OFF")
         ops.operator("bworkflow.preset_select_all", text="", icon="CHECKBOX_HLT").select = True
         ops.operator("bworkflow.preset_select_all", text="", icon="CHECKBOX_DEHLT").select = False
-        import_box.operator("bworkflow.preset_import_selected", text="导入勾选工作流", icon="IMPORT")
+        import_row = import_box.row(align=True)
+        import_row.enabled = selected_count > 0
+        import_row.operator("bworkflow.preset_import_selected", text="导入当前选中工作流", icon="IMPORT")
     else:
-        import_box.label(text="请选择 .goworkflow 文件以预览其中的工作流。", icon="INFO")
+        import_box.label(text="请选择 .gwpreset 预设包以预览其中的工作流。", icon="INFO")
 
     info = col.box()
     draw_folded_text_block(
@@ -10243,9 +15315,9 @@ def draw_preset_editor(layout, state):
         state.settings,
         "show_help_text_blocks",
         "预设说明",
-        "导出会把当前编辑器空间中勾选的工作流写入一个 .goworkflow 文件。\n"
-        "导入会保留现有工作流，并把勾选项目合并到当前编辑器空间。\n"
-        "缺失面板会保留为警告，方便共享预设在不同环境中继续使用。",
+        "导出会把当前编辑器空间中勾选的工作流写入一个 .gwpreset 压缩预设包。\n"
+        "脚本源码会作为独立 .py 文件放入预设包；面板组只保存插件名称和版本摘要。\n"
+        "导入时一次只导入一个工作流，不自动恢复面板排序和子抽屉。",
         icon="INFO",
         expanded_limit=3,
         width=56,
@@ -10345,9 +15417,6 @@ def draw_script_library_editor(layout, state):
                 depress=is_enabled,
             )
             op.workflow_index = workflow_index
-            if is_installed and not is_enabled:
-                row.label(text="已载入", icon="DOT")
-
 
 def draw_global_settings(layout, state):
     box = layout.column(align=True)
@@ -10355,6 +15424,14 @@ def draw_global_settings(layout, state):
     box.prop(state.settings, "auto_sync_registry")
     box.prop(state.settings, "show_missing_summary")
     box.prop(state.settings, "runtime_preview_lines")
+
+    mem_box = box.box()
+    mem_box.label(text="内存管理", icon="MEMORY")
+    mem_box.operator("bworkflow.release_memory", text="现在释放内存", icon="TRASH")
+    mem_box.prop(state.settings, "auto_gc_enabled")
+    if state.settings.auto_gc_enabled:
+        mem_box.prop(state.settings, "auto_gc_interval")
+
     danger = box.box()
     danger.alert = True
     danger.label(text="危险操作", icon="ERROR")
@@ -10499,16 +15576,19 @@ CLASSES = [
     BWFLOW_PG_Workflow,
     BWFLOW_PG_Settings,
     BWFLOW_PG_State,
+    BWFLOW_PG_ShapeKeyInspectorItem,
     BWFLOW_UL_workflows,
     BWFLOW_UL_workflow_panels,
     BWFLOW_UL_panel_library,
     BWFLOW_UL_workflow_modules,
     BWFLOW_UL_script_library,
     BWFLOW_UL_preset_workflows,
+    BWFLOW_UL_shape_key_inspector_results,
     BWFLOW_AddonPreferences,
     BWFLOW_OT_refresh_registry,
     BWFLOW_OT_initialize_defaults,
     BWFLOW_OT_reset_all_settings,
+    BWFLOW_OT_release_memory,
     BWFLOW_OT_restore_default_n_panels,
     BWFLOW_OT_workflow_activate,
     BWFLOW_OT_workflow_add,
@@ -10527,6 +15607,7 @@ CLASSES = [
     BWFLOW_OT_module_open_script_path,
     BWFLOW_OT_module_import_text_file,
     BWFLOW_OT_module_export_text_file,
+    BWFLOW_OT_module_pick_file_path,
     BWFLOW_OT_module_edit_description,
     BWFLOW_OT_module_paste_script_source,
     BWFLOW_OT_module_copy_ai_doc,
@@ -10553,11 +15634,15 @@ CLASSES = [
     BWFLOW_OT_panel_add_current_plugin_to_workflow,
     BWFLOW_OT_panel_toggle_single_for_workflow,
     BWFLOW_OT_group_expand_toggle,
+    BWFLOW_OT_panel_match_imported_by_name,
+    BWFLOW_OT_panel_group_page,
     BWFLOW_OT_select_workflow_panel,
     BWFLOW_OT_panel_group_click,
     BWFLOW_OT_panel_add_tagged_to_workflow,
     BWFLOW_OT_panel_clear_workflow,
     BWFLOW_OT_panel_remove_missing_from_workflow,
+    BWFLOW_OT_workflow_dismiss_missing_warning,
+    BWFLOW_OT_export_missing_plugins_csv,
     BWFLOW_OT_panel_reset_workflow_order,
     BWFLOW_OT_panel_jump_in_workflow,
     BWFLOW_OT_panel_reverse_workflow_order,
@@ -10568,8 +15653,12 @@ CLASSES = [
     BWFLOW_OT_preset_export,
     BWFLOW_OT_preset_import,
     BWFLOW_OT_preset_load,
+    BWFLOW_OT_preset_load_from_clipboard,
     BWFLOW_OT_preset_export_select_all,
     BWFLOW_OT_preset_select_all,
+    BWFLOW_OT_preset_select_current_space,
+    BWFLOW_OT_preset_clear_loaded,
+    BWFLOW_OT_preset_select_cached,
     BWFLOW_OT_preset_import_selected,
     BWFLOW_PT_workflow,
     BWFLOW_PT_workflow_image_editor,
@@ -10577,16 +15666,295 @@ CLASSES = [
 ]
 
 
+AUTO_GC_TIMER_HANDLE = None
+
+
+def _empty_working_set():
+    """调用 Windows EmptyWorkingSet API 释放物理内存。
+
+    参考 Mem Reduct 的实现原理：
+    1. EmptyWorkingSet / SetProcessWorkingSetSize(-1,-1) 告诉 OS
+       将当前进程工作集暂时不用的页面 trim 掉
+    2. Windows 立即回收对应物理 RAM，数据仍在虚拟内存中
+    3. 后续访问触发 soft page fault 按需加载，几乎无感知
+
+    返回 (释放前_MB, 释放后_MB)，失败/非 Windows 返回 None。
+    """
+    if not hasattr(ctypes, "windll"):
+        return None
+    try:
+        kernel32 = ctypes.windll.kernel32
+        psapi = ctypes.windll.psapi
+
+        # 设置正确的函数签名，避免调用约定错误
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        psapi.EmptyWorkingSet.argtypes = [ctypes.c_void_p]
+        psapi.EmptyWorkingSet.restype = ctypes.c_bool
+
+        h = kernel32.GetCurrentProcess()
+
+        # --- 读取释放前的 WorkingSetSize ---
+        # 不用自定义 struct（64位对齐坑多），直接用 psutil 或 CreateToolhelp32Snapshot
+        ws_before = _read_working_set_bytes(h)
+
+        # --- 执行 trim ---
+        ok = psapi.EmptyWorkingSet(h)
+        if not ok:
+            # EmptyWorkingSet 可能失败，尝试 SetProcessWorkingSetSize(-1,-1)
+            kernel32.SetProcessWorkingSetSize.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t]
+            kernel32.SetProcessWorkingSetSize.restype = ctypes.c_bool
+            kernel32.SetProcessWorkingSetSize(h, ctypes.c_size_t(-1), ctypes.c_size_t(-1))
+
+        # --- 读取释放后的 WorkingSetSize ---
+        ws_after = _read_working_set_bytes(h)
+
+        if ws_before is not None and ws_after is not None:
+            return (ws_before / (1024 * 1024), ws_after / (1024 * 1024))
+        return None
+    except Exception:
+        return None
+
+
+def _read_working_set_bytes(h_process):
+    """通过 GetProcessMemoryInfo 读取 WorkingSetSize（字节）。
+
+    使用 pointer-to-buffer 方式避免 struct 对齐陷阱：
+    分配一块足够大的 buffer，让 API 直接填充。
+    """
+    try:
+        kernel32 = ctypes.windll.kernel32
+        psapi = ctypes.windll.psapi
+        # PROCESS_MEMORY_COUNTERS_EX = 10 * SIZE_T + 2 * DWORD ≈ 88 bytes on 64-bit
+        # 多分配一些以防万一
+        buf = (ctypes.c_byte * 128)()
+        # 前 4 字节写 cb = sizeof(PROCESS_MEMORY_COUNTERS_EX) = 80 (64-bit)
+        cb = ctypes.c_ulong(80)
+        ctypes.memmove(buf, ctypes.addressof(cb), 4)
+        psapi.GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
+        psapi.GetProcessMemoryInfo.restype = ctypes.c_bool
+        ok = psapi.GetProcessMemoryInfo(h_process, buf, 128)
+        if not ok:
+            return None
+        # WorkingSetSize 在 PROCESS_MEMORY_COUNTERS 中偏移 16 (64-bit)
+        # cb(4) + PageFaultCount(4) + PeakWorkingSetSize(8) = 16
+        ws = ctypes.c_ulonglong.from_buffer(buf, 16)
+        return ws.value
+    except Exception:
+        return None
+
+
+def _auto_gc_run():
+    """执行一次自动 GC：EmptyWorkingSet trim。"""
+    _empty_working_set()
+
+
+def _auto_gc_timer():
+    """定期检查 auto_gc_enabled，触发时执行内存回收"""
+    try:
+        scene = safe_context_scene()
+        if scene is None:
+            return 5.0
+        state = get_state(scene=scene)
+        if state is None or not state.settings.auto_gc_enabled:
+            return 5.0
+    except Exception:
+        return 5.0
+    _auto_gc_run()
+    try:
+        interval = max(5.0, float(getattr(state.settings, "auto_gc_interval", 15) or 15))
+    except (TypeError, ValueError):
+        interval = 15.0
+    return interval
+
+
+def _start_auto_gc_timer():
+    global AUTO_GC_TIMER_HANDLE
+    _stop_auto_gc_timer()
+    AUTO_GC_TIMER_HANDLE = _auto_gc_timer
+    try:
+        bpy.app.timers.register(_auto_gc_timer, first_interval=10.0)
+    except Exception:
+        pass
+
+
+def _stop_auto_gc_timer():
+    global AUTO_GC_TIMER_HANDLE
+    if AUTO_GC_TIMER_HANDLE is not None:
+        try:
+            bpy.app.timers.unregister(AUTO_GC_TIMER_HANDLE)
+        except Exception:
+            pass
+        AUTO_GC_TIMER_HANDLE = None
+
+
+def register_shape_key_capture_scene_props():
+    bpy.types.Scene.sk_capture_interval = FloatProperty(
+        name="采样间隔",
+        description="每次采样之间的秒数",
+        default=1.0 / 60.0,
+        min=0.001,
+        soft_min=0.001,
+        soft_max=0.1,
+        precision=4,
+    )
+    bpy.types.Scene.sk_capture_include_basis = BoolProperty(
+        name="包含 Basis",
+        description="同时采集 Basis 形态键",
+        default=False,
+    )
+    bpy.types.Scene.sk_capture_only_selected = BoolProperty(
+        name="仅选中对象",
+        description="只采集当前选中的带形态键网格对象",
+        default=False,
+    )
+    bpy.types.Scene.sk_capture_skip_separator_keys = BoolProperty(
+        name="跳过分组键",
+        description="跳过 '-- ARKIT --' 这类分组/标签形态键",
+        default=True,
+    )
+    bpy.types.Scene.sk_capture_arkit_only = BoolProperty(
+        name="仅 ARKit 52 键",
+        description="只记录 ARKit 52 个主键",
+        default=False,
+    )
+    bpy.types.Scene.sk_capture_export_denoised = BoolProperty(
+        name="输出降噪曲线",
+        description="结束采集时自动输出 One Euro 降噪版 JSONL/CSV",
+        default=True,
+    )
+    bpy.types.Scene.sk_capture_denoise_deadband = FloatProperty(
+        name="死区阈值",
+        description="小于此值的微小抖动会被归零",
+        default=0.002,
+        min=0.0,
+        soft_max=0.05,
+        precision=4,
+    )
+    bpy.types.Scene.sk_capture_denoise_min_cutoff = FloatProperty(
+        name="One Euro Min Cutoff",
+        description="基础截止频率",
+        default=1.2,
+        min=0.01,
+        soft_max=10.0,
+        precision=3,
+    )
+    bpy.types.Scene.sk_capture_denoise_beta = FloatProperty(
+        name="One Euro Beta",
+        description="动态跟手强度",
+        default=0.15,
+        min=0.0,
+        soft_max=5.0,
+        precision=3,
+    )
+    bpy.types.Scene.sk_capture_denoise_d_cutoff = FloatProperty(
+        name="One Euro D Cutoff",
+        description="速度项的滤波截止频率",
+        default=1.0,
+        min=0.01,
+        soft_max=10.0,
+        precision=3,
+    )
+    bpy.types.Scene.sk_capture_running = BoolProperty(name="采集运行中", default=False)
+    bpy.types.Scene.sk_capture_status = StringProperty(name="采集状态", default="空闲")
+    bpy.types.Scene.sk_capture_session_dir = StringProperty(name="会话目录", default="")
+    bpy.types.Scene.sk_capture_sample_count = IntProperty(name="样本数", default=0, min=0)
+    bpy.types.Scene.sk_replay_file_path = StringProperty(
+        name="记录文件",
+        description="选择 samples.jsonl 或 samples_denoised.jsonl 文件",
+        default="",
+        subtype="FILE_PATH",
+    )
+    bpy.types.Scene.sk_replay_target_object = PointerProperty(name="目标物体", type=bpy.types.Object)
+    bpy.types.Scene.sk_replay_source_object = StringProperty(
+        name="源对象名",
+        description="不填时默认使用文件中的第一个 objects 项",
+        default="",
+    )
+    bpy.types.Scene.sk_replay_strength = FloatProperty(
+        name="投射强度",
+        description="将记录值乘以该强度再写入目标形态键",
+        default=1.0,
+        min=0.0,
+        soft_max=2.0,
+        precision=3,
+    )
+    bpy.types.Scene.sk_replay_speed = FloatProperty(
+        name="回放倍速",
+        description="实时回放倍速",
+        default=1.0,
+        min=0.01,
+        soft_max=4.0,
+        precision=3,
+    )
+    bpy.types.Scene.sk_replay_loop = BoolProperty(name="循环回放", description="播放到结尾后重新从头播放", default=False)
+    bpy.types.Scene.sk_replay_sample_index = IntProperty(
+        name="当前样本",
+        description="用于单样本应用或回放起点",
+        default=0,
+        min=0,
+    )
+    bpy.types.Scene.sk_replay_key_set = StringProperty(
+        name="验证套件",
+        description="数据回放时验证全部、ARKit 或 MMD 形态键",
+        default="AUTO",
+    )
+    bpy.types.Scene.sk_replay_running = BoolProperty(name="回放运行中", default=False)
+    bpy.types.Scene.sk_replay_status = StringProperty(name="回放状态", default="空闲")
+    bpy.types.Scene.sk_replay_mapped_count = IntProperty(name="映射键数", default=0, min=0)
+    bpy.types.Scene.sk_replay_total_source_keys = IntProperty(name="源键数", default=0, min=0)
+    bpy.types.Scene.sk_replay_total_samples = IntProperty(name="总样本数", default=0, min=0)
+
+
+def unregister_shape_key_capture_scene_props():
+    prop_names = (
+        "sk_capture_interval",
+        "sk_capture_include_basis",
+        "sk_capture_only_selected",
+        "sk_capture_skip_separator_keys",
+        "sk_capture_arkit_only",
+        "sk_capture_export_denoised",
+        "sk_capture_denoise_deadband",
+        "sk_capture_denoise_min_cutoff",
+        "sk_capture_denoise_beta",
+        "sk_capture_denoise_d_cutoff",
+        "sk_capture_running",
+        "sk_capture_status",
+        "sk_capture_session_dir",
+        "sk_capture_sample_count",
+        "sk_replay_file_path",
+        "sk_replay_target_object",
+        "sk_replay_source_object",
+        "sk_replay_strength",
+        "sk_replay_speed",
+        "sk_replay_loop",
+        "sk_replay_sample_index",
+        "sk_replay_key_set",
+        "sk_replay_running",
+        "sk_replay_status",
+        "sk_replay_mapped_count",
+        "sk_replay_total_source_keys",
+        "sk_replay_total_samples",
+    )
+    for prop_name in prop_names:
+        if hasattr(bpy.types.Scene, prop_name):
+            delattr(bpy.types.Scene, prop_name)
+
+
 def register():
     global LOAD_HANDLER_REGISTERED, IS_INITIALIZING_ADDON
     IS_INITIALIZING_ADDON = True
 
     try:
+        repair_problematic_panel_draw_callbacks()
+
         for cls in CLASSES:
             bpy.utils.register_class(cls)
 
         for prop_name in SPACE_STATE_PROP_NAMES.values():
             setattr(bpy.types.Scene, prop_name, PointerProperty(type=BWFLOW_PG_State))
+        bpy.types.Scene.bwflow_shape_key_inspector_items = CollectionProperty(type=BWFLOW_PG_ShapeKeyInspectorItem)
+        bpy.types.Scene.bwflow_shape_key_inspector_index = IntProperty(default=-1, update=on_shape_key_inspector_index_changed)
+        register_shape_key_capture_scene_props()
 
         scenes = iter_available_scenes()
         for scene in scenes:
@@ -10603,9 +15971,18 @@ def register():
     finally:
         IS_INITIALIZING_ADDON = False
 
+    _start_auto_gc_timer()
+
 
 def unregister():
     global LOAD_HANDLER_REGISTERED
+
+    try:
+        quarantine_broken_panel_polls()
+    except Exception:
+        traceback.print_exc()
+
+    _stop_auto_gc_timer()
 
     try:
         _cancel_tracked_one_shot_timers()
@@ -10655,7 +16032,15 @@ def unregister():
         except Exception:
             traceback.print_exc()
     try:
+        unregister_shape_key_capture_scene_props()
+    except Exception:
+        traceback.print_exc()
+    try:
         uninstall_panel_poll_overrides()
+    except Exception:
+        traceback.print_exc()
+    try:
+        restore_problematic_panel_draw_callbacks()
     except Exception:
         traceback.print_exc()
     try:
@@ -10664,6 +16049,10 @@ def unregister():
         traceback.print_exc()
     FILE_TEXT_CACHE.clear()
     FILE_JSON_CACHE.clear()
+    IMAGE_PREVIEW_ICON_CACHE.clear()
+    MODULE_RUNTIME_NAMESPACE_CACHE.clear()
+    MODULE_SOURCE_TEXT_CACHE.clear()
+    MODULE_RUNTIME_FIELD_INIT_CACHE.clear()
     BUILTIN_SCRIPT_LIBRARY_PAYLOAD_CACHE["signature"] = None
     BUILTIN_SCRIPT_LIBRARY_PAYLOAD_CACHE["payloads"] = []
     MODULE_RUNTIME_CLEANUP_CACHE.clear()
@@ -10676,6 +16065,12 @@ def unregister():
     LOAD_HANDLER_REGISTERED = False
 
     for prop_name in SPACE_STATE_PROP_NAMES.values():
+        try:
+            if hasattr(bpy.types.Scene, prop_name):
+                delattr(bpy.types.Scene, prop_name)
+        except Exception:
+            traceback.print_exc()
+    for prop_name in ("bwflow_shape_key_inspector_items", "bwflow_shape_key_inspector_index"):
         try:
             if hasattr(bpy.types.Scene, prop_name):
                 delattr(bpy.types.Scene, prop_name)

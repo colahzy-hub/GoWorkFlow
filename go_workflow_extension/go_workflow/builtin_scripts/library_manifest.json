@@ -1,39 +1,50 @@
 [
   {
     "name": "口型生成（Go Workflow 面板版）",
-    "description": "Go Workflow 自定义面板版口型生成，可直接在工作流里选择是否先用 ARKit 形态键合成 AA/OH/CH，再生成 VRChat / MMD 口型。",
+    "description": "Go Workflow 自定义面板版口型生成。可先用 ARKit 源键生成 AA/OH/CH，再批量生成 VRChat / MMD 口型，适合把现有 ARKit 口部形态快速转成可用口型集。",
     "tags": "go_workflow_builtin,viseme,mmd,arkit,口型,自定义面板",
     "use_custom_panel": true,
     "panel_title": "口型生成 / AA-OH-CH",
-    "panel_description": "在 Go Workflow 模块面板中生成口型，支持先用 ARKit 源键生成 AA/OH/CH，再继续生成目标口型。",
+    "panel_description": "在模块面板内配置目标物体、AA/OH/CH 键名、生成目标、覆盖策略和强度；可选先生成基础口型键，再继续生成最终口型。",
     "script_file": "viseme_generator_module.py",
     "script_path_mode": "embedded",
-    "ai_doc": "Go Workflow 模块。必须定义 run(context, scene, workflow, module)。目标物体需要是带形态键的网格。自定义面板提供 AA/OH/CH 键名、是否先用 ARKit 形态键合成 AA/OH/CH、VRChat/MMD 目标、覆盖开关和强度参数。启用 ARKit 预生成时，会先按内置 ARKit 配方生成或覆盖 AA/OH/CH，再继续生成口型。"
+    "ai_doc": "Go Workflow 模块。用途：把基础口型键 AA/OH/CH 批量混合成 VRChat 或 MMD 口型。输入要求：目标物体必须是带形态键的网格；如果启用“先用 ARKit 形态键合成 AA/OH/CH”，则目标物体还需要存在 JawOpen、MouthFunnel、MouthPucker、MouthSmileLeft/Right、MouthStretchLeft/Right 等 ARKit 口部源键。面板参数：目标物体、是否先合成 AA/OH/CH、AA/OH/CH 键名、生成目标（VRChat/MMD/全部）、VRChat 前缀、MMD 日文键名、强度、是否覆盖已有目标键。运行结果：根据配方创建或覆盖目标口型键，并在状态区返回新建/更新/跳过数量。适用场景：已有 ARKit 口部键，想快速得到可用的 VRChat viseme 或 MMD 元音口型。"
   },
   {
     "name": "ARKit 形态键合成",
-    "description": "用已有 ARKit / Perfect Sync 形态键合成目标形态键，可切换 VRM / MMD 目标集、常规 / 激进混合率，并支持 csv/txt 混合表导入导出与随预设内嵌保存。",
+    "description": "用已有 ARKit / Perfect Sync 形态键合成目标形态键。支持 VRM / MMD 目标集切换、混合策略切换，以及 csv/txt 混合表导入导出和随预设保存。",
     "tags": "go_workflow_builtin,arkit,shape-key,合成,vrm,mmd",
     "use_custom_panel": true,
     "panel_title": "ARKit 形态键合成",
-    "panel_description": "可切换 VRM 基础或 MMD 部分目标键，并把 csv/txt 混合系数表导入到当前工作流模块，随 .goworkflow 一起导出。",
+    "panel_description": "可在面板中切换目标集和混合策略，维护当前模块内嵌的混合表，并与 .goworkflow 一起保存或导出。",
     "script_file": "arkit_shape_synthesis.py",
     "script_path_mode": "embedded",
     "replace": {
       "__TARGET_SET__": "VRM_BASIC",
       "__PROFILE__": "CONSERVATIVE"
     },
-    "ai_doc": "Go Workflow 模块。需要目标网格已有 ARKit / Perfect Sync 形态键；支持 VRM/MMD 目标集切换、常规/激进混合率，以及 csv/txt 混合表导入到模块内嵌配置后随 .goworkflow 导出。"
+    "ai_doc": "Go Workflow 模块。用途：把 ARKit / Perfect Sync 源形态键按预设混合规则合成为目标形态键。输入要求：目标网格需要已经存在可用的 ARKit 源键；目标输出可选择 VRM 基础集或 MMD 局部集。面板能力：切换目标集、切换混合策略、导入或导出 csv/txt 混合表、把混合表存进模块配置并随 .goworkflow 一起保存。运行结果：根据当前混合表对目标键进行创建或覆盖。适用场景：从一套 ARKit 形态快速推导出 VRM/MMD 目标键，或维护项目自己的混合系数表。"
   },
   {
     "name": "形态键鉴定",
-    "description": "扫描当前物体形态键中哪些相对其 relative_key 完全无位移并标记为空形态键；找不到 relative_key 时回退 Basis。支持列表点击切换当前形态键，并在编辑模式里选出当前活动形态键相对参考键发生位移的顶点。",
+    "description": "扫描当前物体的形态键，识别相对参考键没有位移的空键。支持列表点击同步 Blender 原生形态键，并可在编辑模式选出差异顶点。",
     "tags": "go_workflow_builtin,shape-key,inspector,空形态键,编辑模式,自定义面板",
     "use_custom_panel": true,
     "panel_title": "形态键鉴定",
-    "panel_description": "刷新空形态键列表，按 relative_key/Basis 规则识别空键；点击可同步切换当前形态键，并可在编辑模式选择与参考键不同的顶点。",
+    "panel_description": "刷新空键列表，按 relative_key 优先、Basis 回退的规则识别空键；列表项可直接联动当前活动形态键。",
     "script_file": "shape_key_inspector_module.py",
     "script_path_mode": "embedded",
-    "ai_doc": "Go Workflow 模块。用于检查目标网格的形态键列表，优先以 relative_key 为参考判断当前键每个点的相对位移是否近似为 0；找不到 relative_key 时回退 Basis。命中后缓存为空形态键列表；支持点击列表项切换当前活动形态键，支持在编辑模式把当前活动形态键相对参考键发生变化的顶点选出来。面板参数包括目标物体、空键搜索和列表显示上限。"
+    "ai_doc": "Go Workflow 模块。用途：扫描目标网格的形态键，识别空键并辅助定位问题键。判定逻辑：优先以每个键自己的 relative_key 为参考；如果该参考不可用，则回退 Basis；当所有顶点相对位移都接近 0 时判定为空键。面板能力：选择目标物体、执行扫描、显示空键结果列表、点击列表项同步切换当前活动形态键、在编辑模式选择当前活动键相对参考键发生变化的顶点。输出结果：缓存空键列表并写入状态区。适用场景：检查 ARKit、口型或自定义形态键中哪些键实际上没有有效位移。"
+  },
+  {
+    "name": "形态键实时采集记录器（Go Workflow版）",
+    "description": "在 Go Workflow 自定义面板中进行形态键实时采集、降噪导出、样本投射、映射分析和回放。",
+    "tags": "go_workflow_builtin,shape-key,capture,recorder,replay,arkit",
+    "use_custom_panel": true,
+    "panel_title": "形态键实时采集记录器",
+    "panel_description": "用于采集当前形态键变化，导出 samples 文件，并把记录样本重新映射回目标物体；面板内可直接分析映射、应用当前样本和回放。",
+    "script_file": "shape_key_capture_recorder_module.py",
+    "script_path_mode": "embedded",
+    "ai_doc": "Go Workflow 模块。用途：记录当前场景中形态键随时间的变化，并把记录结果重新投射到目标物体上。采集部分：支持采样间隔、是否包含 Basis、仅采集选中物体、跳过分隔键、仅 ARKit 键、One Euro 降噪导出。输出文件：samples.jsonl、samples_flat.csv，以及可选的 samples_denoised.jsonl、samples_denoised.csv、summary.json、curve_report.json。回放部分：可指定记录文件、目标物体、源对象名、投射强度、回放速度、循环开关和当前样本索引。交互流程：先分析映射，再应用当前样本或开始回放。状态字段：面板会显示当前样本、回放状态、映射键数量、样本总数，并在运行过程中同步 scene.sk_replay_* 属性。适用场景：录制真人面捕/测试滑条数据，检查映射是否正确，或把历史样本重新投射到当前模型。"
   }
 ]

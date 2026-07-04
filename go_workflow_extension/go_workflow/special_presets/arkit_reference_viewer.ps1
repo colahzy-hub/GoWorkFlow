@@ -20,6 +20,9 @@ $script:ViewerMediaCount = 0
 $script:ViewerActivated = $false
 $script:StateLastWriteUtc = [DateTime]::MinValue
 $script:StateLastLength = -1
+$script:MediaCache = @{}
+$script:CurrentMediaKey = ""
+$script:PreloadQueue = @()
 
 function To-DisplayText {
     param([object]$Value)
@@ -38,6 +41,12 @@ function Write-ViewerLog {
     } catch {}
 }
 
+function Test-RemoteUrl {
+    param([string]$Value)
+    $text = To-DisplayText $Value
+    return $text.StartsWith('http://') -or $text.StartsWith('https://')
+}
+
 function Get-BulletText {
     param([object[]]$Lines)
     if (-not $Lines) {
@@ -53,8 +62,114 @@ function Get-BulletText {
     return ($items -join [Environment]::NewLine)
 }
 
+function Clear-MediaCache {
+    param([string[]]$KeepKeys = @())
+    $keep = @{}
+    foreach ($key in @($KeepKeys)) {
+        if ($key) {
+            $keep[$key] = $true
+        }
+    }
+    foreach ($key in @($script:MediaCache.Keys)) {
+        if ($keep.ContainsKey($key)) {
+            continue
+        }
+        try {
+            $entry = $script:MediaCache[$key]
+            if ($null -ne $entry.Image) {
+                $entry.Image.Dispose()
+            }
+            if ($null -ne $entry.Stream) {
+                $entry.Stream.Dispose()
+            }
+        } catch {}
+        $script:MediaCache.Remove($key)
+    }
+}
+
 function Stop-CurrentMedia {
     param()
+    Clear-MediaCache
+}
+
+function Get-MediaBytes {
+    param([string]$Path)
+    if (Test-RemoteUrl $Path) {
+        $client = New-Object System.Net.WebClient
+        try {
+            $client.Headers.Set("User-Agent", "Mozilla/5.0 GoWorkflowReferenceViewer")
+            return $client.DownloadData($Path)
+        } finally {
+            $client.Dispose()
+        }
+    }
+    return [System.IO.File]::ReadAllBytes($Path)
+}
+
+function Get-MediaImage {
+    param([string]$Path)
+    $key = To-DisplayText $Path
+    if ($script:MediaCache.ContainsKey($key)) {
+        return $script:MediaCache[$key].Image
+    }
+    $bytes = Get-MediaBytes -Path $Path
+    $stream = New-Object System.IO.MemoryStream(,$bytes)
+    $image = [System.Drawing.Image]::FromStream($stream, $false, $false)
+    $script:MediaCache[$key] = [pscustomobject]@{
+        Image = $image
+        Stream = $stream
+        Touched = [DateTime]::UtcNow
+    }
+    return $image
+}
+
+function Queue-MediaPreload {
+    param([object[]]$PreloadMedia = @())
+    $queue = @()
+    foreach ($entry in @($PreloadMedia)) {
+        $text = (To-DisplayText $entry).Trim()
+        if ($text -and -not $script:MediaCache.ContainsKey($text) -and $text -ne $script:CurrentMediaKey -and -not $queue.Contains($text)) {
+            $queue += $text
+        }
+    }
+    $script:PreloadQueue = $queue
+}
+
+function Consume-MediaPreload {
+    param([int]$MaxItems = 1)
+    if (-not $script:PreloadQueue -or $script:PreloadQueue.Count -le 0) {
+        return
+    }
+    $take = [Math]::Min($MaxItems, $script:PreloadQueue.Count)
+    $batch = @($script:PreloadQueue | Select-Object -First $take)
+    $script:PreloadQueue = @($script:PreloadQueue | Select-Object -Skip $take)
+    foreach ($path in $batch) {
+        try {
+            [void](Get-MediaImage -Path $path)
+        } catch {
+            Write-ViewerLog ("预加载失败: {0} | {1}" -f $path, $_.Exception.Message)
+        }
+    }
+}
+
+function Set-ViewerImage {
+    param(
+        [System.Windows.Forms.PictureBox]$PictureBox,
+        [string]$Path,
+        [object[]]$PreloadMedia = @()
+    )
+    $image = Get-MediaImage -Path $Path
+    $PictureBox.Image = $image
+    $script:CurrentMediaKey = To-DisplayText $Path
+    Queue-MediaPreload -PreloadMedia $PreloadMedia
+    $keep = @($script:CurrentMediaKey)
+    foreach ($entry in @($PreloadMedia)) {
+        $text = (To-DisplayText $entry).Trim()
+        if ($text) {
+            $keep += $text
+        }
+    }
+    Clear-MediaCache -KeepKeys $keep
 }
 
 function Focus-ViewerWindow {
@@ -88,64 +203,6 @@ function Center-NavButtons {
     $NextButton.Top = [int](($Panel.ClientSize.Height - $NextButton.Height) / 2)
 }
 
-function Write-ViewerHtml {
-    param(
-        [string]$MediaPath,
-        [string]$HtmlPath
-    )
-
-    $ext = [System.IO.Path]::GetExtension($MediaPath).ToLowerInvariant()
-    $mime = switch ($ext) {
-        ".gif" { "image/gif"; break }
-        ".png" { "image/png"; break }
-        ".jpg" { "image/jpeg"; break }
-        ".jpeg" { "image/jpeg"; break }
-        ".bmp" { "image/bmp"; break }
-        ".webp" { "image/webp"; break }
-        default { "application/octet-stream"; break }
-    }
-    $bytes = [System.IO.File]::ReadAllBytes($MediaPath)
-    $base64 = [System.Convert]::ToBase64String($bytes)
-    $url = "data:{0};base64,{1}" -f $mime, $base64
-    $html = @"
-<html>
-<head>
-<meta http-equiv='X-UA-Compatible' content='IE=edge' />
-<meta charset='utf-8' />
-<style>
-html, body {
-    margin: 0;
-    padding: 0;
-    width: 100%;
-    height: 100%;
-    overflow: hidden;
-    background: rgb(214,214,214);
-}
-body {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}
-img {
-    display: block;
-    max-width: 100%;
-    max-height: 100%;
-    width: auto;
-    height: auto;
-    object-fit: contain;
-    image-rendering: auto;
-}
-</style>
-</head>
-<body>
-<img src="$url" />
-</body>
-</html>
-"@
-    [System.IO.File]::WriteAllText($HtmlPath, $html, [System.Text.Encoding]::UTF8)
-    return [System.Uri]::new($HtmlPath)
-}
-
 function Set-ViewerContent {
     param(
         [pscustomobject]$Data,
@@ -158,7 +215,7 @@ function Set-ViewerContent {
         [System.Windows.Forms.Label]$DetailLabel,
         [System.Windows.Forms.Label]$MixLabel,
         [System.Windows.Forms.Label]$MediaLabel,
-        [System.Windows.Forms.WebBrowser]$Browser
+        [System.Windows.Forms.PictureBox]$PictureBox
     )
 
     $signature = @(
@@ -189,11 +246,12 @@ function Set-ViewerContent {
     } catch {}
 
     $mediaFiles = @($Data.media_files)
+    $preloadFiles = @($Data.preload_media_files)
     $mediaCount = $mediaFiles.Count
     $script:ViewerMediaCount = $mediaCount
     if ($mediaCount -le 0) {
         $MediaLabel.Text = "当前步骤没有参考图"
-        $Browser.DocumentText = "<html><body style='margin:0;background:#d6d6d6;display:flex;align-items:center;justify-content:center;font-family:Microsoft YaHei UI;'><div style='color:#444;'>当前步骤没有参考图</div></body></html>"
+        $PictureBox.Image = $null
         return
     }
 
@@ -202,19 +260,17 @@ function Set-ViewerContent {
     $path = [string]$mediaFiles[$mediaIndex]
     $MediaLabel.Text = "当前图 $($mediaIndex + 1) / $mediaCount    $(Split-Path $path -Leaf)"
 
-    if (-not (Test-Path -LiteralPath $path)) {
+    if ((-not (Test-RemoteUrl $path)) -and (-not (Test-Path -LiteralPath $path))) {
         $MediaLabel.Text = "未找到参考图: $path"
-        $Browser.DocumentText = "<html><body style='margin:0;background:#d6d6d6;display:flex;align-items:center;justify-content:center;font-family:Microsoft YaHei UI;'><div style='color:#444;'>未找到参考图</div></body></html>"
+        $PictureBox.Image = $null
         return
     }
 
     try {
-        $htmlPath = [System.IO.Path]::ChangeExtension($StateFile, ".viewer.html")
-        $htmlUri = Write-ViewerHtml -MediaPath $path -HtmlPath $htmlPath
-        $Browser.Navigate($htmlUri)
+        Set-ViewerImage -PictureBox $PictureBox -Path $path -PreloadMedia $preloadFiles
     } catch {
         $MediaLabel.Text = "参考图加载失败: $path"
-        $Browser.DocumentText = "<html><body style='margin:0;background:#d6d6d6;display:flex;align-items:center;justify-content:center;font-family:Microsoft YaHei UI;'><div style='color:#444;'>参考图加载失败</div></body></html>"
+        $PictureBox.Image = $null
         Write-ViewerLog ("参考图加载失败: {0} | {1}" -f $path, $_.Exception.Message)
     }
 }
@@ -275,19 +331,16 @@ $mediaLabel = New-WrapLabel -Left 12 -Top 58 -Width 460 -Height 22
 $mediaLabel.ForeColor = $uiMuted
 $form.Controls.Add($mediaLabel)
 
-$browser = New-Object System.Windows.Forms.WebBrowser
-$browser.Left = 0
-$browser.Top = 0
-$browser.Width = 500
-$browser.Height = 500
-$browser.Anchor = "Top,Bottom,Left,Right"
-$browser.ScrollBarsEnabled = $false
-$browser.IsWebBrowserContextMenuEnabled = $false
-$browser.WebBrowserShortcutsEnabled = $false
-$browser.AllowNavigation = $true
-$browser.ScriptErrorsSuppressed = $true
-$browser.MinimumSize = New-Object System.Drawing.Size(20, 20)
-$form.Controls.Add($browser)
+$pictureBox = New-Object System.Windows.Forms.PictureBox
+$pictureBox.Left = 0
+$pictureBox.Top = 0
+$pictureBox.Width = 500
+$pictureBox.Height = 500
+$pictureBox.Anchor = "Top,Bottom,Left,Right"
+$pictureBox.BackColor = $uiSurface
+$pictureBox.SizeMode = "Zoom"
+$pictureBox.MinimumSize = New-Object System.Drawing.Size(20, 20)
+$form.Controls.Add($pictureBox)
 
 $navPanel = New-Object System.Windows.Forms.Panel
 $navPanel.Left = 0
@@ -393,6 +446,8 @@ foreach ($control in @(
 
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 220
+$preloadTimer = New-Object System.Windows.Forms.Timer
+$preloadTimer.Interval = 350
 $stateInfo = Get-Item -LiteralPath $StateFile
 $script:StateLastWriteUtc = $stateInfo.LastWriteTimeUtc
 $script:StateLastLength = $stateInfo.Length
@@ -416,7 +471,7 @@ function Invoke-ViewerUpdate {
         $script:StateLastLength = $file.Length
         $json = Get-Content -LiteralPath $StateFile -Raw -Encoding UTF8
         $data = $json | ConvertFrom-Json
-        Set-ViewerContent -Data $data -Form $form -TitleLabel $titleLabel -StepLabel $stepLabel -SummaryLabel $summaryLabel -NotesLabel $notesLabel -TipsLabel $tipsLabel -DetailLabel $detailLabel -MixLabel $mixLabel -MediaLabel $mediaLabel -Browser $browser
+        Set-ViewerContent -Data $data -Form $form -TitleLabel $titleLabel -StepLabel $stepLabel -SummaryLabel $summaryLabel -NotesLabel $notesLabel -TipsLabel $tipsLabel -DetailLabel $detailLabel -MixLabel $mixLabel -MediaLabel $mediaLabel -PictureBox $pictureBox
         if ($Force) {
             Focus-ViewerWindow -Form $form
         }
@@ -446,17 +501,25 @@ $nextButton.Add_Click({
 $timer.Add_Tick({
     Invoke-ViewerUpdate -Force $false
 })
+$preloadTimer.Add_Tick({
+    Consume-MediaPreload -MaxItems 1
+})
 $form.Add_Shown({
     try {
         [System.IO.File]::WriteAllText($PidFile, [System.Diagnostics.Process]::GetCurrentProcess().Id.ToString(), [System.Text.Encoding]::UTF8)
     } catch {}
     Invoke-ViewerUpdate -Force $true
     $timer.Start()
+    $preloadTimer.Start()
 })
 
 $form.Add_FormClosed({
     $timer.Stop()
+    $preloadTimer.Stop()
     Stop-CurrentMedia
+    try {
+        Remove-Item -LiteralPath $StateFile -Force -ErrorAction SilentlyContinue
+    } catch {}
     try {
         if ((Test-Path -LiteralPath $PidFile) -and ((Get-Content -LiteralPath $PidFile -Raw -Encoding UTF8).Trim() -eq [System.Diagnostics.Process]::GetCurrentProcess().Id.ToString())) {
             Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue
