@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "go_workflow"
-version = "0.9.1"
+version = "0.9.2"
 name = "Go工作流 / Go Workflow"
 tagline = "工作流 N 面板筛选与脚本模块管理"
 maintainer = "OpenAI Codex"

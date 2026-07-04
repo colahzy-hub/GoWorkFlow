@@ -26,8 +26,8 @@ _UNDO_PLAYBACK_STATE = {"changed": False, "original": None}
 ANIMATION_TIMER_INTERVAL = 0.04
 ANIMATION_DURATION_PER_KEY = 1.0
 ANIMATION_STATUS_INTERVAL = 0.2
-FULL_VALIDATION_TOTAL_SECONDS = 15.0
-FULL_VALIDATION_TARGET_FRAMES = 600
+FULL_VALIDATION_TOTAL_SECONDS = 33.0
+FULL_VALIDATION_TARGET_FRAMES = 1000
 FULL_VALIDATION_PLAYBACK_FPS = 30.0
 FULL_VALIDATION_TIMER_INTERVAL = 1.0 / max(60.0, FULL_VALIDATION_PLAYBACK_FPS * 2.0)
 PREVIEW_IDLE_RELEASE_SECONDS = 2.0
@@ -2626,6 +2626,344 @@ def _build_full_validation_plan(resolved_states, start_frame, fps, total_seconds
         )
         previous_values = dict(target_values)
         cursor = int(end_frame) + 1
+
+    end_frame = int(segments[-1]["end_frame"]) if segments else int(start_frame)
+    frame_span = max(1, end_frame - int(start_frame))
+    actual_total_seconds = max(float(total_seconds), float(frame_span) / fps)
+    return {
+        "object_name": str(object_name or ""),
+        "action_name": str(action_name or ""),
+        "start_frame": int(start_frame),
+        "end_frame": end_frame,
+        "total_seconds": float(actual_total_seconds),
+        "fps": float(fps),
+        "target_frames": int(target_frames or 0),
+        "segments": segments,
+    }
+
+
+def _resolve_full_validation_states_for_object(key_blocks, items, target_count=70):
+    del items, target_count
+    available_names = [str(getattr(key_block, "name", "") or "") for index, key_block in enumerate(key_blocks or []) if index != 0]
+    resolved = []
+    for state in _full_validation_core_state_specs():
+        next_state = _full_validation_available_state(state, available_names)
+        if next_state is not None:
+            resolved.append(next_state)
+    if resolved:
+        return resolved
+    return _resolve_validation_state_specs_for_object(key_blocks, FULL_VALIDATION_STATES, allow_empty=False)
+
+
+def _state_target_values(state):
+    target_values = {}
+    for key_name, value in dict((state or {}).get("base_weights", {}) or {}).items():
+        target_values[str(key_name)] = max(0.0, min(1.0, float(value or 0.0)))
+    for key_name, value in dict((state or {}).get("weights", {}) or {}).items():
+        target_values[str(key_name)] = max(0.0, min(1.0, float(value or 0.0)))
+
+    target_values = _soften_opposing_target_values(target_values)
+    jaw_open = max(0.0, min(1.0, float(target_values.get("JawOpen", 0.0) or 0.0)))
+    blink_left = max(0.0, min(1.0, float(target_values.get("EyeBlinkLeft", 0.0) or 0.0)))
+    blink_right = max(0.0, min(1.0, float(target_values.get("EyeBlinkRight", 0.0) or 0.0)))
+    squint_left = max(0.0, min(1.0, float(target_values.get("EyeSquintLeft", 0.0) or 0.0)))
+    squint_right = max(0.0, min(1.0, float(target_values.get("EyeSquintRight", 0.0) or 0.0)))
+    pucker = max(0.0, min(1.0, float(target_values.get("MouthPucker", 0.0) or 0.0)))
+    funnel = max(0.0, min(1.0, float(target_values.get("MouthFunnel", 0.0) or 0.0)))
+    mouth_close = max(0.0, min(1.0, float(target_values.get("MouthClose", 0.0) or 0.0)))
+
+    if "EyeWideLeft" in target_values:
+        target_values["EyeWideLeft"] = max(0.0, min(1.0, float(target_values["EyeWideLeft"]) * (1.0 - (0.85 * blink_left)) * (1.0 - (0.62 * squint_left))))
+    if "EyeWideRight" in target_values:
+        target_values["EyeWideRight"] = max(0.0, min(1.0, float(target_values["EyeWideRight"]) * (1.0 - (0.85 * blink_right)) * (1.0 - (0.62 * squint_right))))
+
+    if pucker > 0.0 or funnel > 0.0:
+        if jaw_open > 0.58:
+            target_values["MouthPucker"] = pucker * (1.0 - (0.30 * jaw_open))
+            target_values["MouthFunnel"] = funnel * (1.0 - (0.16 * jaw_open))
+        target_values["JawOpen"] = max(jaw_open, max(funnel * 0.42, pucker * 0.24))
+        jaw_open = max(0.0, min(1.0, float(target_values.get("JawOpen", 0.0) or 0.0)))
+
+    if jaw_open > 0.0:
+        target_values["MouthLowerDownLeft"] = max(float(target_values.get("MouthLowerDownLeft", 0.0) or 0.0), jaw_open * 0.12)
+        target_values["MouthLowerDownRight"] = max(float(target_values.get("MouthLowerDownRight", 0.0) or 0.0), jaw_open * 0.12)
+        target_values["MouthStretchLeft"] = max(float(target_values.get("MouthStretchLeft", 0.0) or 0.0), jaw_open * 0.08)
+        target_values["MouthStretchRight"] = max(float(target_values.get("MouthStretchRight", 0.0) or 0.0), jaw_open * 0.08)
+
+    if mouth_close > 0.0:
+        target_values["JawOpen"] = max(jaw_open, mouth_close)
+        target_values["MouthClose"] = min(mouth_close, float(target_values.get("JawOpen", 0.0) or 0.0))
+        for conflict_key in ("MouthPressLeft", "MouthPressRight", "MouthPucker", "MouthFunnel", "MouthShrugUpper", "MouthShrugLower"):
+            if conflict_key in target_values:
+                target_values[conflict_key] = min(float(target_values.get(conflict_key, 0.0) or 0.0), 0.05)
+
+    return _enforce_mouth_close_not_above_jaw_open(target_values)
+
+
+def _build_full_validation_plan(resolved_states, start_frame, fps, total_seconds, action_name, object_name, target_frames=FULL_VALIDATION_TARGET_FRAMES, tail_states=None):
+    fps = max(1.0, float(fps))
+    tail_states = list(tail_states or FULL_VALIDATION_TEXT_MIX_STATES or [])
+    resolved_states = list(resolved_states or [])
+    target_frame_count = max(1, int(target_frames or FULL_VALIDATION_TARGET_FRAMES))
+    core_frame_budget = max(len(resolved_states) * 8, int(round(target_frame_count * 0.86)))
+    tail_frame_budget = int(round(target_frame_count * 0.14)) if tail_states else 0
+    core_weight = sum(max(0.2, float((state or {}).get("seconds", 0.5) or 0.5)) for state in resolved_states) or 1.0
+    tail_weight = sum(max(0.1, float((state or {}).get("seconds", 0.3) or 0.3)) for state in tail_states) or 1.0
+    cursor = int(start_frame)
+    segments = []
+    previous_values = {}
+
+    def append_state(state, frame_budget, weight_total, min_span, fallback_name="mix"):
+        nonlocal cursor, previous_values
+        weight = max(0.1, float((state or {}).get("seconds", 0.4) or 0.4))
+        current_span = max(int(min_span), int(round(float(frame_budget) * (weight / float(weight_total or 1.0)))))
+        transition_ratio = max(0.30, min(0.78, float((state or {}).get("transition_ratio", 0.50) or 0.50)))
+        transition_frames = max(3, min(current_span - 2, int(round(current_span * transition_ratio))))
+        hold_frames = max(2, current_span - transition_frames)
+        target_values = _state_target_values(state)
+        peak_frame = cursor + transition_frames
+        hold_end_frame = peak_frame + hold_frames
+        segments.append(
+            {
+                "index": len(segments) + 1,
+                "name": str((state or {}).get("name", fallback_name) or fallback_name),
+                "start_frame": int(cursor),
+                "peak_frame": int(peak_frame),
+                "hold_end_frame": int(hold_end_frame),
+                "end_frame": int(hold_end_frame),
+                "from_values": _enforce_mouth_close_not_above_jaw_open(previous_values),
+                "base_weights": dict((state or {}).get("base_weights", {}) or {}),
+                "weights": dict((state or {}).get("weights", {}) or {}),
+                "target_values": target_values,
+                "curve_mode": _full_validation_curve_mode(state),
+            }
+        )
+        previous_values = dict(target_values)
+        cursor = int(hold_end_frame) + 1
+
+    for state in resolved_states:
+        append_state(state, core_frame_budget, core_weight, 14)
+    if previous_values:
+        append_state({"name": "Return To Base Before Capture Tail", "seconds": 0.36, "transition_ratio": 0.72, "weights": {}}, int(round(fps * 0.36)), 0.36, 10)
+        previous_values = {}
+    for state in tail_states:
+        append_state(state, tail_frame_budget, tail_weight, 8, fallback_name="Capture Tail")
+    if previous_values:
+        append_state({"name": "Return To Zero", "seconds": 0.28, "transition_ratio": 0.82, "weights": {}}, int(round(fps * 0.28)), 0.28, 8)
+
+    end_frame = int(segments[-1]["end_frame"]) if segments else int(start_frame)
+    frame_span = max(1, end_frame - int(start_frame))
+    actual_total_seconds = max(float(total_seconds), float(frame_span) / fps)
+    return {
+        "object_name": str(object_name or ""),
+        "action_name": str(action_name or ""),
+        "start_frame": int(start_frame),
+        "end_frame": end_frame,
+        "total_seconds": float(actual_total_seconds),
+        "fps": float(fps),
+        "target_frames": int(target_frames or 0),
+        "segments": segments,
+    }
+
+
+# Final full-validation override.  This replaces the older emotion-heavy preset
+# with a deterministic ARKit blend-check sequence plus a short mocap-like tail.
+FULL_VALIDATION_TEXT_MIX_STATES = [
+    {"name": "Capture Tail Neutral", "seconds": 0.42, "transition_ratio": 0.72, "weights": {"EyeLookDownLeft": 0.10, "EyeLookDownRight": 0.10, "BrowInnerUp": 0.06, "JawOpen": 0.06}},
+    {"name": "Capture Tail Eye Lead", "seconds": 0.32, "transition_ratio": 0.46, "weights": {"EyeLookOutLeft": 0.24, "EyeLookInRight": 0.24, "EyeSquintLeft": 0.10, "BrowOuterUpLeft": 0.10}},
+    {"name": "Capture Tail Soft Smile", "seconds": 0.36, "transition_ratio": 0.54, "weights": {"MouthSmileLeft": 0.36, "MouthSmileRight": 0.28, "MouthDimpleLeft": 0.16, "CheekSquintLeft": 0.14, "CheekSquintRight": 0.10, "EyeSquintLeft": 0.08}},
+    {"name": "Capture Tail Speech A", "seconds": 0.30, "transition_ratio": 0.44, "weights": {"JawOpen": 0.48, "MouthLowerDownLeft": 0.30, "MouthLowerDownRight": 0.28, "MouthStretchLeft": 0.20, "MouthStretchRight": 0.18}},
+    {"name": "Capture Tail Speech O", "seconds": 0.28, "transition_ratio": 0.42, "weights": {"JawOpen": 0.34, "MouthFunnel": 0.46, "MouthPucker": 0.22, "MouthShrugUpper": 0.10}},
+    {"name": "Capture Tail Blink Accent", "seconds": 0.24, "transition_ratio": 0.34, "weights": {"EyeBlinkLeft": 0.92, "EyeBlinkRight": 0.86, "EyeSquintLeft": 0.20, "EyeSquintRight": 0.18, "CheekSquintLeft": 0.12, "CheekSquintRight": 0.10}},
+    {"name": "Capture Tail Wide Beat", "seconds": 0.32, "transition_ratio": 0.42, "weights": {"BrowInnerUp": 0.38, "EyeWideLeft": 0.46, "EyeWideRight": 0.42, "JawOpen": 0.62, "MouthLowerDownLeft": 0.34, "MouthLowerDownRight": 0.32}},
+    {"name": "Capture Tail Recover Smirk", "seconds": 0.36, "transition_ratio": 0.66, "weights": {"MouthSmileLeft": 0.22, "MouthSmileRight": 0.14, "MouthLeft": 0.08, "CheekSquintLeft": 0.10, "JawOpen": 0.10}},
+    {"name": "Capture Tail Neutral Recover", "seconds": 0.52, "transition_ratio": 0.84, "weights": {}},
+]
+
+
+def _full_validation_key_present(key_blocks, key_name):
+    normalized = _normalize_shape_key_name(key_name)
+    if not normalized:
+        return False
+    for index, key_block in enumerate(key_blocks or []):
+        if index == 0:
+            continue
+        if _normalize_shape_key_name(getattr(key_block, "name", "")) == normalized:
+            return True
+    return False
+
+
+def _full_validation_available_state(state, available_names):
+    available = {_normalize_shape_key_name(name) for name in available_names}
+    weights = {}
+    base_weights = {}
+    for key_name, value in dict((state or {}).get("base_weights", {}) or {}).items():
+        if _normalize_shape_key_name(key_name) in available:
+            base_weights[key_name] = value
+    for key_name, value in dict((state or {}).get("weights", {}) or {}).items():
+        if _normalize_shape_key_name(key_name) in available:
+            weights[key_name] = value
+    if not weights and not base_weights:
+        return None
+    next_state = dict(state or {})
+    next_state["weights"] = weights
+    next_state["base_weights"] = base_weights
+    return next_state
+
+
+def _full_validation_core_state_specs():
+    # 33 states plus the tail gives about 1000 frames at 30 fps.
+    return [
+        {"name": "Calibration Neutral", "seconds": 0.36, "transition_ratio": 0.72, "weights": {}},
+        {"name": "Eyes Blink Full", "seconds": 0.58, "transition_ratio": 0.34, "weights": {"EyeBlinkLeft": 1.0, "EyeBlinkRight": 1.0, "EyeSquintLeft": 0.18, "EyeSquintRight": 0.18}},
+        {"name": "Eyes Wide Brows Full", "seconds": 0.58, "transition_ratio": 0.46, "weights": {"EyeWideLeft": 1.0, "EyeWideRight": 1.0, "BrowInnerUp": 1.0, "BrowOuterUpLeft": 1.0, "BrowOuterUpRight": 1.0}},
+        {"name": "Brows Down Full", "seconds": 0.52, "transition_ratio": 0.48, "weights": {"BrowDownLeft": 1.0, "BrowDownRight": 1.0, "EyeSquintLeft": 0.24, "EyeSquintRight": 0.24}},
+        {"name": "Eyes Squint Cheek Full", "seconds": 0.54, "transition_ratio": 0.44, "weights": {"EyeSquintLeft": 1.0, "EyeSquintRight": 1.0, "CheekSquintLeft": 0.55, "CheekSquintRight": 0.55}},
+        {"name": "Look Up Down Check", "seconds": 0.50, "transition_ratio": 0.50, "weights": {"EyeLookUpLeft": 1.0, "EyeLookUpRight": 1.0, "BrowOuterUpLeft": 0.20, "BrowOuterUpRight": 0.20}},
+        {"name": "Look Down Check", "seconds": 0.50, "transition_ratio": 0.50, "weights": {"EyeLookDownLeft": 1.0, "EyeLookDownRight": 1.0, "BrowInnerUp": 0.12}},
+        {"name": "Look Left Check", "seconds": 0.50, "transition_ratio": 0.50, "weights": {"EyeLookOutLeft": 1.0, "EyeLookInRight": 1.0, "MouthLeft": 0.10}},
+        {"name": "Look Right Check", "seconds": 0.50, "transition_ratio": 0.50, "weights": {"EyeLookInLeft": 1.0, "EyeLookOutRight": 1.0, "MouthRight": 0.10}},
+        {"name": "Jaw Open Full", "seconds": 0.66, "transition_ratio": 0.42, "weights": {"JawOpen": 1.0, "MouthLowerDownLeft": 0.56, "MouthLowerDownRight": 0.56, "MouthStretchLeft": 0.18, "MouthStretchRight": 0.18}},
+        {"name": "Mouth Close With Jaw Rule", "seconds": 0.66, "transition_ratio": 0.48, "weights": {"JawOpen": 1.0, "MouthClose": 1.0}},
+        {"name": "Mouth Funnel Full", "seconds": 0.56, "transition_ratio": 0.42, "weights": {"JawOpen": 0.42, "MouthFunnel": 1.0, "MouthPucker": 0.22}},
+        {"name": "Mouth Pucker Full", "seconds": 0.56, "transition_ratio": 0.42, "weights": {"JawOpen": 0.28, "MouthPucker": 1.0, "MouthFunnel": 0.46}},
+        {"name": "Mouth Smile Full", "seconds": 0.60, "transition_ratio": 0.50, "weights": {"MouthSmileLeft": 1.0, "MouthSmileRight": 1.0, "MouthDimpleLeft": 0.50, "MouthDimpleRight": 0.50, "CheekSquintLeft": 0.32, "CheekSquintRight": 0.32}},
+        {"name": "Smile Open Compatibility", "seconds": 0.58, "transition_ratio": 0.44, "weights": {"JawOpen": 0.58, "MouthSmileLeft": 1.0, "MouthSmileRight": 1.0, "MouthStretchLeft": 0.34, "MouthStretchRight": 0.34, "CheekSquintLeft": 0.32, "CheekSquintRight": 0.32}},
+        {"name": "Mouth Frown Full", "seconds": 0.56, "transition_ratio": 0.54, "weights": {"MouthFrownLeft": 1.0, "MouthFrownRight": 1.0, "BrowInnerUp": 0.24, "JawOpen": 0.16}},
+        {"name": "Mouth Stretch Full", "seconds": 0.54, "transition_ratio": 0.48, "weights": {"MouthStretchLeft": 1.0, "MouthStretchRight": 1.0, "JawOpen": 0.34}},
+        {"name": "Mouth Shrug Full", "seconds": 0.52, "transition_ratio": 0.50, "weights": {"MouthShrugUpper": 1.0, "MouthShrugLower": 1.0, "JawOpen": 0.18}},
+        {"name": "Mouth Roll Full", "seconds": 0.52, "transition_ratio": 0.50, "weights": {"MouthRollUpper": 1.0, "MouthRollLower": 1.0, "JawOpen": 0.22}},
+        {"name": "Mouth Press Independent", "seconds": 0.50, "transition_ratio": 0.48, "weights": {"MouthPressLeft": 1.0, "MouthPressRight": 1.0, "JawForward": 0.20}},
+        {"name": "Mouth Upper Lower Full", "seconds": 0.58, "transition_ratio": 0.48, "weights": {"JawOpen": 0.70, "MouthUpperUpLeft": 1.0, "MouthUpperUpRight": 1.0, "MouthLowerDownLeft": 1.0, "MouthLowerDownRight": 1.0}},
+        {"name": "Mouth Left Full", "seconds": 0.52, "transition_ratio": 0.50, "weights": {"MouthLeft": 1.0, "JawLeft": 0.48, "MouthStretchLeft": 0.24}},
+        {"name": "Mouth Right Full", "seconds": 0.52, "transition_ratio": 0.50, "weights": {"MouthRight": 1.0, "JawRight": 0.48, "MouthStretchRight": 0.24}},
+        {"name": "Jaw Directions Full", "seconds": 0.54, "transition_ratio": 0.50, "weights": {"JawForward": 1.0, "JawLeft": 0.55, "MouthLeft": 0.22}},
+        {"name": "Jaw Directions Right", "seconds": 0.54, "transition_ratio": 0.50, "weights": {"JawForward": 1.0, "JawRight": 0.55, "MouthRight": 0.22}},
+        {"name": "Cheek Puff Full", "seconds": 0.56, "transition_ratio": 0.56, "weights": {"CheekPuff": 1.0, "JawOpen": 0.42, "MouthClose": 0.42}},
+        {"name": "Nose Sneer Full", "seconds": 0.50, "transition_ratio": 0.50, "weights": {"NoseSneerLeft": 1.0, "NoseSneerRight": 1.0, "BrowDownLeft": 0.24, "BrowDownRight": 0.24}},
+        {"name": "Tongue Out Full", "seconds": 0.60, "transition_ratio": 0.42, "weights": {"TongueOut": 1.0, "JawOpen": 0.86, "MouthLowerDownLeft": 0.24, "MouthLowerDownRight": 0.24}},
+        {"name": "Eye Mouth Compatible Smile", "seconds": 0.58, "transition_ratio": 0.44, "weights": {"EyeSquintLeft": 0.42, "EyeSquintRight": 0.42, "CheekSquintLeft": 0.45, "CheekSquintRight": 0.45, "MouthSmileLeft": 1.0, "MouthSmileRight": 1.0, "JawOpen": 0.26}},
+        {"name": "Eye Mouth Compatible Speech", "seconds": 0.58, "transition_ratio": 0.42, "weights": {"EyeWideLeft": 0.38, "EyeWideRight": 0.38, "BrowInnerUp": 0.44, "JawOpen": 0.86, "MouthStretchLeft": 0.34, "MouthStretchRight": 0.34}},
+        {"name": "Left Side Blend Full", "seconds": 0.56, "transition_ratio": 0.48, "weights": {"BrowDownLeft": 1.0, "EyeSquintLeft": 1.0, "CheekSquintLeft": 0.60, "MouthSmileLeft": 1.0, "MouthStretchLeft": 0.60, "MouthUpperUpLeft": 0.60}},
+        {"name": "Right Side Blend Full", "seconds": 0.56, "transition_ratio": 0.48, "weights": {"BrowDownRight": 1.0, "EyeSquintRight": 1.0, "CheekSquintRight": 0.60, "MouthSmileRight": 1.0, "MouthStretchRight": 0.60, "MouthUpperUpRight": 0.60}},
+        {"name": "Rule Stress Open Close", "seconds": 0.64, "transition_ratio": 0.42, "weights": {"JawOpen": 1.0, "MouthClose": 1.0, "MouthLowerDownLeft": 0.44, "MouthLowerDownRight": 0.44}},
+    ]
+
+
+def _resolve_full_validation_states_for_object(key_blocks, items, target_count=70):
+    del items, target_count
+    available_names = [str(getattr(key_block, "name", "") or "") for index, key_block in enumerate(key_blocks or []) if index != 0]
+    resolved = []
+    for state in _full_validation_core_state_specs():
+        next_state = _full_validation_available_state(state, available_names)
+        if next_state is not None:
+            resolved.append(next_state)
+    if resolved:
+        return resolved
+    return _resolve_validation_state_specs_for_object(key_blocks, FULL_VALIDATION_STATES, allow_empty=False)
+
+
+def _state_target_values(state):
+    target_values = {}
+    for key_name, value in dict((state or {}).get("base_weights", {}) or {}).items():
+        target_values[str(key_name)] = max(0.0, min(1.0, float(value or 0.0)))
+    for key_name, value in dict((state or {}).get("weights", {}) or {}).items():
+        target_values[str(key_name)] = max(0.0, min(1.0, float(value or 0.0)))
+
+    target_values = _soften_opposing_target_values(target_values)
+    jaw_open = max(0.0, min(1.0, float(target_values.get("JawOpen", 0.0) or 0.0)))
+    blink_left = max(0.0, min(1.0, float(target_values.get("EyeBlinkLeft", 0.0) or 0.0)))
+    blink_right = max(0.0, min(1.0, float(target_values.get("EyeBlinkRight", 0.0) or 0.0)))
+    squint_left = max(0.0, min(1.0, float(target_values.get("EyeSquintLeft", 0.0) or 0.0)))
+    squint_right = max(0.0, min(1.0, float(target_values.get("EyeSquintRight", 0.0) or 0.0)))
+    pucker = max(0.0, min(1.0, float(target_values.get("MouthPucker", 0.0) or 0.0)))
+    funnel = max(0.0, min(1.0, float(target_values.get("MouthFunnel", 0.0) or 0.0)))
+    mouth_close = max(0.0, min(1.0, float(target_values.get("MouthClose", 0.0) or 0.0)))
+
+    if "EyeWideLeft" in target_values:
+        target_values["EyeWideLeft"] = max(0.0, min(1.0, float(target_values["EyeWideLeft"]) * (1.0 - (0.85 * blink_left)) * (1.0 - (0.62 * squint_left))))
+    if "EyeWideRight" in target_values:
+        target_values["EyeWideRight"] = max(0.0, min(1.0, float(target_values["EyeWideRight"]) * (1.0 - (0.85 * blink_right)) * (1.0 - (0.62 * squint_right))))
+
+    if pucker > 0.0 or funnel > 0.0:
+        if jaw_open > 0.58:
+            target_values["MouthPucker"] = pucker * (1.0 - (0.30 * jaw_open))
+            target_values["MouthFunnel"] = funnel * (1.0 - (0.16 * jaw_open))
+        target_values["JawOpen"] = max(jaw_open, max(funnel * 0.42, pucker * 0.24))
+        jaw_open = max(0.0, min(1.0, float(target_values.get("JawOpen", 0.0) or 0.0)))
+
+    if jaw_open > 0.0:
+        target_values["MouthLowerDownLeft"] = max(float(target_values.get("MouthLowerDownLeft", 0.0) or 0.0), jaw_open * 0.12)
+        target_values["MouthLowerDownRight"] = max(float(target_values.get("MouthLowerDownRight", 0.0) or 0.0), jaw_open * 0.12)
+        target_values["MouthStretchLeft"] = max(float(target_values.get("MouthStretchLeft", 0.0) or 0.0), jaw_open * 0.08)
+        target_values["MouthStretchRight"] = max(float(target_values.get("MouthStretchRight", 0.0) or 0.0), jaw_open * 0.08)
+
+    if mouth_close > 0.0:
+        target_values["JawOpen"] = max(jaw_open, mouth_close)
+        target_values["MouthClose"] = min(mouth_close, float(target_values.get("JawOpen", 0.0) or 0.0))
+        # mouthClose validates lip closure over an opened jaw.  Keep it separate
+        # from press/pucker/funnel/shrug so it does not become a pursed-lip test.
+        for conflict_key in ("MouthPressLeft", "MouthPressRight", "MouthPucker", "MouthFunnel", "MouthShrugUpper", "MouthShrugLower"):
+            if conflict_key in target_values:
+                target_values[conflict_key] = min(float(target_values.get(conflict_key, 0.0) or 0.0), 0.05)
+
+    return _enforce_mouth_close_not_above_jaw_open(target_values)
+
+
+def _build_full_validation_plan(resolved_states, start_frame, fps, total_seconds, action_name, object_name, target_frames=FULL_VALIDATION_TARGET_FRAMES, tail_states=None):
+    fps = max(1.0, float(fps))
+    tail_states = list(tail_states or FULL_VALIDATION_TEXT_MIX_STATES or [])
+    resolved_states = list(resolved_states or [])
+    core_frame_budget = int(round(float(target_frames or FULL_VALIDATION_TARGET_FRAMES) * 0.86))
+    tail_frame_budget = max(0, int(round(float(target_frames or FULL_VALIDATION_TARGET_FRAMES) * 0.14))) if tail_states else 0
+    core_frame_budget = max(len(resolved_states) * 8, core_frame_budget)
+    core_weight = sum(max(0.2, float((state or {}).get("seconds", 0.5) or 0.5)) for state in resolved_states) or 1.0
+    tail_weight = sum(max(0.1, float((state or {}).get("seconds", 0.3) or 0.3)) for state in tail_states) or 1.0
+
+    cursor = int(start_frame)
+    segments = []
+    previous_values = {}
+
+    def append_state(state, frame_budget, weight_total, min_span, index_name=None):
+        nonlocal cursor, previous_values
+        weight = max(0.1, float((state or {}).get("seconds", 0.4) or 0.4))
+        current_span = max(int(min_span), int(round(float(frame_budget) * (weight / float(weight_total or 1.0)))))
+        transition_ratio = max(0.30, min(0.78, float((state or {}).get("transition_ratio", 0.50) or 0.50)))
+        transition_frames = max(3, min(current_span - 2, int(round(current_span * transition_ratio))))
+        hold_frames = max(2, current_span - transition_frames)
+        target_values = _state_target_values(state)
+        peak_frame = cursor + transition_frames
+        hold_end_frame = peak_frame + hold_frames
+        segment = {
+            "index": len(segments) + 1,
+            "name": str((state or {}).get("name", index_name or "mix") or index_name or "mix"),
+            "start_frame": int(cursor),
+            "peak_frame": int(peak_frame),
+            "hold_end_frame": int(hold_end_frame),
+            "end_frame": int(hold_end_frame),
+            "from_values": _enforce_mouth_close_not_above_jaw_open(previous_values),
+            "base_weights": dict((state or {}).get("base_weights", {}) or {}),
+            "weights": dict((state or {}).get("weights", {}) or {}),
+            "target_values": target_values,
+            "curve_mode": _full_validation_curve_mode(state),
+        }
+        segments.append(segment)
+        previous_values = dict(target_values)
+        cursor = int(hold_end_frame) + 1
+
+    for state in resolved_states:
+        append_state(state, core_frame_budget, core_weight, 14)
+
+    if previous_values:
+        reset_state = {"name": "Return To Base Before Capture Tail", "seconds": 0.36, "transition_ratio": 0.72, "weights": {}}
+        append_state(reset_state, int(round(fps * 0.36)), 0.36, 10)
+        previous_values = {}
+
+    for state in tail_states:
+        append_state(state, tail_frame_budget, tail_weight, 8, index_name="Capture Tail")
+
+    if previous_values:
+        append_state({"name": "Return To Zero", "seconds": 0.28, "transition_ratio": 0.82, "weights": {}}, int(round(fps * 0.28)), 0.28, 8)
 
     end_frame = int(segments[-1]["end_frame"]) if segments else int(start_frame)
     frame_span = max(1, end_frame - int(start_frame))
@@ -6252,6 +6590,130 @@ def _build_full_validation_plan(resolved_states, start_frame, fps, total_seconds
         )
         previous_values = _enforce_mouth_close_not_above_jaw_open(target_values)
         cursor = int(end_frame) + 1
+    end_frame = int(segments[-1]["end_frame"]) if segments else int(start_frame)
+    frame_span = max(1, end_frame - int(start_frame))
+    actual_total_seconds = max(float(total_seconds), float(frame_span) / fps)
+    return {
+        "object_name": str(object_name or ""),
+        "action_name": str(action_name or ""),
+        "start_frame": int(start_frame),
+        "end_frame": end_frame,
+        "total_seconds": float(actual_total_seconds),
+        "fps": float(fps),
+        "target_frames": int(target_frames or 0),
+        "segments": segments,
+    }
+
+
+def _resolve_full_validation_states_for_object(key_blocks, items, target_count=70):
+    del items, target_count
+    available_names = [str(getattr(key_block, "name", "") or "") for index, key_block in enumerate(key_blocks or []) if index != 0]
+    resolved = []
+    for state in _full_validation_core_state_specs():
+        next_state = _full_validation_available_state(state, available_names)
+        if next_state is not None:
+            resolved.append(next_state)
+    if resolved:
+        return resolved
+    return _resolve_validation_state_specs_for_object(key_blocks, FULL_VALIDATION_STATES, allow_empty=False)
+
+
+def _state_target_values(state):
+    target_values = {}
+    for key_name, value in dict((state or {}).get("base_weights", {}) or {}).items():
+        target_values[str(key_name)] = max(0.0, min(1.0, float(value or 0.0)))
+    for key_name, value in dict((state or {}).get("weights", {}) or {}).items():
+        target_values[str(key_name)] = max(0.0, min(1.0, float(value or 0.0)))
+
+    target_values = _soften_opposing_target_values(target_values)
+    jaw_open = max(0.0, min(1.0, float(target_values.get("JawOpen", 0.0) or 0.0)))
+    blink_left = max(0.0, min(1.0, float(target_values.get("EyeBlinkLeft", 0.0) or 0.0)))
+    blink_right = max(0.0, min(1.0, float(target_values.get("EyeBlinkRight", 0.0) or 0.0)))
+    squint_left = max(0.0, min(1.0, float(target_values.get("EyeSquintLeft", 0.0) or 0.0)))
+    squint_right = max(0.0, min(1.0, float(target_values.get("EyeSquintRight", 0.0) or 0.0)))
+    pucker = max(0.0, min(1.0, float(target_values.get("MouthPucker", 0.0) or 0.0)))
+    funnel = max(0.0, min(1.0, float(target_values.get("MouthFunnel", 0.0) or 0.0)))
+    mouth_close = max(0.0, min(1.0, float(target_values.get("MouthClose", 0.0) or 0.0)))
+
+    if "EyeWideLeft" in target_values:
+        target_values["EyeWideLeft"] = max(0.0, min(1.0, float(target_values["EyeWideLeft"]) * (1.0 - (0.85 * blink_left)) * (1.0 - (0.62 * squint_left))))
+    if "EyeWideRight" in target_values:
+        target_values["EyeWideRight"] = max(0.0, min(1.0, float(target_values["EyeWideRight"]) * (1.0 - (0.85 * blink_right)) * (1.0 - (0.62 * squint_right))))
+
+    if pucker > 0.0 or funnel > 0.0:
+        if jaw_open > 0.58:
+            target_values["MouthPucker"] = pucker * (1.0 - (0.30 * jaw_open))
+            target_values["MouthFunnel"] = funnel * (1.0 - (0.16 * jaw_open))
+        target_values["JawOpen"] = max(jaw_open, max(funnel * 0.42, pucker * 0.24))
+        jaw_open = max(0.0, min(1.0, float(target_values.get("JawOpen", 0.0) or 0.0)))
+
+    if jaw_open > 0.0:
+        target_values["MouthLowerDownLeft"] = max(float(target_values.get("MouthLowerDownLeft", 0.0) or 0.0), jaw_open * 0.12)
+        target_values["MouthLowerDownRight"] = max(float(target_values.get("MouthLowerDownRight", 0.0) or 0.0), jaw_open * 0.12)
+        target_values["MouthStretchLeft"] = max(float(target_values.get("MouthStretchLeft", 0.0) or 0.0), jaw_open * 0.08)
+        target_values["MouthStretchRight"] = max(float(target_values.get("MouthStretchRight", 0.0) or 0.0), jaw_open * 0.08)
+
+    if mouth_close > 0.0:
+        target_values["JawOpen"] = max(jaw_open, mouth_close)
+        target_values["MouthClose"] = min(mouth_close, float(target_values.get("JawOpen", 0.0) or 0.0))
+        for conflict_key in ("MouthPressLeft", "MouthPressRight", "MouthPucker", "MouthFunnel", "MouthShrugUpper", "MouthShrugLower"):
+            if conflict_key in target_values:
+                target_values[conflict_key] = min(float(target_values.get(conflict_key, 0.0) or 0.0), 0.05)
+
+    return _enforce_mouth_close_not_above_jaw_open(target_values)
+
+
+def _build_full_validation_plan(resolved_states, start_frame, fps, total_seconds, action_name, object_name, target_frames=FULL_VALIDATION_TARGET_FRAMES, tail_states=None):
+    fps = max(1.0, float(fps))
+    tail_states = list(tail_states or FULL_VALIDATION_TEXT_MIX_STATES or [])
+    resolved_states = list(resolved_states or [])
+    target_frame_count = max(1, int(target_frames or FULL_VALIDATION_TARGET_FRAMES))
+    core_frame_budget = max(len(resolved_states) * 8, int(round(target_frame_count * 0.86)))
+    tail_frame_budget = int(round(target_frame_count * 0.14)) if tail_states else 0
+    core_weight = sum(max(0.2, float((state or {}).get("seconds", 0.5) or 0.5)) for state in resolved_states) or 1.0
+    tail_weight = sum(max(0.1, float((state or {}).get("seconds", 0.3) or 0.3)) for state in tail_states) or 1.0
+    cursor = int(start_frame)
+    segments = []
+    previous_values = {}
+
+    def append_state(state, frame_budget, weight_total, min_span, fallback_name="mix"):
+        nonlocal cursor, previous_values
+        weight = max(0.1, float((state or {}).get("seconds", 0.4) or 0.4))
+        current_span = max(int(min_span), int(round(float(frame_budget) * (weight / float(weight_total or 1.0)))))
+        transition_ratio = max(0.30, min(0.78, float((state or {}).get("transition_ratio", 0.50) or 0.50)))
+        transition_frames = max(3, min(current_span - 2, int(round(current_span * transition_ratio))))
+        hold_frames = max(2, current_span - transition_frames)
+        target_values = _state_target_values(state)
+        peak_frame = cursor + transition_frames
+        hold_end_frame = peak_frame + hold_frames
+        segments.append(
+            {
+                "index": len(segments) + 1,
+                "name": str((state or {}).get("name", fallback_name) or fallback_name),
+                "start_frame": int(cursor),
+                "peak_frame": int(peak_frame),
+                "hold_end_frame": int(hold_end_frame),
+                "end_frame": int(hold_end_frame),
+                "from_values": _enforce_mouth_close_not_above_jaw_open(previous_values),
+                "base_weights": dict((state or {}).get("base_weights", {}) or {}),
+                "weights": dict((state or {}).get("weights", {}) or {}),
+                "target_values": target_values,
+                "curve_mode": _full_validation_curve_mode(state),
+            }
+        )
+        previous_values = dict(target_values)
+        cursor = int(hold_end_frame) + 1
+
+    for state in resolved_states:
+        append_state(state, core_frame_budget, core_weight, 14)
+    if previous_values:
+        append_state({"name": "Return To Base Before Capture Tail", "seconds": 0.36, "transition_ratio": 0.72, "weights": {}}, int(round(fps * 0.36)), 0.36, 10)
+        previous_values = {}
+    for state in tail_states:
+        append_state(state, tail_frame_budget, tail_weight, 8, fallback_name="Capture Tail")
+    if previous_values:
+        append_state({"name": "Return To Zero", "seconds": 0.28, "transition_ratio": 0.82, "weights": {}}, int(round(fps * 0.28)), 0.28, 8)
+
     end_frame = int(segments[-1]["end_frame"]) if segments else int(start_frame)
     frame_span = max(1, end_frame - int(start_frame))
     actual_total_seconds = max(float(total_seconds), float(frame_span) / fps)

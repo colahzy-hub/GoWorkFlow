@@ -8,7 +8,7 @@ bl_info = {
     "category": "3D View",
 }
 
-__version__ = (0, 9, 1)
+__version__ = (0, 9, 2)
 
 import json
 import csv
