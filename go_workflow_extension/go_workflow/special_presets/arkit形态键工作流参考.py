@@ -26,8 +26,8 @@ _UNDO_PLAYBACK_STATE = {"changed": False, "original": None}
 ANIMATION_TIMER_INTERVAL = 0.04
 ANIMATION_DURATION_PER_KEY = 1.0
 ANIMATION_STATUS_INTERVAL = 0.2
-FULL_VALIDATION_TOTAL_SECONDS = 33.0
-FULL_VALIDATION_TARGET_FRAMES = 1000
+FULL_VALIDATION_TOTAL_SECONDS = 22.0
+FULL_VALIDATION_TARGET_FRAMES = 660
 FULL_VALIDATION_PLAYBACK_FPS = 30.0
 FULL_VALIDATION_TIMER_INTERVAL = 1.0 / max(60.0, FULL_VALIDATION_PLAYBACK_FPS * 2.0)
 PREVIEW_IDLE_RELEASE_SECONDS = 2.0
@@ -275,29 +275,14 @@ def _suspend_global_undo():
         return False
     _UNDO_PLAYBACK_STATE["changed"] = False
     _UNDO_PLAYBACK_STATE["original"] = current
-    if not current:
-        return False
-    try:
-        prefs.use_global_undo = False
-    except Exception:
-        _UNDO_PLAYBACK_STATE["original"] = None
-        return False
-    _UNDO_PLAYBACK_STATE["changed"] = True
-    return True
+    # AI定位：不要修改 Blender 的全局撤回开关；实时预览只做临时值播放，避免破坏用户撤回习惯。
+    return False
 
 
 def _restore_global_undo():
-    prefs = _undo_preferences()
-    original = _UNDO_PLAYBACK_STATE.get("original")
-    changed = bool(_UNDO_PLAYBACK_STATE.get("changed"))
     _UNDO_PLAYBACK_STATE["changed"] = False
     _UNDO_PLAYBACK_STATE["original"] = None
-    if not changed or prefs is None or original is None:
-        return False
-    try:
-        prefs.use_global_undo = bool(original)
-    except Exception:
-        return False
+    # AI定位：对应 _suspend_global_undo；只清内部状态，不写 Blender 偏好。
     return True
 FULL_VALIDATION_TEXT_MIX_STATES = [
     {"name": "TextMix Calm Neutral", "seconds": 0.54, "transition_ratio": 0.88, "weights": {}},
@@ -752,6 +737,7 @@ _VALIDATION_PREVIEW_STORE_KEYS = {
 }
 _FULL_VALIDATION_PLAN_KEY = "arkit_fv_plan_json"
 _MODULE_RUNTIME_STORE_ROOT = "_go_workflow_module_state"
+_MODULE_RUNTIME_VOLATILE_STORE = {}
 
 
 def _runtime_slug(text, fallback):
@@ -761,16 +747,19 @@ def _runtime_slug(text, fallback):
 
 
 def _module_runtime_store_snapshot(scene, workflow, module):
-    if scene is None:
-        return {}
-    root_store = scene.get(_MODULE_RUNTIME_STORE_ROOT)
-    if not isinstance(root_store, dict):
-        return {}
-    workflow_store = root_store.get(_runtime_slug(getattr(workflow, "name", ""), "workflow"))
-    if not isinstance(workflow_store, dict):
-        return {}
-    module_store = workflow_store.get(_runtime_slug(getattr(module, "name", ""), "module"))
-    return dict(module_store) if isinstance(module_store, dict) else {}
+    module_store = {}
+    if scene is not None:
+        root_store = scene.get(_MODULE_RUNTIME_STORE_ROOT)
+        if isinstance(root_store, dict):
+            workflow_store = root_store.get(_runtime_slug(getattr(workflow, "name", ""), "workflow"))
+            if isinstance(workflow_store, dict):
+                scene_module_store = workflow_store.get(_runtime_slug(getattr(module, "name", ""), "module"))
+                if isinstance(scene_module_store, dict):
+                    module_store.update(scene_module_store)
+    volatile_store = _MODULE_RUNTIME_VOLATILE_STORE.get(_full_validation_runtime_scope_key(scene=scene, workflow=workflow, module=module))
+    if isinstance(volatile_store, dict):
+        module_store.update(volatile_store)
+    return module_store
 
 
 def _full_validation_runtime_scope_key(scene=None, workflow=None, module=None):
@@ -803,29 +792,11 @@ def _full_validation_runtime_scope_key(scene=None, workflow=None, module=None):
 
 
 def _update_module_runtime_store(scene, workflow, module, updates):
-    if scene is None:
-        return {}
-    root_store = scene.get(_MODULE_RUNTIME_STORE_ROOT)
-    if not isinstance(root_store, dict):
-        root_store = {}
-    else:
-        root_store = dict(root_store)
-    workflow_key = _runtime_slug(getattr(workflow, "name", ""), "workflow")
-    module_key = _runtime_slug(getattr(module, "name", ""), "module")
-    workflow_store = root_store.get(workflow_key)
-    if not isinstance(workflow_store, dict):
-        workflow_store = {}
-    else:
-        workflow_store = dict(workflow_store)
-    module_store = workflow_store.get(module_key)
-    if not isinstance(module_store, dict):
-        module_store = {}
-    else:
-        module_store = dict(module_store)
+    scope_key = _full_validation_runtime_scope_key(scene=scene, workflow=workflow, module=module)
+    module_store = dict(_MODULE_RUNTIME_VOLATILE_STORE.get(scope_key, {}) or {})
     module_store.update(dict(updates or {}))
-    workflow_store[module_key] = module_store
-    root_store[workflow_key] = workflow_store
-    scene[_MODULE_RUNTIME_STORE_ROOT] = root_store
+    # AI定位：ARKit 预览/验证运行状态只写内存，避免写 Scene 影响 Blender 撤回。
+    _MODULE_RUNTIME_VOLATILE_STORE[scope_key] = module_store
     return module_store
 
 
@@ -917,22 +888,11 @@ def _clear_module_store_values(scene, workflow, module, module_state=None, *keys
     keys = [str(key) for key in keys if str(key or "").strip()]
     if not keys:
         return
-    root_store = scene.get(_MODULE_RUNTIME_STORE_ROOT) if scene is not None else None
-    if isinstance(root_store, dict):
-        root_store = dict(root_store)
-        workflow_key = _runtime_slug(getattr(workflow, "name", ""), "workflow")
-        module_key = _runtime_slug(getattr(module, "name", ""), "module")
-        workflow_store = root_store.get(workflow_key)
-        if isinstance(workflow_store, dict):
-            workflow_store = dict(workflow_store)
-            module_store = workflow_store.get(module_key)
-            if isinstance(module_store, dict):
-                module_store = dict(module_store)
-                for key in keys:
-                    module_store.pop(key, None)
-                workflow_store[module_key] = module_store
-                root_store[workflow_key] = workflow_store
-                scene[_MODULE_RUNTIME_STORE_ROOT] = root_store
+    scope_key = _full_validation_runtime_scope_key(scene=scene, workflow=workflow, module=module)
+    module_store = dict(_MODULE_RUNTIME_VOLATILE_STORE.get(scope_key, {}) or {})
+    for key in keys:
+        module_store.pop(key, None)
+    _MODULE_RUNTIME_VOLATILE_STORE[scope_key] = module_store
     if module_state is not None:
         for key in keys:
             module_state.set(key, "")
@@ -1261,6 +1221,28 @@ def _normalize_shape_key_name(name):
     return re.sub(r"[^a-z0-9]", "", str(name or "").lower())
 
 
+def _shape_key_name_variants(name):
+    normalized = _normalize_shape_key_name(name)
+    if not normalized:
+        return []
+    variants = {normalized}
+    if "mouse" in normalized:
+        variants.add(normalized.replace("mouse", "mouth"))
+    if "mouth" in normalized:
+        variants.add(normalized.replace("mouth", "mouse"))
+    current = list(variants)
+    for value in current:
+        if value.endswith("left"):
+            variants.add(value[:-4] + "l")
+        if value.endswith("right"):
+            variants.add(value[:-5] + "r")
+        if value.endswith("l") and len(value) > 1:
+            variants.add(value[:-1] + "left")
+        if value.endswith("r") and len(value) > 1:
+            variants.add(value[:-1] + "right")
+    return list(variants)
+
+
 def _shape_key_names(items):
     return [str(item.get("shape_key", "") or "").strip() for item in items if str(item.get("shape_key", "") or "").strip()]
 
@@ -1559,14 +1541,6 @@ def _set_step_and_focus(context, scene, workflow, module, panel_api, module_stat
     return item, target_index
 
 
-def _set_step_and_maybe_validate(context, scene, workflow, module, panel_api, module_state, items, target_index):
-    item, target_index = _set_step_and_focus(context, scene, workflow, module, panel_api, module_state, items, target_index)
-    auto_validate = bool(panel_api.get_bool("auto_validate_on_step", _get_setting(module, "auto_validate_on_step", False)))
-    if auto_validate:
-        _start_validation_animation(context, scene, workflow, module, panel_api, module_state, item, items)
-    return item, target_index
-
-
 def _validation_mix_lines(item):
     key = _item_cache_key(item)
     state = _preview_runtime_state()
@@ -1807,9 +1781,9 @@ def _mouth_close_floor(values):
 
 
 def _value_key_by_normalized(values, normalized_name):
-    normalized_name = str(normalized_name or "").strip()
+    normalized_names = set(_shape_key_name_variants(normalized_name) or [_normalize_shape_key_name(normalized_name)])
     for key_name in dict(values or {}).keys():
-        if _normalize_shape_key_name(key_name) == normalized_name:
+        if set(_shape_key_name_variants(key_name)) & normalized_names:
             return key_name
     return ""
 
@@ -1822,8 +1796,11 @@ def _enforce_mouth_close_not_above_jaw_open(values):
     jaw_open_key = _value_key_by_normalized(adjusted, "jawopen") or "JawOpen"
     mouth_close = max(0.0, min(1.0, float(adjusted.get(mouth_close_key, 0.0) or 0.0)))
     jaw_open = max(0.0, min(1.0, float(adjusted.get(jaw_open_key, 0.0) or 0.0)))
-    if mouth_close > jaw_open:
-        jaw_open = mouth_close
+    if mouth_close <= 0.0:
+        adjusted[mouth_close_key] = 0.0
+        return adjusted
+    if jaw_open <= 0.0:
+        jaw_open = min(1.0, mouth_close + 0.08)
         adjusted[jaw_open_key] = jaw_open
     adjusted[mouth_close_key] = min(mouth_close, jaw_open)
     return adjusted
@@ -1895,9 +1872,15 @@ def _expanded_full_validation_states(resolved_states, target_count=70):
         if first_bucket == "mouth":
             for offset in range(1, len(core_states) + 1):
                 candidate = core_states[(cursor + offset) % len(core_states)]
-                if _full_validation_state_bucket(candidate) == "mouth":
+                if _full_validation_state_bucket(candidate) == "eye":
                     second = candidate
                     break
+            if second is None:
+                for offset in range(1, len(core_states) + 1):
+                    candidate = core_states[(cursor + offset) % len(core_states)]
+                    if _full_validation_state_bucket(candidate) != "mouth":
+                        second = candidate
+                        break
         else:
             for offset in range(1, len(core_states) + 1):
                 candidate = core_states[(cursor + offset) % len(core_states)]
@@ -2088,17 +2071,73 @@ def _smoothed_text_mix_validation_states(resolved_states):
     return smoothed_states
 
 
-def _state_target_values(state):
+def _state_target_values_legacy_capture_rules(state):
     target_values = dict(state.get("base_weights", {}) or {})
     for key_name, value in dict(state.get("weights", {}) or {}).items():
         target_values[key_name] = float(value)
-    target_values = _soften_opposing_target_values(target_values)
     jaw_open = max(0.0, min(1.0, float(target_values.get("JawOpen", 0.0) or 0.0)))
     if "MouthClose" in target_values and jaw_open > 0.0:
         target_values["MouthClose"] = min(
             max(0.0, float(target_values.get("MouthClose", 0.0) or 0.0)),
             jaw_open,
         )
+    return _enforce_mouth_close_not_above_jaw_open(target_values)
+
+
+def _state_target_values(state):
+    target_values = {}
+    for key_name, value in dict((state or {}).get("base_weights", {}) or {}).items():
+        target_values[str(key_name)] = max(0.0, min(1.0, float(value or 0.0)))
+    for key_name, value in dict((state or {}).get("weights", {}) or {}).items():
+        target_values[str(key_name)] = max(0.0, min(1.0, float(value or 0.0)))
+
+    jaw_open = max(0.0, min(1.0, float(target_values.get("JawOpen", 0.0) or 0.0)))
+    blink_left = max(0.0, min(1.0, float(target_values.get("EyeBlinkLeft", 0.0) or 0.0)))
+    blink_right = max(0.0, min(1.0, float(target_values.get("EyeBlinkRight", 0.0) or 0.0)))
+    squint_left = max(0.0, min(1.0, float(target_values.get("EyeSquintLeft", 0.0) or 0.0)))
+    squint_right = max(0.0, min(1.0, float(target_values.get("EyeSquintRight", 0.0) or 0.0)))
+    smile_left = max(0.0, min(1.0, float(target_values.get("MouthSmileLeft", 0.0) or 0.0)))
+    smile_right = max(0.0, min(1.0, float(target_values.get("MouthSmileRight", 0.0) or 0.0)))
+    pucker = max(0.0, min(1.0, float(target_values.get("MouthPucker", 0.0) or 0.0)))
+    funnel = max(0.0, min(1.0, float(target_values.get("MouthFunnel", 0.0) or 0.0)))
+    mouth_close = max(0.0, min(1.0, float(target_values.get("MouthClose", 0.0) or 0.0)))
+
+    if "EyeWideLeft" in target_values and float(target_values.get("EyeWideLeft", 0.0) or 0.0) < 1.0:
+        target_values["EyeWideLeft"] = max(0.0, min(1.0, float(target_values["EyeWideLeft"]) * (1.0 - (0.85 * blink_left)) * (1.0 - (0.62 * squint_left))))
+    if "EyeWideRight" in target_values and float(target_values.get("EyeWideRight", 0.0) or 0.0) < 1.0:
+        target_values["EyeWideRight"] = max(0.0, min(1.0, float(target_values["EyeWideRight"]) * (1.0 - (0.85 * blink_right)) * (1.0 - (0.62 * squint_right))))
+
+    if pucker > 0.0 or funnel > 0.0:
+        target_values["JawOpen"] = max(jaw_open, max(funnel * 0.42, pucker * 0.24))
+        jaw_open = max(0.0, min(1.0, float(target_values.get("JawOpen", 0.0) or 0.0)))
+        if pucker < 1.0:
+            target_values["MouthPucker"] = pucker * (1.0 - (0.30 * jaw_open))
+        if funnel < 1.0:
+            target_values["MouthFunnel"] = funnel * (1.0 - (0.16 * jaw_open))
+
+    if jaw_open > 0.0:
+        target_values["MouthLowerDownLeft"] = max(float(target_values.get("MouthLowerDownLeft", 0.0) or 0.0), jaw_open * 0.12)
+        target_values["MouthLowerDownRight"] = max(float(target_values.get("MouthLowerDownRight", 0.0) or 0.0), jaw_open * 0.12)
+        target_values["MouthStretchLeft"] = max(float(target_values.get("MouthStretchLeft", 0.0) or 0.0), jaw_open * 0.08)
+        target_values["MouthStretchRight"] = max(float(target_values.get("MouthStretchRight", 0.0) or 0.0), jaw_open * 0.08)
+        if smile_left > 0.0:
+            target_values["MouthSmileLeft"] = max(float(target_values.get("MouthSmileLeft", 0.0) or 0.0), smile_left * 0.20)
+            target_values["CheekSquintLeft"] = max(float(target_values.get("CheekSquintLeft", 0.0) or 0.0), smile_left * 0.12)
+        if smile_right > 0.0:
+            target_values["MouthSmileRight"] = max(float(target_values.get("MouthSmileRight", 0.0) or 0.0), smile_right * 0.20)
+            target_values["CheekSquintRight"] = max(float(target_values.get("CheekSquintRight", 0.0) or 0.0), smile_right * 0.12)
+
+    if mouth_close > 0.0:
+        if jaw_open <= 0.0:
+            jaw_open = mouth_close
+            target_values["JawOpen"] = jaw_open
+        else:
+            target_values["JawOpen"] = jaw_open
+        target_values["MouthClose"] = min(mouth_close, jaw_open)
+        for conflict_key in ("MouthPressLeft", "MouthPressRight", "MouthPucker", "MouthFunnel", "MouthShrugUpper", "MouthShrugLower"):
+            if conflict_key in target_values and float(target_values.get(conflict_key, 0.0) or 0.0) < 1.0:
+                target_values[conflict_key] = min(float(target_values.get(conflict_key, 0.0) or 0.0), 0.05)
+
     return _enforce_mouth_close_not_above_jaw_open(target_values)
 
 
@@ -2210,9 +2249,22 @@ def _insert_shape_key_frame(key_block_map, key_names, values, frame):
     for key_name in key_names:
         key_block = key_block_map.get(key_name)
         if key_block is None:
+            for normalized_name in _shape_key_name_variants(key_name):
+                key_block = key_block_map.get(normalized_name)
+                if key_block is not None:
+                    break
+        if key_block is None:
             continue
         key_block.value = max(0.0, min(1.0, float(values.get(key_name, 0.0) or 0.0)))
         key_block.keyframe_insert(data_path="value", frame=frame)
+
+
+def _insert_shape_key_frame_if_distinct(key_block_map, key_names, values, frame, used_frames):
+    frame = int(frame)
+    if frame in used_frames:
+        return
+    used_frames.add(frame)
+    _insert_shape_key_frame(key_block_map, key_names, values, frame)
 
 
 def _smoothstep_factor(value):
@@ -2642,6 +2694,518 @@ def _build_full_validation_plan(resolved_states, start_frame, fps, total_seconds
     }
 
 
+def _state_target_values(state):
+    target_values = {}
+    for key_name, value in dict((state or {}).get("base_weights", {}) or {}).items():
+        target_values[str(key_name)] = max(0.0, min(1.0, float(value or 0.0)))
+    for key_name, value in dict((state or {}).get("weights", {}) or {}).items():
+        target_values[str(key_name)] = max(0.0, min(1.0, float(value or 0.0)))
+
+    jaw_open = max(0.0, min(1.0, float(target_values.get("JawOpen", 0.0) or 0.0)))
+    blink_left = max(0.0, min(1.0, float(target_values.get("EyeBlinkLeft", 0.0) or 0.0)))
+    blink_right = max(0.0, min(1.0, float(target_values.get("EyeBlinkRight", 0.0) or 0.0)))
+    squint_left = max(0.0, min(1.0, float(target_values.get("EyeSquintLeft", 0.0) or 0.0)))
+    squint_right = max(0.0, min(1.0, float(target_values.get("EyeSquintRight", 0.0) or 0.0)))
+    smile_left = max(0.0, min(1.0, float(target_values.get("MouthSmileLeft", 0.0) or 0.0)))
+    smile_right = max(0.0, min(1.0, float(target_values.get("MouthSmileRight", 0.0) or 0.0)))
+    pucker = max(0.0, min(1.0, float(target_values.get("MouthPucker", 0.0) or 0.0)))
+    funnel = max(0.0, min(1.0, float(target_values.get("MouthFunnel", 0.0) or 0.0)))
+    mouth_close = max(0.0, min(1.0, float(target_values.get("MouthClose", 0.0) or 0.0)))
+
+    if "EyeWideLeft" in target_values and float(target_values.get("EyeWideLeft", 0.0) or 0.0) < 1.0:
+        target_values["EyeWideLeft"] = max(0.0, min(1.0, float(target_values["EyeWideLeft"]) * (1.0 - (0.85 * blink_left)) * (1.0 - (0.62 * squint_left))))
+    if "EyeWideRight" in target_values and float(target_values.get("EyeWideRight", 0.0) or 0.0) < 1.0:
+        target_values["EyeWideRight"] = max(0.0, min(1.0, float(target_values["EyeWideRight"]) * (1.0 - (0.85 * blink_right)) * (1.0 - (0.62 * squint_right))))
+
+    if pucker > 0.0 or funnel > 0.0:
+        target_values["JawOpen"] = max(jaw_open, max(funnel * 0.42, pucker * 0.24))
+        jaw_open = max(0.0, min(1.0, float(target_values.get("JawOpen", 0.0) or 0.0)))
+        if pucker < 1.0:
+            target_values["MouthPucker"] = pucker * (1.0 - (0.30 * jaw_open))
+        if funnel < 1.0:
+            target_values["MouthFunnel"] = funnel * (1.0 - (0.16 * jaw_open))
+
+    if jaw_open > 0.0:
+        target_values["MouthLowerDownLeft"] = max(float(target_values.get("MouthLowerDownLeft", 0.0) or 0.0), jaw_open * 0.12)
+        target_values["MouthLowerDownRight"] = max(float(target_values.get("MouthLowerDownRight", 0.0) or 0.0), jaw_open * 0.12)
+        target_values["MouthStretchLeft"] = max(float(target_values.get("MouthStretchLeft", 0.0) or 0.0), jaw_open * 0.08)
+        target_values["MouthStretchRight"] = max(float(target_values.get("MouthStretchRight", 0.0) or 0.0), jaw_open * 0.08)
+        if smile_left > 0.0:
+            target_values["MouthSmileLeft"] = max(float(target_values.get("MouthSmileLeft", 0.0) or 0.0), smile_left * 0.20)
+            target_values["CheekSquintLeft"] = max(float(target_values.get("CheekSquintLeft", 0.0) or 0.0), smile_left * 0.12)
+        if smile_right > 0.0:
+            target_values["MouthSmileRight"] = max(float(target_values.get("MouthSmileRight", 0.0) or 0.0), smile_right * 0.20)
+            target_values["CheekSquintRight"] = max(float(target_values.get("CheekSquintRight", 0.0) or 0.0), smile_right * 0.12)
+
+    if mouth_close > 0.0:
+        if jaw_open <= 0.0:
+            jaw_open = min(1.0, mouth_close + 0.08)
+            target_values["JawOpen"] = jaw_open
+        else:
+            target_values["JawOpen"] = jaw_open
+        target_values["MouthClose"] = min(mouth_close, jaw_open)
+        for conflict_key in ("MouthPressLeft", "MouthPressRight", "MouthPucker", "MouthFunnel", "MouthShrugUpper", "MouthShrugLower"):
+            if conflict_key in target_values:
+                target_values[conflict_key] = min(float(target_values.get(conflict_key, 0.0) or 0.0), 0.05)
+
+    return _enforce_mouth_close_not_above_jaw_open(target_values)
+
+
+# Final runtime tail override: a denser, low-amplitude mocap-style passage.
+# The core validation above keeps explicit 1.0 peaks for testing; this tail is
+# intentionally smaller and more continuous to read like captured facial motion.
+FULL_VALIDATION_TEXT_MIX_STATES = [
+    {"name": "Mocap Flow Idle 01", "seconds": 0.14, "transition_ratio": 0.82, "weights": {"EyeLookDownLeft": 0.10, "EyeLookDownRight": 0.10, "JawOpen": 0.04, "BrowInnerUp": 0.05}},
+    {"name": "Mocap Flow Idle 02", "seconds": 0.12, "transition_ratio": 0.86, "weights": {"EyeLookDownLeft": 0.16, "EyeLookDownRight": 0.15, "MouthStretchLeft": 0.05, "MouthStretchRight": 0.04, "JawOpen": 0.06}},
+    {"name": "Mocap Flow Speech 01", "seconds": 0.13, "transition_ratio": 0.78, "weights": {"JawOpen": 0.18, "MouthLowerDownLeft": 0.12, "MouthLowerDownRight": 0.11, "MouthStretchLeft": 0.10, "MouthStretchRight": 0.09, "EyeLookDownLeft": 0.12, "EyeLookDownRight": 0.12}},
+    {"name": "Mocap Flow Speech 02", "seconds": 0.11, "transition_ratio": 0.74, "weights": {"JawOpen": 0.31, "MouthLowerDownLeft": 0.23, "MouthLowerDownRight": 0.22, "MouthStretchLeft": 0.20, "MouthStretchRight": 0.18, "BrowInnerUp": 0.10}},
+    {"name": "Mocap Flow Close 01", "seconds": 0.12, "transition_ratio": 0.84, "weights": {"JawOpen": 0.16, "MouthClose": 0.12, "MouthShrugLower": 0.12, "MouthShrugUpper": 0.07, "EyeLookDownLeft": 0.17, "EyeLookDownRight": 0.17}},
+    {"name": "Mocap Flow Pucker 01", "seconds": 0.13, "transition_ratio": 0.78, "weights": {"JawOpen": 0.14, "MouthPucker": 0.24, "MouthFunnel": 0.16, "MouthShrugLower": 0.15, "NoseSneerLeft": 0.08, "NoseSneerRight": 0.09}},
+    {"name": "Mocap Flow Blink Lead", "seconds": 0.08, "transition_ratio": 0.62, "weights": {"EyeBlinkLeft": 0.18, "EyeBlinkRight": 0.16, "EyeSquintLeft": 0.10, "EyeSquintRight": 0.09, "JawOpen": 0.10}},
+    {"name": "Mocap Flow Blink Peak", "seconds": 0.07, "transition_ratio": 0.48, "weights": {"EyeBlinkLeft": 0.72, "EyeBlinkRight": 0.66, "EyeSquintLeft": 0.24, "EyeSquintRight": 0.21, "CheekSquintLeft": 0.14, "CheekSquintRight": 0.12}},
+    {"name": "Mocap Flow Blink Release", "seconds": 0.10, "transition_ratio": 0.88, "weights": {"EyeBlinkLeft": 0.12, "EyeBlinkRight": 0.10, "EyeSquintLeft": 0.08, "EyeSquintRight": 0.07, "JawOpen": 0.12, "MouthStretchLeft": 0.09}},
+    {"name": "Mocap Flow Side Glance", "seconds": 0.13, "transition_ratio": 0.82, "weights": {"EyeLookOutLeft": 0.16, "EyeLookInRight": 0.20, "MouthLeft": 0.07, "MouthSmileLeft": 0.08, "JawOpen": 0.15}},
+    {"name": "Mocap Flow Asym Speech", "seconds": 0.12, "transition_ratio": 0.76, "weights": {"JawOpen": 0.27, "MouthLowerDownLeft": 0.22, "MouthLowerDownRight": 0.20, "MouthSmileLeft": 0.10, "MouthStretchRight": 0.14, "NoseSneerLeft": 0.08}},
+    {"name": "Mocap Flow Soft Smile", "seconds": 0.14, "transition_ratio": 0.84, "weights": {"MouthSmileLeft": 0.18, "MouthSmileRight": 0.14, "CheekSquintLeft": 0.10, "CheekSquintRight": 0.08, "EyeSquintLeft": 0.08, "EyeSquintRight": 0.06, "JawOpen": 0.09}},
+    {"name": "Mocap Flow Open Beat", "seconds": 0.11, "transition_ratio": 0.72, "weights": {"JawOpen": 0.38, "MouthLowerDownLeft": 0.28, "MouthLowerDownRight": 0.27, "MouthStretchLeft": 0.24, "MouthStretchRight": 0.23, "BrowInnerUp": 0.13}},
+    {"name": "Mocap Flow Recover 01", "seconds": 0.13, "transition_ratio": 0.86, "weights": {"JawOpen": 0.18, "MouthFunnel": 0.10, "MouthStretchLeft": 0.11, "MouthStretchRight": 0.10, "EyeLookDownLeft": 0.12, "EyeLookDownRight": 0.12}},
+    {"name": "Mocap Flow Press 01", "seconds": 0.12, "transition_ratio": 0.78, "weights": {"JawOpen": 0.10, "MouthClose": 0.08, "MouthPressLeft": 0.10, "MouthPressRight": 0.11, "MouthShrugLower": 0.13, "NoseSneerRight": 0.08}},
+    {"name": "Mocap Flow Tiny Blink", "seconds": 0.08, "transition_ratio": 0.54, "weights": {"EyeBlinkLeft": 0.34, "EyeBlinkRight": 0.28, "EyeSquintLeft": 0.14, "EyeSquintRight": 0.10, "MouthSmileLeft": 0.08}},
+    {"name": "Mocap Flow Settled Speech", "seconds": 0.13, "transition_ratio": 0.82, "weights": {"JawOpen": 0.22, "MouthLowerDownLeft": 0.17, "MouthLowerDownRight": 0.17, "MouthStretchLeft": 0.15, "MouthStretchRight": 0.14, "BrowInnerUp": 0.07}},
+    {"name": "Mocap Flow Settle", "seconds": 0.18, "transition_ratio": 0.90, "weights": {"EyeLookDownLeft": 0.05, "EyeLookDownRight": 0.05, "JawOpen": 0.04, "MouthSmileLeft": 0.04, "MouthSmileRight": 0.03}},
+    {"name": "Mocap Flow Neutral", "seconds": 0.18, "transition_ratio": 0.92, "weights": {}},
+]
+
+
+FULL_VALIDATION_TEXT_MIX_STATES = []
+
+
+def _full_validation_core_state_specs():
+    ordered_tests = [
+        ("Brow Down Left", {"BrowDownLeft": 1.0}),
+        ("Brow Outer Up Left", {"BrowOuterUpLeft": 1.0}),
+        ("Eye Blink Left", {"EyeBlinkLeft": 1.0}),
+        ("Eye Wide Left", {"EyeWideLeft": 1.0}),
+        ("Eye Squint Left", {"EyeSquintLeft": 1.0}),
+        ("Eye Look Up Left", {"EyeLookUpLeft": 1.0}),
+        ("Eye Look Down Left", {"EyeLookDownLeft": 1.0}),
+        ("Eye Look In Left", {"EyeLookInLeft": 1.0}),
+        ("Eye Look Out Left", {"EyeLookOutLeft": 1.0}),
+        ("Cheek Squint Left", {"CheekSquintLeft": 1.0}),
+        ("Nose Sneer Left", {"NoseSneerLeft": 1.0}),
+        ("Mouth Smile Left", {"MouthSmileLeft": 1.0}),
+        ("Mouth Frown Left", {"MouthFrownLeft": 1.0}),
+        ("Mouth Dimple Left", {"MouthDimpleLeft": 1.0}),
+        ("Mouth Stretch Left", {"MouthStretchLeft": 1.0}),
+        ("Mouth Press Left", {"MouthPressLeft": 1.0}),
+        ("Mouth Lower Down Left", {"MouthLowerDownLeft": 1.0, "JawOpen": 0.42}),
+        ("Mouth Upper Up Left", {"MouthUpperUpLeft": 1.0}),
+        ("Brow Down Right", {"BrowDownRight": 1.0}),
+        ("Brow Outer Up Right", {"BrowOuterUpRight": 1.0}),
+        ("Eye Blink Right", {"EyeBlinkRight": 1.0}),
+        ("Eye Wide Right", {"EyeWideRight": 1.0}),
+        ("Eye Squint Right", {"EyeSquintRight": 1.0}),
+        ("Eye Look Up Right", {"EyeLookUpRight": 1.0}),
+        ("Eye Look Down Right", {"EyeLookDownRight": 1.0}),
+        ("Eye Look In Right", {"EyeLookInRight": 1.0}),
+        ("Eye Look Out Right", {"EyeLookOutRight": 1.0}),
+        ("Cheek Squint Right", {"CheekSquintRight": 1.0}),
+        ("Nose Sneer Right", {"NoseSneerRight": 1.0}),
+        ("Mouth Smile Right", {"MouthSmileRight": 1.0}),
+        ("Mouth Frown Right", {"MouthFrownRight": 1.0}),
+        ("Mouth Dimple Right", {"MouthDimpleRight": 1.0}),
+        ("Mouth Stretch Right", {"MouthStretchRight": 1.0}),
+        ("Mouth Press Right", {"MouthPressRight": 1.0}),
+        ("Mouth Lower Down Right", {"MouthLowerDownRight": 1.0, "JawOpen": 0.42}),
+        ("Mouth Upper Up Right", {"MouthUpperUpRight": 1.0}),
+        ("Brow Inner Up", {"BrowInnerUp": 1.0}),
+        ("Cheek Puff", {"CheekPuff": 1.0}),
+        ("Jaw Open", {"JawOpen": 1.0}),
+        ("Jaw Forward", {"JawForward": 1.0}),
+        ("Jaw Left", {"JawLeft": 1.0}),
+        ("Jaw Right", {"JawRight": 1.0}),
+        ("Mouth Close", {"JawOpen": 1.0, "MouthClose": 1.0}),
+        ("Mouth Funnel", {"JawOpen": 0.42, "MouthFunnel": 1.0}),
+        ("Mouth Pucker", {"JawOpen": 0.28, "MouthPucker": 1.0}),
+        ("Mouth Left", {"MouthLeft": 1.0}),
+        ("Mouth Right", {"MouthRight": 1.0}),
+        ("Mouth Roll Lower", {"JawOpen": 0.18, "MouthRollLower": 1.0}),
+        ("Mouth Roll Upper", {"JawOpen": 0.14, "MouthRollUpper": 1.0}),
+        ("Mouth Shrug Lower", {"JawOpen": 0.16, "MouthShrugLower": 1.0}),
+        ("Mouth Shrug Upper", {"JawOpen": 0.12, "MouthShrugUpper": 1.0}),
+        ("Tongue Out", {"JawOpen": 0.70, "TongueOut": 1.0}),
+        ("Mouth A Open", {"JawOpen": 0.78, "MouthLowerDownLeft": 0.55, "MouthLowerDownRight": 0.55}),
+        ("Mouth O Funnel", {"JawOpen": 0.42, "MouthFunnel": 0.95}),
+        ("Mouth U Pucker", {"JawOpen": 0.28, "MouthPucker": 0.95}),
+        ("Mouth E Stretch", {"JawOpen": 0.24, "MouthStretchLeft": 0.85, "MouthStretchRight": 0.85}),
+        ("Mouth Smile Pair", {"MouthSmileLeft": 0.85, "MouthSmileRight": 0.85, "CheekSquintLeft": 0.24, "CheekSquintRight": 0.24}),
+    ]
+    states = [{"name": "00 Neutral", "seconds": 0.20, "transition_ratio": 0.72, "weights": {}}]
+    for index, (name, weights) in enumerate(ordered_tests, start=1):
+        states.append({"name": f"{index:02d} {name}", "seconds": 0.26, "transition_ratio": 0.52, "weights": weights})
+    states.append({"name": f"{len(states):02d} Return To Neutral", "seconds": 0.24, "transition_ratio": 0.84, "weights": {}})
+    return states
+
+
+_regular_full_validation_core_state_specs = _full_validation_core_state_specs
+
+
+def _full_validation_core_state_specs():
+    base_states = _regular_full_validation_core_state_specs()
+    eye_brow_accents = [
+        {"EyeSquintLeft": 0.18, "EyeSquintRight": 0.14, "BrowDownLeft": 0.10},
+        {"EyeSquintRight": 0.18, "EyeSquintLeft": 0.14, "BrowDownRight": 0.10},
+        {"EyeWideLeft": 0.20, "EyeWideRight": 0.16, "BrowInnerUp": 0.16},
+        {"EyeLookDownLeft": 0.18, "EyeLookDownRight": 0.18, "BrowInnerUp": 0.10},
+        {"EyeBlinkLeft": 0.32, "EyeBlinkRight": 0.22, "EyeSquintLeft": 0.12},
+        {"EyeBlinkRight": 0.32, "EyeBlinkLeft": 0.22, "EyeSquintRight": 0.12},
+    ]
+    accent_keys = {key for accent in eye_brow_accents for key in accent}
+    expanded_states = []
+    mouth_index = 0
+
+    def renumbered_name(label):
+        parts = str(label or "").split(" ", 1)
+        clean_label = parts[1] if parts and parts[0].isdigit() and len(parts) > 1 else str(label or "")
+        return f"{len(expanded_states):02d} {clean_label}"
+
+    for state in base_states:
+        label = str(state.get("name", "State"))
+        weights = dict(state.get("weights") or {})
+        if "Mouth" not in label:
+            next_state = dict(state)
+            next_state["name"] = renumbered_name(label)
+            next_state["weights"] = weights
+            expanded_states.append(next_state)
+            continue
+
+        base_weights = {key: value for key, value in weights.items() if key not in accent_keys}
+        for accent_offset in range(3):
+            next_weights = dict(base_weights)
+            next_weights.update(eye_brow_accents[(mouth_index + accent_offset) % len(eye_brow_accents)])
+            next_state = dict(state)
+            next_state["name"] = f"{renumbered_name(label)} Eye Brow Mix {accent_offset + 1}"
+            next_state["seconds"] = 0.20
+            next_state["transition_ratio"] = min(float(state.get("transition_ratio", 0.52) or 0.52), 0.50)
+            next_state["weights"] = next_weights
+            expanded_states.append(next_state)
+        mouth_index += 3
+
+    return expanded_states
+
+
+FULL_VALIDATION_TEXT_MIX_STATES = []
+
+
+def _full_validation_core_state_specs():
+    left_tests = [
+        ("Brow Down Left", {"BrowDownLeft": 1.0}),
+        ("Brow Outer Up Left", {"BrowOuterUpLeft": 1.0}),
+        ("Eye Blink Left", {"EyeBlinkLeft": 1.0}),
+        ("Eye Wide Left", {"EyeWideLeft": 1.0}),
+        ("Eye Squint Left", {"EyeSquintLeft": 1.0}),
+        ("Eye Look Up Left", {"EyeLookUpLeft": 1.0}),
+        ("Eye Look Down Left", {"EyeLookDownLeft": 1.0}),
+        ("Eye Look In Left", {"EyeLookInLeft": 1.0}),
+        ("Eye Look Out Left", {"EyeLookOutLeft": 1.0}),
+        ("Cheek Squint Left", {"CheekSquintLeft": 1.0}),
+        ("Nose Sneer Left", {"NoseSneerLeft": 1.0}),
+        ("Mouth Smile Left", {"MouthSmileLeft": 1.0}),
+        ("Mouth Frown Left", {"MouthFrownLeft": 1.0}),
+        ("Mouth Dimple Left", {"MouthDimpleLeft": 1.0}),
+        ("Mouth Stretch Left", {"MouthStretchLeft": 1.0}),
+        ("Mouth Press Left", {"MouthPressLeft": 1.0}),
+        ("Mouth Lower Down Left", {"MouthLowerDownLeft": 1.0, "JawOpen": 0.42}),
+        ("Mouth Upper Up Left", {"MouthUpperUpLeft": 1.0}),
+    ]
+    right_tests = [
+        ("Brow Down Right", {"BrowDownRight": 1.0}),
+        ("Brow Outer Up Right", {"BrowOuterUpRight": 1.0}),
+        ("Eye Blink Right", {"EyeBlinkRight": 1.0}),
+        ("Eye Wide Right", {"EyeWideRight": 1.0}),
+        ("Eye Squint Right", {"EyeSquintRight": 1.0}),
+        ("Eye Look Up Right", {"EyeLookUpRight": 1.0}),
+        ("Eye Look Down Right", {"EyeLookDownRight": 1.0}),
+        ("Eye Look In Right", {"EyeLookInRight": 1.0}),
+        ("Eye Look Out Right", {"EyeLookOutRight": 1.0}),
+        ("Cheek Squint Right", {"CheekSquintRight": 1.0}),
+        ("Nose Sneer Right", {"NoseSneerRight": 1.0}),
+        ("Mouth Smile Right", {"MouthSmileRight": 1.0}),
+        ("Mouth Frown Right", {"MouthFrownRight": 1.0}),
+        ("Mouth Dimple Right", {"MouthDimpleRight": 1.0}),
+        ("Mouth Stretch Right", {"MouthStretchRight": 1.0}),
+        ("Mouth Press Right", {"MouthPressRight": 1.0}),
+        ("Mouth Lower Down Right", {"MouthLowerDownRight": 1.0, "JawOpen": 0.42}),
+        ("Mouth Upper Up Right", {"MouthUpperUpRight": 1.0}),
+    ]
+    center_and_mouth_tests = [
+        ("Brow Inner Up", {"BrowInnerUp": 1.0}),
+        ("Cheek Puff", {"CheekPuff": 1.0}),
+        ("Jaw Open", {"JawOpen": 1.0}),
+        ("Jaw Forward", {"JawForward": 1.0}),
+        ("Jaw Left", {"JawLeft": 1.0}),
+        ("Jaw Right", {"JawRight": 1.0}),
+        ("Mouth Close", {"JawOpen": 1.0, "MouthClose": 1.0}),
+        ("Mouth Funnel", {"JawOpen": 0.42, "MouthFunnel": 1.0}),
+        ("Mouth Pucker", {"JawOpen": 0.28, "MouthPucker": 1.0}),
+        ("Mouth Left", {"MouthLeft": 1.0}),
+        ("Mouth Right", {"MouthRight": 1.0}),
+        ("Mouth Roll Lower", {"JawOpen": 0.18, "MouthRollLower": 1.0}),
+        ("Mouth Roll Upper", {"JawOpen": 0.14, "MouthRollUpper": 1.0}),
+        ("Mouth Shrug Lower", {"JawOpen": 0.16, "MouthShrugLower": 1.0}),
+        ("Mouth Shrug Upper", {"JawOpen": 0.12, "MouthShrugUpper": 1.0}),
+        ("Tongue Out", {"JawOpen": 0.70, "TongueOut": 1.0}),
+        ("Mouth A Open", {"JawOpen": 0.78, "MouthLowerDownLeft": 0.55, "MouthLowerDownRight": 0.55}),
+        ("Mouth O Funnel", {"JawOpen": 0.42, "MouthFunnel": 0.95}),
+        ("Mouth U Pucker", {"JawOpen": 0.28, "MouthPucker": 0.95}),
+        ("Mouth E Stretch", {"JawOpen": 0.24, "MouthStretchLeft": 0.85, "MouthStretchRight": 0.85}),
+        ("Mouth Smile Pair", {"MouthSmileLeft": 0.85, "MouthSmileRight": 0.85, "CheekSquintLeft": 0.24, "CheekSquintRight": 0.24}),
+    ]
+    eye_brow_accents = [
+        {"EyeSquintLeft": 0.18, "EyeSquintRight": 0.14, "BrowDownLeft": 0.10},
+        {"EyeSquintRight": 0.18, "EyeSquintLeft": 0.14, "BrowDownRight": 0.10},
+        {"EyeWideLeft": 0.20, "EyeWideRight": 0.16, "BrowInnerUp": 0.16},
+        {"EyeLookDownLeft": 0.18, "EyeLookDownRight": 0.18, "BrowInnerUp": 0.10},
+        {"EyeBlinkLeft": 0.32, "EyeBlinkRight": 0.22, "EyeSquintLeft": 0.12},
+        {"EyeBlinkRight": 0.32, "EyeBlinkLeft": 0.22, "EyeSquintRight": 0.12},
+    ]
+    states = [{"name": "00 Neutral", "seconds": 0.20, "transition_ratio": 0.72, "weights": {}}]
+    mouth_index = 0
+
+    def append_state(name, weights, seconds=0.26, transition_ratio=0.52):
+        states.append({
+            "name": f"{len(states):02d} {name}",
+            "seconds": seconds,
+            "transition_ratio": transition_ratio,
+            "weights": weights,
+        })
+
+    for name, weights in left_tests + right_tests + center_and_mouth_tests:
+        if not name.startswith("Mouth"):
+            append_state(name, dict(weights))
+            continue
+
+        for accent_offset in range(3):
+            next_weights = dict(weights)
+            accent = eye_brow_accents[(mouth_index + accent_offset) % len(eye_brow_accents)]
+            for key_name, value in accent.items():
+                next_weights.setdefault(key_name, value)
+            append_state(f"{name} Eye Brow Mix {accent_offset + 1}", next_weights, seconds=0.20, transition_ratio=0.50)
+        mouth_index += 3
+    states.append({"name": f"{len(states):02d} Return To Neutral", "seconds": 0.24, "transition_ratio": 0.84, "weights": {}})
+    return states
+
+
+def _full_validation_core_state_specs():
+    ordered_single_tests = [
+        ("Brow Down Left", {"BrowDownLeft": 1.0}),
+        ("Brow Down Right", {"BrowDownRight": 1.0}),
+        ("Brow Inner Up", {"BrowInnerUp": 1.0}),
+        ("Brow Outer Up Left", {"BrowOuterUpLeft": 1.0}),
+        ("Brow Outer Up Right", {"BrowOuterUpRight": 1.0}),
+        ("Eye Blink Left", {"EyeBlinkLeft": 1.0}),
+        ("Eye Blink Right", {"EyeBlinkRight": 1.0}),
+        ("Eye Wide Left", {"EyeWideLeft": 1.0}),
+        ("Eye Wide Right", {"EyeWideRight": 1.0}),
+        ("Eye Squint Left", {"EyeSquintLeft": 1.0}),
+        ("Eye Squint Right", {"EyeSquintRight": 1.0}),
+        ("Eye Look Up Left", {"EyeLookUpLeft": 1.0}),
+        ("Eye Look Up Right", {"EyeLookUpRight": 1.0}),
+        ("Eye Look Down Left", {"EyeLookDownLeft": 1.0}),
+        ("Eye Look Down Right", {"EyeLookDownRight": 1.0}),
+        ("Eye Look Out Left", {"EyeLookOutLeft": 1.0}),
+        ("Eye Look In Right", {"EyeLookInRight": 1.0}),
+        ("Eye Look In Left", {"EyeLookInLeft": 1.0}),
+        ("Eye Look Out Right", {"EyeLookOutRight": 1.0}),
+        ("Cheek Puff", {"CheekPuff": 1.0}),
+        ("Cheek Squint Left", {"CheekSquintLeft": 1.0}),
+        ("Cheek Squint Right", {"CheekSquintRight": 1.0}),
+        ("Nose Sneer Left", {"NoseSneerLeft": 1.0}),
+        ("Nose Sneer Right", {"NoseSneerRight": 1.0}),
+        ("Jaw Open", {"JawOpen": 1.0}),
+        ("Jaw Forward", {"JawForward": 1.0}),
+        ("Jaw Left", {"JawLeft": 1.0}),
+        ("Jaw Right", {"JawRight": 1.0}),
+        ("Mouth Close Jaw Rule", {"JawOpen": 1.0, "MouthClose": 1.0}),
+        ("Mouth Funnel", {"MouthFunnel": 1.0, "JawOpen": 0.42}),
+        ("Mouth Pucker", {"MouthPucker": 1.0, "JawOpen": 0.28}),
+        ("Mouth Left", {"MouthLeft": 1.0}),
+        ("Mouth Right", {"MouthRight": 1.0}),
+        ("Mouth Smile Left", {"MouthSmileLeft": 1.0}),
+        ("Mouth Smile Right", {"MouthSmileRight": 1.0}),
+        ("Mouth Frown Left", {"MouthFrownLeft": 1.0}),
+        ("Mouth Frown Right", {"MouthFrownRight": 1.0}),
+        ("Mouth Dimple Left", {"MouthDimpleLeft": 1.0}),
+        ("Mouth Dimple Right", {"MouthDimpleRight": 1.0}),
+        ("Mouth Stretch Left", {"MouthStretchLeft": 1.0}),
+        ("Mouth Stretch Right", {"MouthStretchRight": 1.0}),
+        ("Mouth Roll Lower", {"MouthRollLower": 1.0, "JawOpen": 0.18}),
+        ("Mouth Roll Upper", {"MouthRollUpper": 1.0, "JawOpen": 0.14}),
+        ("Mouth Shrug Lower", {"MouthShrugLower": 1.0, "JawOpen": 0.16}),
+        ("Mouth Shrug Upper", {"MouthShrugUpper": 1.0, "JawOpen": 0.12}),
+        ("Mouth Press Left", {"MouthPressLeft": 1.0}),
+        ("Mouth Press Right", {"MouthPressRight": 1.0}),
+        ("Mouth Lower Down Left", {"MouthLowerDownLeft": 1.0, "JawOpen": 0.42}),
+        ("Mouth Lower Down Right", {"MouthLowerDownRight": 1.0, "JawOpen": 0.42}),
+        ("Mouth Upper Up Left", {"MouthUpperUpLeft": 1.0}),
+        ("Mouth Upper Up Right", {"MouthUpperUpRight": 1.0}),
+        ("Tongue Out", {"TongueOut": 1.0, "JawOpen": 0.70}),
+    ]
+    mouth_sequence = [
+        ("Mouth Sequence A Open", {"JawOpen": 0.78, "MouthLowerDownLeft": 0.55, "MouthLowerDownRight": 0.55}),
+        ("Mouth Sequence O Funnel", {"JawOpen": 0.42, "MouthFunnel": 0.95}),
+        ("Mouth Sequence U Pucker", {"JawOpen": 0.28, "MouthPucker": 0.95}),
+        ("Mouth Sequence E Stretch", {"MouthStretchLeft": 0.85, "MouthStretchRight": 0.85, "JawOpen": 0.24}),
+        ("Mouth Sequence Smile", {"MouthSmileLeft": 0.85, "MouthSmileRight": 0.85, "CheekSquintLeft": 0.24, "CheekSquintRight": 0.24}),
+        ("Eye Mouth Combined Left", {"EyeSquintLeft": 0.45, "CheekSquintLeft": 0.45, "MouthSmileLeft": 0.85}),
+        ("Eye Mouth Combined Right", {"EyeSquintRight": 0.45, "CheekSquintRight": 0.45, "MouthSmileRight": 0.85}),
+    ]
+    states = [{"name": "00 Neutral Calibration", "seconds": 0.22, "transition_ratio": 0.72, "weights": {}}]
+    for index, (name, weights) in enumerate(ordered_single_tests, start=1):
+        states.append({"name": f"{index:02d} {name}", "seconds": 0.28, "transition_ratio": 0.52, "weights": weights})
+    offset = len(states)
+    for index, (name, weights) in enumerate(mouth_sequence, start=offset):
+        states.append({"name": f"{index:02d} {name}", "seconds": 0.24, "transition_ratio": 0.50, "weights": weights})
+    states.append({"name": f"{len(states):02d} Return To Neutral", "seconds": 0.26, "transition_ratio": 0.84, "weights": {}})
+    return states
+
+
+FULL_VALIDATION_TEXT_MIX_STATES = []
+
+
+def _full_validation_core_state_specs():
+    ordered_tests = [
+        ("Brow Down Left", {"BrowDownLeft": 1.0}),
+        ("Brow Outer Up Left", {"BrowOuterUpLeft": 1.0}),
+        ("Eye Blink Left", {"EyeBlinkLeft": 1.0}),
+        ("Eye Wide Left", {"EyeWideLeft": 1.0}),
+        ("Eye Squint Left", {"EyeSquintLeft": 1.0}),
+        ("Eye Look Up Left", {"EyeLookUpLeft": 1.0}),
+        ("Eye Look Down Left", {"EyeLookDownLeft": 1.0}),
+        ("Eye Look In Left", {"EyeLookInLeft": 1.0}),
+        ("Eye Look Out Left", {"EyeLookOutLeft": 1.0}),
+        ("Cheek Squint Left", {"CheekSquintLeft": 1.0}),
+        ("Nose Sneer Left", {"NoseSneerLeft": 1.0}),
+        ("Mouth Smile Left", {"MouthSmileLeft": 1.0}),
+        ("Mouth Frown Left", {"MouthFrownLeft": 1.0}),
+        ("Mouth Dimple Left", {"MouthDimpleLeft": 1.0}),
+        ("Mouth Stretch Left", {"MouthStretchLeft": 1.0}),
+        ("Mouth Press Left", {"MouthPressLeft": 1.0}),
+        ("Mouth Lower Down Left", {"MouthLowerDownLeft": 1.0, "JawOpen": 0.42}),
+        ("Mouth Upper Up Left", {"MouthUpperUpLeft": 1.0}),
+        ("Brow Down Right", {"BrowDownRight": 1.0}),
+        ("Brow Outer Up Right", {"BrowOuterUpRight": 1.0}),
+        ("Eye Blink Right", {"EyeBlinkRight": 1.0}),
+        ("Eye Wide Right", {"EyeWideRight": 1.0}),
+        ("Eye Squint Right", {"EyeSquintRight": 1.0}),
+        ("Eye Look Up Right", {"EyeLookUpRight": 1.0}),
+        ("Eye Look Down Right", {"EyeLookDownRight": 1.0}),
+        ("Eye Look In Right", {"EyeLookInRight": 1.0}),
+        ("Eye Look Out Right", {"EyeLookOutRight": 1.0}),
+        ("Cheek Squint Right", {"CheekSquintRight": 1.0}),
+        ("Nose Sneer Right", {"NoseSneerRight": 1.0}),
+        ("Mouth Smile Right", {"MouthSmileRight": 1.0}),
+        ("Mouth Frown Right", {"MouthFrownRight": 1.0}),
+        ("Mouth Dimple Right", {"MouthDimpleRight": 1.0}),
+        ("Mouth Stretch Right", {"MouthStretchRight": 1.0}),
+        ("Mouth Press Right", {"MouthPressRight": 1.0}),
+        ("Mouth Lower Down Right", {"MouthLowerDownRight": 1.0, "JawOpen": 0.42}),
+        ("Mouth Upper Up Right", {"MouthUpperUpRight": 1.0}),
+        ("Brow Inner Up", {"BrowInnerUp": 1.0}),
+        ("Cheek Puff", {"CheekPuff": 1.0}),
+        ("Jaw Open", {"JawOpen": 1.0}),
+        ("Jaw Forward", {"JawForward": 1.0}),
+        ("Jaw Left", {"JawLeft": 1.0}),
+        ("Jaw Right", {"JawRight": 1.0}),
+        ("Mouth Close", {"JawOpen": 1.0, "MouthClose": 1.0}),
+        ("Mouth Funnel", {"JawOpen": 0.42, "MouthFunnel": 1.0}),
+        ("Mouth Pucker", {"JawOpen": 0.28, "MouthPucker": 1.0}),
+        ("Mouth Left", {"MouthLeft": 1.0}),
+        ("Mouth Right", {"MouthRight": 1.0}),
+        ("Mouth Roll Lower", {"JawOpen": 0.18, "MouthRollLower": 1.0}),
+        ("Mouth Roll Upper", {"JawOpen": 0.14, "MouthRollUpper": 1.0}),
+        ("Mouth Shrug Lower", {"JawOpen": 0.16, "MouthShrugLower": 1.0}),
+        ("Mouth Shrug Upper", {"JawOpen": 0.12, "MouthShrugUpper": 1.0}),
+        ("Tongue Out", {"JawOpen": 0.70, "TongueOut": 1.0}),
+        ("Mouth A Open", {"JawOpen": 0.78, "MouthLowerDownLeft": 0.55, "MouthLowerDownRight": 0.55}),
+        ("Mouth O Funnel", {"JawOpen": 0.42, "MouthFunnel": 0.95}),
+        ("Mouth U Pucker", {"JawOpen": 0.28, "MouthPucker": 0.95}),
+        ("Mouth E Stretch", {"JawOpen": 0.24, "MouthStretchLeft": 0.85, "MouthStretchRight": 0.85}),
+        ("Mouth Smile Pair", {"MouthSmileLeft": 0.85, "MouthSmileRight": 0.85, "CheekSquintLeft": 0.24, "CheekSquintRight": 0.24}),
+    ]
+    states = [{"name": "00 Neutral", "seconds": 0.20, "transition_ratio": 0.72, "weights": {}}]
+    for index, (name, weights) in enumerate(ordered_tests, start=1):
+        states.append({"name": f"{index:02d} {name}", "seconds": 0.26, "transition_ratio": 0.52, "weights": weights})
+    states.append({"name": f"{len(states):02d} Return To Neutral", "seconds": 0.24, "transition_ratio": 0.84, "weights": {}})
+    return states
+
+
+def _full_validation_core_state_specs():
+    return [
+        {"name": "00 Neutral Calibration", "seconds": 0.22, "transition_ratio": 0.72, "weights": {}},
+        {"name": "01 Brow Down Left", "seconds": 0.28, "transition_ratio": 0.54, "weights": {"BrowDownLeft": 1.0}},
+        {"name": "02 Brow Down Right", "seconds": 0.28, "transition_ratio": 0.54, "weights": {"BrowDownRight": 1.0}},
+        {"name": "03 Brow Inner Up", "seconds": 0.30, "transition_ratio": 0.56, "weights": {"BrowInnerUp": 1.0}},
+        {"name": "04 Brow Outer Up Left", "seconds": 0.28, "transition_ratio": 0.54, "weights": {"BrowOuterUpLeft": 1.0}},
+        {"name": "05 Brow Outer Up Right", "seconds": 0.28, "transition_ratio": 0.54, "weights": {"BrowOuterUpRight": 1.0}},
+        {"name": "06 Eye Blink Left", "seconds": 0.24, "transition_ratio": 0.42, "weights": {"EyeBlinkLeft": 1.0}},
+        {"name": "07 Eye Blink Right", "seconds": 0.24, "transition_ratio": 0.42, "weights": {"EyeBlinkRight": 1.0}},
+        {"name": "08 Eye Wide Left", "seconds": 0.26, "transition_ratio": 0.50, "weights": {"EyeWideLeft": 1.0}},
+        {"name": "09 Eye Wide Right", "seconds": 0.26, "transition_ratio": 0.50, "weights": {"EyeWideRight": 1.0}},
+        {"name": "10 Eye Squint Left", "seconds": 0.26, "transition_ratio": 0.50, "weights": {"EyeSquintLeft": 1.0}},
+        {"name": "11 Eye Squint Right", "seconds": 0.26, "transition_ratio": 0.50, "weights": {"EyeSquintRight": 1.0}},
+        {"name": "12 Eye Look Up Left", "seconds": 0.24, "transition_ratio": 0.52, "weights": {"EyeLookUpLeft": 1.0}},
+        {"name": "13 Eye Look Up Right", "seconds": 0.24, "transition_ratio": 0.52, "weights": {"EyeLookUpRight": 1.0}},
+        {"name": "14 Eye Look Down Left", "seconds": 0.24, "transition_ratio": 0.52, "weights": {"EyeLookDownLeft": 1.0}},
+        {"name": "15 Eye Look Down Right", "seconds": 0.24, "transition_ratio": 0.52, "weights": {"EyeLookDownRight": 1.0}},
+        {"name": "16 Eye Look Out Left", "seconds": 0.24, "transition_ratio": 0.52, "weights": {"EyeLookOutLeft": 1.0}},
+        {"name": "17 Eye Look In Right", "seconds": 0.24, "transition_ratio": 0.52, "weights": {"EyeLookInRight": 1.0}},
+        {"name": "18 Eye Look In Left", "seconds": 0.24, "transition_ratio": 0.52, "weights": {"EyeLookInLeft": 1.0}},
+        {"name": "19 Eye Look Out Right", "seconds": 0.24, "transition_ratio": 0.52, "weights": {"EyeLookOutRight": 1.0}},
+        {"name": "20 Cheek Puff", "seconds": 0.30, "transition_ratio": 0.58, "weights": {"CheekPuff": 1.0}},
+        {"name": "21 Cheek Squint Left", "seconds": 0.26, "transition_ratio": 0.52, "weights": {"CheekSquintLeft": 1.0}},
+        {"name": "22 Cheek Squint Right", "seconds": 0.26, "transition_ratio": 0.52, "weights": {"CheekSquintRight": 1.0}},
+        {"name": "23 Nose Sneer Left", "seconds": 0.26, "transition_ratio": 0.52, "weights": {"NoseSneerLeft": 1.0}},
+        {"name": "24 Nose Sneer Right", "seconds": 0.26, "transition_ratio": 0.52, "weights": {"NoseSneerRight": 1.0}},
+        {"name": "25 Jaw Open", "seconds": 0.34, "transition_ratio": 0.50, "weights": {"JawOpen": 1.0}},
+        {"name": "26 Jaw Forward", "seconds": 0.28, "transition_ratio": 0.52, "weights": {"JawForward": 1.0}},
+        {"name": "27 Jaw Left", "seconds": 0.28, "transition_ratio": 0.52, "weights": {"JawLeft": 1.0}},
+        {"name": "28 Jaw Right", "seconds": 0.28, "transition_ratio": 0.52, "weights": {"JawRight": 1.0}},
+        {"name": "29 Mouth Close Jaw Rule", "seconds": 0.34, "transition_ratio": 0.50, "weights": {"JawOpen": 1.0, "MouthClose": 1.0}},
+        {"name": "30 Mouth Funnel", "seconds": 0.32, "transition_ratio": 0.50, "weights": {"MouthFunnel": 1.0, "JawOpen": 0.42}},
+        {"name": "31 Mouth Pucker", "seconds": 0.32, "transition_ratio": 0.50, "weights": {"MouthPucker": 1.0, "JawOpen": 0.28}},
+        {"name": "32 Mouth Left", "seconds": 0.28, "transition_ratio": 0.52, "weights": {"MouthLeft": 1.0}},
+        {"name": "33 Mouth Right", "seconds": 0.28, "transition_ratio": 0.52, "weights": {"MouthRight": 1.0}},
+        {"name": "34 Mouth Smile Left", "seconds": 0.28, "transition_ratio": 0.52, "weights": {"MouthSmileLeft": 1.0}},
+        {"name": "35 Mouth Smile Right", "seconds": 0.28, "transition_ratio": 0.52, "weights": {"MouthSmileRight": 1.0}},
+        {"name": "36 Mouth Frown Left", "seconds": 0.28, "transition_ratio": 0.52, "weights": {"MouthFrownLeft": 1.0}},
+        {"name": "37 Mouth Frown Right", "seconds": 0.28, "transition_ratio": 0.52, "weights": {"MouthFrownRight": 1.0}},
+        {"name": "38 Mouth Dimple Left", "seconds": 0.26, "transition_ratio": 0.52, "weights": {"MouthDimpleLeft": 1.0}},
+        {"name": "39 Mouth Dimple Right", "seconds": 0.26, "transition_ratio": 0.52, "weights": {"MouthDimpleRight": 1.0}},
+        {"name": "40 Mouth Stretch Left", "seconds": 0.28, "transition_ratio": 0.52, "weights": {"MouthStretchLeft": 1.0}},
+        {"name": "41 Mouth Stretch Right", "seconds": 0.28, "transition_ratio": 0.52, "weights": {"MouthStretchRight": 1.0}},
+        {"name": "42 Mouth Roll Lower", "seconds": 0.28, "transition_ratio": 0.52, "weights": {"MouthRollLower": 1.0, "JawOpen": 0.18}},
+        {"name": "43 Mouth Roll Upper", "seconds": 0.28, "transition_ratio": 0.52, "weights": {"MouthRollUpper": 1.0, "JawOpen": 0.14}},
+        {"name": "44 Mouth Shrug Lower", "seconds": 0.28, "transition_ratio": 0.52, "weights": {"MouthShrugLower": 1.0, "JawOpen": 0.16}},
+        {"name": "45 Mouth Shrug Upper", "seconds": 0.28, "transition_ratio": 0.52, "weights": {"MouthShrugUpper": 1.0, "JawOpen": 0.12}},
+        {"name": "46 Mouth Press Left", "seconds": 0.26, "transition_ratio": 0.52, "weights": {"MouthPressLeft": 1.0}},
+        {"name": "47 Mouth Press Right", "seconds": 0.26, "transition_ratio": 0.52, "weights": {"MouthPressRight": 1.0}},
+        {"name": "48 Mouth Lower Down Left", "seconds": 0.30, "transition_ratio": 0.52, "weights": {"MouthLowerDownLeft": 1.0, "JawOpen": 0.42}},
+        {"name": "49 Mouth Lower Down Right", "seconds": 0.30, "transition_ratio": 0.52, "weights": {"MouthLowerDownRight": 1.0, "JawOpen": 0.42}},
+        {"name": "50 Mouth Upper Up Left", "seconds": 0.28, "transition_ratio": 0.52, "weights": {"MouthUpperUpLeft": 1.0}},
+        {"name": "51 Mouth Upper Up Right", "seconds": 0.28, "transition_ratio": 0.52, "weights": {"MouthUpperUpRight": 1.0}},
+        {"name": "52 Tongue Out", "seconds": 0.32, "transition_ratio": 0.50, "weights": {"TongueOut": 1.0, "JawOpen": 0.70}},
+        {"name": "53 Mouth Sequence A Open", "seconds": 0.24, "transition_ratio": 0.50, "weights": {"JawOpen": 0.78, "MouthLowerDownLeft": 0.55, "MouthLowerDownRight": 0.55}},
+        {"name": "54 Mouth Sequence O Funnel", "seconds": 0.24, "transition_ratio": 0.50, "weights": {"JawOpen": 0.42, "MouthFunnel": 0.95}},
+        {"name": "55 Mouth Sequence U Pucker", "seconds": 0.24, "transition_ratio": 0.50, "weights": {"JawOpen": 0.28, "MouthPucker": 0.95}},
+        {"name": "56 Mouth Sequence E Stretch", "seconds": 0.24, "transition_ratio": 0.50, "weights": {"MouthStretchLeft": 0.85, "MouthStretchRight": 0.85, "JawOpen": 0.24}},
+        {"name": "57 Mouth Sequence Smile", "seconds": 0.24, "transition_ratio": 0.50, "weights": {"MouthSmileLeft": 0.85, "MouthSmileRight": 0.85, "CheekSquintLeft": 0.24, "CheekSquintRight": 0.24}},
+        {"name": "58 Eye Mouth Combined Left", "seconds": 0.28, "transition_ratio": 0.50, "weights": {"EyeSquintLeft": 0.45, "CheekSquintLeft": 0.45, "MouthSmileLeft": 0.85}},
+        {"name": "59 Eye Mouth Combined Right", "seconds": 0.28, "transition_ratio": 0.50, "weights": {"EyeSquintRight": 0.45, "CheekSquintRight": 0.45, "MouthSmileRight": 0.85}},
+        {"name": "60 Return To Neutral", "seconds": 0.26, "transition_ratio": 0.84, "weights": {}},
+    ]
+
+
 def _resolve_full_validation_states_for_object(key_blocks, items, target_count=70):
     del items, target_count
     available_names = [str(getattr(key_block, "name", "") or "") for index, key_block in enumerate(key_blocks or []) if index != 0]
@@ -2662,7 +3226,6 @@ def _state_target_values(state):
     for key_name, value in dict((state or {}).get("weights", {}) or {}).items():
         target_values[str(key_name)] = max(0.0, min(1.0, float(value or 0.0)))
 
-    target_values = _soften_opposing_target_values(target_values)
     jaw_open = max(0.0, min(1.0, float(target_values.get("JawOpen", 0.0) or 0.0)))
     blink_left = max(0.0, min(1.0, float(target_values.get("EyeBlinkLeft", 0.0) or 0.0)))
     blink_right = max(0.0, min(1.0, float(target_values.get("EyeBlinkRight", 0.0) or 0.0)))
@@ -2672,9 +3235,9 @@ def _state_target_values(state):
     funnel = max(0.0, min(1.0, float(target_values.get("MouthFunnel", 0.0) or 0.0)))
     mouth_close = max(0.0, min(1.0, float(target_values.get("MouthClose", 0.0) or 0.0)))
 
-    if "EyeWideLeft" in target_values:
+    if "EyeWideLeft" in target_values and float(target_values.get("EyeWideLeft", 0.0) or 0.0) < 1.0:
         target_values["EyeWideLeft"] = max(0.0, min(1.0, float(target_values["EyeWideLeft"]) * (1.0 - (0.85 * blink_left)) * (1.0 - (0.62 * squint_left))))
-    if "EyeWideRight" in target_values:
+    if "EyeWideRight" in target_values and float(target_values.get("EyeWideRight", 0.0) or 0.0) < 1.0:
         target_values["EyeWideRight"] = max(0.0, min(1.0, float(target_values["EyeWideRight"]) * (1.0 - (0.85 * blink_right)) * (1.0 - (0.62 * squint_right))))
 
     if pucker > 0.0 or funnel > 0.0:
@@ -2691,8 +3254,11 @@ def _state_target_values(state):
         target_values["MouthStretchRight"] = max(float(target_values.get("MouthStretchRight", 0.0) or 0.0), jaw_open * 0.08)
 
     if mouth_close > 0.0:
-        target_values["JawOpen"] = max(jaw_open, mouth_close)
-        target_values["MouthClose"] = min(mouth_close, float(target_values.get("JawOpen", 0.0) or 0.0))
+        if jaw_open <= 0.0:
+            jaw_open = min(1.0, mouth_close + 0.08)
+            target_values["JawOpen"] = jaw_open
+        mouth_close = mouth_close * (1.0 - (0.75 * jaw_open))
+        target_values["MouthClose"] = min(mouth_close, max(0.0, jaw_open - 0.02))
         for conflict_key in ("MouthPressLeft", "MouthPressRight", "MouthPucker", "MouthFunnel", "MouthShrugUpper", "MouthShrugLower"):
             if conflict_key in target_values:
                 target_values[conflict_key] = min(float(target_values.get(conflict_key, 0.0) or 0.0), 0.05)
@@ -2777,6 +3343,16 @@ FULL_VALIDATION_TEXT_MIX_STATES = [
     {"name": "Capture Tail Blink Accent", "seconds": 0.24, "transition_ratio": 0.34, "weights": {"EyeBlinkLeft": 0.92, "EyeBlinkRight": 0.86, "EyeSquintLeft": 0.20, "EyeSquintRight": 0.18, "CheekSquintLeft": 0.12, "CheekSquintRight": 0.10}},
     {"name": "Capture Tail Wide Beat", "seconds": 0.32, "transition_ratio": 0.42, "weights": {"BrowInnerUp": 0.38, "EyeWideLeft": 0.46, "EyeWideRight": 0.42, "JawOpen": 0.62, "MouthLowerDownLeft": 0.34, "MouthLowerDownRight": 0.32}},
     {"name": "Capture Tail Recover Smirk", "seconds": 0.36, "transition_ratio": 0.66, "weights": {"MouthSmileLeft": 0.22, "MouthSmileRight": 0.14, "MouthLeft": 0.08, "CheekSquintLeft": 0.10, "JawOpen": 0.10}},
+    {"name": "Mocap Tail Soft Full Close", "seconds": 0.24, "transition_ratio": 0.40, "weights": {"EyeBlinkLeft": 0.52, "EyeBlinkRight": 0.49, "EyeLookDownLeft": 0.39, "EyeLookDownRight": 0.39, "BrowInnerUp": 0.15, "MouthClose": 0.09, "JawOpen": 0.06, "MouthShrugLower": 0.24, "MouthShrugUpper": 0.16, "NoseSneerLeft": 0.16, "NoseSneerRight": 0.18}},
+    {"name": "Mocap Tail Speech Open", "seconds": 0.30, "transition_ratio": 0.48, "weights": {"BrowInnerUp": 0.25, "EyeLookDownLeft": 0.18, "EyeLookDownRight": 0.18, "JawOpen": 0.28, "MouthLowerDownLeft": 0.27, "MouthLowerDownRight": 0.26, "MouthStretchLeft": 0.26, "MouthStretchRight": 0.25, "MouthSmileRight": 0.16, "NoseSneerLeft": 0.15, "NoseSneerRight": 0.15}},
+    {"name": "Mocap Tail Pucker Down Look", "seconds": 0.30, "transition_ratio": 0.44, "weights": {"EyeBlinkLeft": 0.26, "EyeBlinkRight": 0.26, "EyeLookDownLeft": 0.33, "EyeLookDownRight": 0.33, "MouthPucker": 0.43, "MouthFunnel": 0.25, "MouthShrugLower": 0.34, "NoseSneerLeft": 0.24, "NoseSneerRight": 0.26}},
+    {"name": "Mocap Tail Brow Concern", "seconds": 0.28, "transition_ratio": 0.56, "weights": {"BrowInnerUp": 0.45, "EyeLookDownLeft": 0.33, "EyeLookDownRight": 0.33, "MouthStretchLeft": 0.22, "MouthStretchRight": 0.22, "MouthLowerDownLeft": 0.20, "MouthLowerDownRight": 0.21, "NoseSneerLeft": 0.15, "NoseSneerRight": 0.16}},
+    {"name": "Mocap Tail Side Glance Press", "seconds": 0.28, "transition_ratio": 0.50, "weights": {"EyeLookInRight": 0.22, "EyeLookOutLeft": 0.15, "MouthPucker": 0.22, "MouthPressLeft": 0.20, "MouthPressRight": 0.21, "MouthShrugLower": 0.30, "MouthShrugUpper": 0.20, "NoseSneerLeft": 0.16, "NoseSneerRight": 0.17}},
+    {"name": "Mocap Tail Single Blink Scrunch", "seconds": 0.22, "transition_ratio": 0.32, "weights": {"EyeBlinkLeft": 0.62, "EyeBlinkRight": 0.33, "EyeSquintLeft": 0.27, "EyeSquintRight": 0.17, "BrowDownLeft": 0.31, "CheekSquintLeft": 0.27, "CheekSquintRight": 0.16, "NoseSneerLeft": 0.30, "NoseSneerRight": 0.29, "MouthShrugLower": 0.27}},
+    {"name": "Mocap Tail Wide Jaw", "seconds": 0.30, "transition_ratio": 0.42, "weights": {"JawOpen": 0.58, "MouthLowerDownLeft": 0.35, "MouthLowerDownRight": 0.36, "MouthStretchLeft": 0.35, "MouthStretchRight": 0.35, "EyeLookDownLeft": 0.27, "EyeLookDownRight": 0.28, "BrowInnerUp": 0.18, "NoseSneerLeft": 0.18, "NoseSneerRight": 0.17}},
+    {"name": "Mocap Tail Downward Tension", "seconds": 0.26, "transition_ratio": 0.60, "weights": {"EyeLookDownLeft": 0.30, "EyeLookDownRight": 0.30, "EyeBlinkLeft": 0.15, "EyeBlinkRight": 0.15, "BrowInnerUp": 0.14, "MouthShrugLower": 0.17, "MouthShrugUpper": 0.12, "NoseSneerLeft": 0.17, "NoseSneerRight": 0.17}},
+    {"name": "Mocap Tail Soft Speech Recover", "seconds": 0.32, "transition_ratio": 0.62, "weights": {"BrowInnerUp": 0.16, "EyeLookDownLeft": 0.13, "EyeLookDownRight": 0.13, "JawOpen": 0.23, "MouthFunnel": 0.18, "MouthLowerDownLeft": 0.23, "MouthLowerDownRight": 0.23, "MouthStretchLeft": 0.19, "MouthStretchRight": 0.19, "NoseSneerLeft": 0.15, "NoseSneerRight": 0.16}},
+    {"name": "Mocap Tail Smile Residual", "seconds": 0.34, "transition_ratio": 0.72, "weights": {"BrowInnerUp": 0.16, "EyeLookDownLeft": 0.13, "EyeLookDownRight": 0.13, "MouthSmileLeft": 0.15, "MouthSmileRight": 0.14, "MouthStretchLeft": 0.17, "MouthStretchRight": 0.16, "NoseSneerLeft": 0.16, "NoseSneerRight": 0.17}},
     {"name": "Capture Tail Neutral Recover", "seconds": 0.52, "transition_ratio": 0.84, "weights": {}},
 ]
 
@@ -2794,14 +3370,14 @@ def _full_validation_key_present(key_blocks, key_name):
 
 
 def _full_validation_available_state(state, available_names):
-    available = {_normalize_shape_key_name(name) for name in available_names}
+    available = {variant for name in available_names for variant in _shape_key_name_variants(name)}
     weights = {}
     base_weights = {}
     for key_name, value in dict((state or {}).get("base_weights", {}) or {}).items():
-        if _normalize_shape_key_name(key_name) in available:
+        if set(_shape_key_name_variants(key_name)) & available:
             base_weights[key_name] = value
     for key_name, value in dict((state or {}).get("weights", {}) or {}).items():
-        if _normalize_shape_key_name(key_name) in available:
+        if set(_shape_key_name_variants(key_name)) & available:
             weights[key_name] = value
     if not weights and not base_weights:
         return None
@@ -2812,7 +3388,50 @@ def _full_validation_available_state(state, available_names):
 
 
 def _full_validation_core_state_specs():
-    # 33 states plus the tail gives about 1000 frames at 30 fps.
+    ordered_single_tests = [
+        ("Brow Down Left", {"BrowDownLeft": 1.0}), ("Brow Down Right", {"BrowDownRight": 1.0}),
+        ("Brow Inner Up", {"BrowInnerUp": 1.0}), ("Brow Outer Up Left", {"BrowOuterUpLeft": 1.0}), ("Brow Outer Up Right", {"BrowOuterUpRight": 1.0}),
+        ("Eye Blink Left", {"EyeBlinkLeft": 1.0}), ("Eye Blink Right", {"EyeBlinkRight": 1.0}),
+        ("Eye Wide Left", {"EyeWideLeft": 1.0}), ("Eye Wide Right", {"EyeWideRight": 1.0}),
+        ("Eye Squint Left", {"EyeSquintLeft": 1.0}), ("Eye Squint Right", {"EyeSquintRight": 1.0}),
+        ("Eye Look Up Left", {"EyeLookUpLeft": 1.0}), ("Eye Look Up Right", {"EyeLookUpRight": 1.0}),
+        ("Eye Look Down Left", {"EyeLookDownLeft": 1.0}), ("Eye Look Down Right", {"EyeLookDownRight": 1.0}),
+        ("Eye Look Out Left", {"EyeLookOutLeft": 1.0}), ("Eye Look In Right", {"EyeLookInRight": 1.0}),
+        ("Eye Look In Left", {"EyeLookInLeft": 1.0}), ("Eye Look Out Right", {"EyeLookOutRight": 1.0}),
+        ("Cheek Puff", {"CheekPuff": 1.0}), ("Cheek Squint Left", {"CheekSquintLeft": 1.0}), ("Cheek Squint Right", {"CheekSquintRight": 1.0}),
+        ("Nose Sneer Left", {"NoseSneerLeft": 1.0}), ("Nose Sneer Right", {"NoseSneerRight": 1.0}),
+        ("Jaw Open", {"JawOpen": 1.0}), ("Jaw Forward", {"JawForward": 1.0}), ("Jaw Left", {"JawLeft": 1.0}), ("Jaw Right", {"JawRight": 1.0}),
+        ("Mouth Close Jaw Rule", {"JawOpen": 1.0, "MouthClose": 1.0}),
+        ("Mouth Funnel", {"MouthFunnel": 1.0, "JawOpen": 0.42}), ("Mouth Pucker", {"MouthPucker": 1.0, "JawOpen": 0.28}),
+        ("Mouth Left", {"MouthLeft": 1.0}), ("Mouth Right", {"MouthRight": 1.0}),
+        ("Mouth Smile Left", {"MouthSmileLeft": 1.0}), ("Mouth Smile Right", {"MouthSmileRight": 1.0}),
+        ("Mouth Frown Left", {"MouthFrownLeft": 1.0}), ("Mouth Frown Right", {"MouthFrownRight": 1.0}),
+        ("Mouth Dimple Left", {"MouthDimpleLeft": 1.0}), ("Mouth Dimple Right", {"MouthDimpleRight": 1.0}),
+        ("Mouth Stretch Left", {"MouthStretchLeft": 1.0}), ("Mouth Stretch Right", {"MouthStretchRight": 1.0}),
+        ("Mouth Roll Lower", {"MouthRollLower": 1.0, "JawOpen": 0.18}), ("Mouth Roll Upper", {"MouthRollUpper": 1.0, "JawOpen": 0.14}),
+        ("Mouth Shrug Lower", {"MouthShrugLower": 1.0, "JawOpen": 0.16}), ("Mouth Shrug Upper", {"MouthShrugUpper": 1.0, "JawOpen": 0.12}),
+        ("Mouth Press Left", {"MouthPressLeft": 1.0}), ("Mouth Press Right", {"MouthPressRight": 1.0}),
+        ("Mouth Lower Down Left", {"MouthLowerDownLeft": 1.0, "JawOpen": 0.42}), ("Mouth Lower Down Right", {"MouthLowerDownRight": 1.0, "JawOpen": 0.42}),
+        ("Mouth Upper Up Left", {"MouthUpperUpLeft": 1.0}), ("Mouth Upper Up Right", {"MouthUpperUpRight": 1.0}),
+        ("Tongue Out", {"TongueOut": 1.0, "JawOpen": 0.70}),
+    ]
+    mouth_sequence = [
+        ("Mouth Sequence A Open", {"JawOpen": 0.78, "MouthLowerDownLeft": 0.55, "MouthLowerDownRight": 0.55}),
+        ("Mouth Sequence O Funnel", {"JawOpen": 0.42, "MouthFunnel": 0.95}),
+        ("Mouth Sequence U Pucker", {"JawOpen": 0.28, "MouthPucker": 0.95}),
+        ("Mouth Sequence E Stretch", {"MouthStretchLeft": 0.85, "MouthStretchRight": 0.85, "JawOpen": 0.24}),
+        ("Mouth Sequence Smile", {"MouthSmileLeft": 0.85, "MouthSmileRight": 0.85, "CheekSquintLeft": 0.24, "CheekSquintRight": 0.24}),
+        ("Eye Mouth Combined Left", {"EyeSquintLeft": 0.45, "CheekSquintLeft": 0.45, "MouthSmileLeft": 0.85}),
+        ("Eye Mouth Combined Right", {"EyeSquintRight": 0.45, "CheekSquintRight": 0.45, "MouthSmileRight": 0.85}),
+    ]
+    states = [{"name": "00 Neutral Calibration", "seconds": 0.22, "transition_ratio": 0.72, "weights": {}}]
+    for index, (name, weights) in enumerate(ordered_single_tests, start=1):
+        states.append({"name": f"{index:02d} {name}", "seconds": 0.28, "transition_ratio": 0.52, "weights": weights})
+    for index, (name, weights) in enumerate(mouth_sequence, start=len(states)):
+        states.append({"name": f"{index:02d} {name}", "seconds": 0.24, "transition_ratio": 0.50, "weights": weights})
+    states.append({"name": f"{len(states):02d} Return To Neutral", "seconds": 0.26, "transition_ratio": 0.84, "weights": {}})
+    return states
+    # Compact core checks plus a capture tail give about 660 frames at 30 fps.
     return [
         {"name": "Calibration Neutral", "seconds": 0.36, "transition_ratio": 0.72, "weights": {}},
         {"name": "Eyes Blink Full", "seconds": 0.58, "transition_ratio": 0.34, "weights": {"EyeBlinkLeft": 1.0, "EyeBlinkRight": 1.0, "EyeSquintLeft": 0.18, "EyeSquintRight": 0.18}},
@@ -2844,6 +3463,10 @@ def _full_validation_core_state_specs():
         {"name": "Tongue Out Full", "seconds": 0.60, "transition_ratio": 0.42, "weights": {"TongueOut": 1.0, "JawOpen": 0.86, "MouthLowerDownLeft": 0.24, "MouthLowerDownRight": 0.24}},
         {"name": "Eye Mouth Compatible Smile", "seconds": 0.58, "transition_ratio": 0.44, "weights": {"EyeSquintLeft": 0.42, "EyeSquintRight": 0.42, "CheekSquintLeft": 0.45, "CheekSquintRight": 0.45, "MouthSmileLeft": 1.0, "MouthSmileRight": 1.0, "JawOpen": 0.26}},
         {"name": "Eye Mouth Compatible Speech", "seconds": 0.58, "transition_ratio": 0.42, "weights": {"EyeWideLeft": 0.38, "EyeWideRight": 0.38, "BrowInnerUp": 0.44, "JawOpen": 0.86, "MouthStretchLeft": 0.34, "MouthStretchRight": 0.34}},
+        {"name": "Speech With Blink Accent", "seconds": 0.34, "transition_ratio": 0.38, "weights": {"EyeBlinkLeft": 0.72, "EyeBlinkRight": 0.64, "EyeSquintLeft": 0.18, "EyeSquintRight": 0.16, "JawOpen": 0.46, "MouthLowerDownLeft": 0.26, "MouthLowerDownRight": 0.24, "MouthStretchLeft": 0.16, "MouthStretchRight": 0.14}},
+        {"name": "O Mouth With Eye Focus", "seconds": 0.34, "transition_ratio": 0.42, "weights": {"EyeSquintLeft": 0.18, "EyeSquintRight": 0.16, "BrowInnerUp": 0.16, "JawOpen": 0.38, "MouthFunnel": 0.72, "MouthPucker": 0.34}},
+        {"name": "Smile Speech Asymmetry", "seconds": 0.36, "transition_ratio": 0.48, "weights": {"EyeSquintLeft": 0.20, "EyeSquintRight": 0.14, "CheekSquintLeft": 0.30, "CheekSquintRight": 0.20, "MouthSmileLeft": 0.72, "MouthSmileRight": 0.54, "MouthStretchLeft": 0.28, "MouthStretchRight": 0.18, "JawOpen": 0.34}},
+        {"name": "Concerned Speech Blend", "seconds": 0.36, "transition_ratio": 0.54, "weights": {"BrowInnerUp": 0.42, "BrowDownLeft": 0.22, "BrowDownRight": 0.18, "EyeLookDownLeft": 0.18, "EyeLookDownRight": 0.16, "MouthFrownLeft": 0.36, "MouthFrownRight": 0.30, "JawOpen": 0.24, "MouthShrugLower": 0.16}},
         {"name": "Left Side Blend Full", "seconds": 0.56, "transition_ratio": 0.48, "weights": {"BrowDownLeft": 1.0, "EyeSquintLeft": 1.0, "CheekSquintLeft": 0.60, "MouthSmileLeft": 1.0, "MouthStretchLeft": 0.60, "MouthUpperUpLeft": 0.60}},
         {"name": "Right Side Blend Full", "seconds": 0.56, "transition_ratio": 0.48, "weights": {"BrowDownRight": 1.0, "EyeSquintRight": 1.0, "CheekSquintRight": 0.60, "MouthSmileRight": 1.0, "MouthStretchRight": 0.60, "MouthUpperUpRight": 0.60}},
         {"name": "Rule Stress Open Close", "seconds": 0.64, "transition_ratio": 0.42, "weights": {"JawOpen": 1.0, "MouthClose": 1.0, "MouthLowerDownLeft": 0.44, "MouthLowerDownRight": 0.44}},
@@ -2880,9 +3503,9 @@ def _state_target_values(state):
     funnel = max(0.0, min(1.0, float(target_values.get("MouthFunnel", 0.0) or 0.0)))
     mouth_close = max(0.0, min(1.0, float(target_values.get("MouthClose", 0.0) or 0.0)))
 
-    if "EyeWideLeft" in target_values:
+    if "EyeWideLeft" in target_values and float(target_values.get("EyeWideLeft", 0.0) or 0.0) < 1.0:
         target_values["EyeWideLeft"] = max(0.0, min(1.0, float(target_values["EyeWideLeft"]) * (1.0 - (0.85 * blink_left)) * (1.0 - (0.62 * squint_left))))
-    if "EyeWideRight" in target_values:
+    if "EyeWideRight" in target_values and float(target_values.get("EyeWideRight", 0.0) or 0.0) < 1.0:
         target_values["EyeWideRight"] = max(0.0, min(1.0, float(target_values["EyeWideRight"]) * (1.0 - (0.85 * blink_right)) * (1.0 - (0.62 * squint_right))))
 
     if pucker > 0.0 or funnel > 0.0:
@@ -3016,7 +3639,7 @@ def _state_target_values(state):
     if "MouthClose" in target_values:
         mouth_close_value = max(0.0, min(1.0, float(target_values.get("MouthClose", 0.0) or 0.0) * (1.0 - (0.75 * jaw_open))))
         if jaw_open > 0.0:
-            mouth_close_value = min(mouth_close_value, jaw_open)
+            mouth_close_value = min(mouth_close_value, max(0.0, jaw_open - 0.02))
         target_values["MouthClose"] = mouth_close_value
 
     smile_hold_left = smile_left * 0.20
@@ -3040,9 +3663,17 @@ def _state_target_values(state):
 
     mouth_close_floor = _mouth_close_floor(target_values)
     if mouth_close_floor is not None:
-        target_values["JawOpen"] = max(float(target_values.get("JawOpen", 0.0) or 0.0), float(mouth_close_floor))
+        target_values["JawOpen"] = max(float(target_values.get("JawOpen", 0.0) or 0.0), min(1.0, float(mouth_close_floor) + 0.08))
         if "MouthClose" in target_values:
-            target_values["MouthClose"] = min(float(target_values.get("MouthClose", 0.0) or 0.0), float(target_values.get("JawOpen", 0.0) or 0.0))
+            target_values["MouthClose"] = min(
+                float(target_values.get("MouthClose", 0.0) or 0.0),
+                max(0.0, float(target_values.get("JawOpen", 0.0) or 0.0) - 0.02),
+            )
+    if jaw_open > 0.0:
+        if "MouthPucker" in target_values:
+            target_values["MouthPucker"] = float(target_values.get("MouthPucker", 0.0) or 0.0) * (1.0 - (0.30 * jaw_open))
+        if "MouthFunnel" in target_values:
+            target_values["MouthFunnel"] = float(target_values.get("MouthFunnel", 0.0) or 0.0) * (1.0 - (0.16 * jaw_open))
     return _enforce_mouth_close_not_above_jaw_open(target_values)
 
 
@@ -3437,6 +4068,9 @@ def _build_full_validation_plan(resolved_states, start_frame, fps, total_seconds
 
 def _bake_full_validation_action(obj, key_blocks, resolved_states, tail_states, start_frame=1):
     key_block_map = {str(getattr(key_block, "name", "") or ""): key_block for index, key_block in enumerate(key_blocks) if index != 0}
+    for key_name, key_block in list(key_block_map.items()):
+        for normalized_name in _shape_key_name_variants(key_name):
+            key_block_map.setdefault(normalized_name, key_block)
     shape_keys, action = _ensure_full_validation_action(obj)
     plan = _build_full_validation_plan(
         resolved_states,
@@ -3460,15 +4094,54 @@ def _bake_full_validation_action(obj, key_blocks, resolved_states, tail_states, 
         target_values = _enforce_mouth_close_not_above_jaw_open(segment.get("target_values", {}) or {})
         segment["from_values"] = from_values
         segment["target_values"] = target_values
-        _insert_shape_key_frame(key_block_map, used_key_names, from_values, int(segment.get("start_frame", start_frame) or start_frame))
-        _insert_shape_key_frame(key_block_map, used_key_names, target_values, int(segment.get("peak_frame", start_frame) or start_frame))
-        _insert_shape_key_frame(key_block_map, used_key_names, target_values, int(segment.get("hold_end_frame", start_frame) or start_frame))
+        segment_start = int(segment.get("start_frame", start_frame) or start_frame)
+        segment_peak = int(segment.get("peak_frame", start_frame) or start_frame)
+        segment_hold = int(segment.get("hold_end_frame", start_frame) or start_frame)
+        transition_span = max(1, segment_peak - segment_start)
+        eye_frame = segment_start + max(1, int(round(transition_span * 0.26)))
+        mouth_frame = segment_start + max(1, int(round(transition_span * 0.58)))
+        curve_mode = str(segment.get("curve_mode", "") or "")
+        eye_values = {}
+        mouth_values = {}
+        for key_name in set(from_values) | set(target_values):
+            normalized = _normalize_shape_key_name(key_name)
+            start_value = float(from_values.get(key_name, 0.0) or 0.0)
+            target_value = float(target_values.get(key_name, 0.0) or 0.0)
+            delta = target_value - start_value
+            if normalized.startswith("eye") or normalized.startswith("brow"):
+                eye_factor = max(0.0, min(1.0, _full_validation_eased_progress(0.58, "upper")))
+                mouth_factor = max(eye_factor, _full_validation_eased_progress(0.88, "upper"))
+            elif normalized.startswith("jaw") or normalized.startswith("mouth") or normalized.startswith("tongue"):
+                eye_factor = max(0.0, min(1.0, _full_validation_eased_progress(0.18, curve_mode or "speech")))
+                mouth_factor = max(eye_factor, _full_validation_eased_progress(0.68, curve_mode or "mouth"))
+            else:
+                eye_factor = max(0.0, min(1.0, _full_validation_eased_progress(0.34, curve_mode or "bridge")))
+                mouth_factor = max(eye_factor, _full_validation_eased_progress(0.62, curve_mode or "bridge"))
+            eye_values[key_name] = max(0.0, min(1.0, start_value + (delta * eye_factor)))
+            mouth_values[key_name] = max(0.0, min(1.0, start_value + (delta * mouth_factor)))
+        used_frames = set()
+        _insert_shape_key_frame_if_distinct(key_block_map, used_key_names, from_values, segment_start, used_frames)
+        if eye_frame < segment_peak:
+            _insert_shape_key_frame_if_distinct(key_block_map, used_key_names, eye_values, eye_frame, used_frames)
+        if mouth_frame < segment_peak:
+            _insert_shape_key_frame_if_distinct(key_block_map, used_key_names, mouth_values, mouth_frame, used_frames)
+        _insert_shape_key_frame_if_distinct(key_block_map, used_key_names, target_values, segment_peak, used_frames)
+        _insert_shape_key_frame_if_distinct(key_block_map, used_key_names, target_values, segment_hold, used_frames)
     for fcurve in action.fcurves:
+        data_path = str(getattr(fcurve, "data_path", "") or "")
+        normalized_path = _normalize_shape_key_name(data_path)
         for keyframe_point in fcurve.keyframe_points:
             keyframe_point.interpolation = "BEZIER"
             try:
-                keyframe_point.handle_left_type = "AUTO_CLAMPED"
-                keyframe_point.handle_right_type = "AUTO_CLAMPED"
+                if "eyeblink" in normalized_path:
+                    keyframe_point.handle_left_type = "AUTO_CLAMPED"
+                    keyframe_point.handle_right_type = "AUTO"
+                elif "jawopen" in normalized_path or "mouthfunnel" in normalized_path or "mouthpucker" in normalized_path:
+                    keyframe_point.handle_left_type = "AUTO"
+                    keyframe_point.handle_right_type = "AUTO_CLAMPED"
+                else:
+                    keyframe_point.handle_left_type = "AUTO_CLAMPED"
+                    keyframe_point.handle_right_type = "AUTO_CLAMPED"
             except Exception:
                 pass
     for key_name in used_key_names:
@@ -3734,14 +4407,14 @@ def _start_full_validation_animation_legacy(context, scene, workflow, module, pa
             if elapsed >= total_seconds:
                 _ANIMATION_STATE["running"] = False
                 _ANIMATION_STATE["paused"] = False
-                _apply_value_map({})
+                _restore_validation_preview_state(scene=scene, workflow=workflow, module=module, module_state=module_state)
                 _set_full_validation_runtime(scene, workflow, module, module_state, running=False, paused=False, status="finished", paused_at=0.0, pause_accumulated=0.0, current_index=len(list(plan.get("segments", []) or [])), current_factor=1.0, total=len(list(plan.get("segments", []) or [])))
                 _restore_global_undo()
                 _release_validation_timer(_tick)
                 if panel_api is not None:
-                    panel_api.set_status(f"已完成 ARKit 全面混合验证，共 {len(list(plan.get('segments', []) or []))} 段连续动画", level="OK")
+                    panel_api.set_status(f"已完成 ARKit 全面混合验证，共 {len(list(plan.get('segments', []) or []))} 段连续动画，已恢复验证前形态键状态", level="OK")
                 if module_state is not None:
-                    module_state.set("last_result", f"已完成 ARKit 全面混合验证，共 {len(list(plan.get('segments', []) or []))} 段连续动画")
+                    module_state.set("last_result", f"已完成 ARKit 全面混合验证，共 {len(list(plan.get('segments', []) or []))} 段连续动画，已恢复验证前状态")
                 return None
 
             frame_span = max(1.0, plan_end_frame - plan_start_frame)
@@ -3992,13 +4665,7 @@ def _start_full_validation_animation(context, scene, workflow, module, panel_api
             if elapsed >= total_seconds:
                 _ANIMATION_STATE["running"] = False
                 _ANIMATION_STATE["paused"] = False
-                _apply_value_map({})
-                try:
-                    scene.frame_current = int(plan_end_frame)
-                    if hasattr(scene, "frame_subframe"):
-                        scene.frame_subframe = 0.0
-                except Exception:
-                    pass
+                _restore_validation_preview_state(scene=scene, workflow=workflow, module=module, module_state=module_state)
                 _set_full_validation_runtime(
                     scene,
                     workflow,
@@ -4017,9 +4684,9 @@ def _start_full_validation_animation(context, scene, workflow, module, panel_api
                 _release_validation_timer(_tick)
                 _restore_nodepreview_playback_updates()
                 if panel_api is not None:
-                    panel_api.set_status(f"Full validation finished: {len(list(plan.get('segments', []) or []))} segments", level="OK")
+                    panel_api.set_status(f"Full validation finished: {len(list(plan.get('segments', []) or []))} segments, restored previous shape key state", level="OK")
                 if module_state is not None:
-                    module_state.set("last_result", f"Full validation finished: {len(list(plan.get('segments', []) or []))} segments")
+                    module_state.set("last_result", f"Full validation finished: {len(list(plan.get('segments', []) or []))} segments, restored previous state")
                 return None
 
             frame_span = max(1.0, plan_end_frame - plan_start_frame)
@@ -4270,7 +4937,8 @@ def _start_full_validation_native_animation(context, scene, workflow, module, pa
     _capture_validation_preview_state(obj, key_blocks, scene=scene, workflow=workflow, module=module, module_state=module_state)
     _configure_full_validation_scene_timing(scene)
     start_frame = 1
-    shape_keys, action, plan, used_key_names = _bake_full_validation_action(obj, key_blocks, resolved_states, [], start_frame=start_frame)
+    tail_states = _resolve_text_mix_validation_states_for_object(key_blocks)
+    shape_keys, action, plan, used_key_names = _bake_full_validation_action(obj, key_blocks, resolved_states, tail_states, start_frame=start_frame)
     if not used_key_names:
         message = "当前物体没有可写入关键帧的匹配 ARKit 形态键"
         if panel_api is not None:
@@ -4348,7 +5016,7 @@ def _reset_full_validation_to_preview(scene, workflow, module, panel_api=None, m
     return False
 
 
-def _stop_validation_animation(scene=None, workflow=None, module=None, module_state=None):
+def _stop_validation_animation(scene=None, workflow=None, module=None, module_state=None, restore_preview=True):
     _cancel_validation_timer()
     was_running = bool(_ANIMATION_STATE["running"])
     _ANIMATION_STATE["running"] = False
@@ -4372,7 +5040,7 @@ def _stop_validation_animation(scene=None, workflow=None, module=None, module_st
         current_factor=0.0,
         total=0,
     )
-    if was_running or bool(_full_validation_runtime(scene=scene, workflow=workflow, module=module).get("running")):
+    if restore_preview and (was_running or bool(_full_validation_runtime(scene=scene, workflow=workflow, module=module).get("running"))):
         _restore_validation_preview_state(scene=scene, workflow=workflow, module=module, module_state=module_state)
     _tag_redraw_all()
 
@@ -4472,6 +5140,26 @@ def _start_validation_animation(context, scene, workflow, module, panel_api, mod
         "last_status_at": 0.0,
     }
 
+    def _finish():
+        _ANIMATION_STATE["running"] = False
+        _ANIMATION_STATE["paused"] = False
+        _ANIMATION_STATE["token"] += 1
+        _restore_global_undo()
+        _release_validation_timer(_tick)
+        _restore_nodepreview_playback_updates()
+        _tag_redraw_all()
+        if panel_api is not None:
+            panel_api.set_status(
+                f"已完成只读递增预览：{len(matched)} 个形态键，模式={'同时递增' if animation_mode == 'simultaneous' else '顺序递增'}，当前验证姿态已保留；切步骤或重置时会恢复预览前原值",
+                level="OK",
+            )
+        if module_state is not None:
+            module_state.set(
+                "last_result",
+                f"已完成只读递增预览：{len(matched)} 个形态键，模式={'同时递增' if animation_mode == 'simultaneous' else '顺序递增'}，当前验证姿态已保留",
+            )
+        return None
+
     def _tick():
         if not _ANIMATION_STATE["running"] or token != _ANIMATION_STATE["token"]:
             _restore_global_undo()
@@ -4480,21 +5168,7 @@ def _start_validation_animation(context, scene, workflow, module, panel_api, mod
             return None
         target_index = int(state["target_index"])
         if target_index >= len(matched):
-            _ANIMATION_STATE["running"] = False
-            _restore_global_undo()
-            _release_validation_timer(_tick)
-            _restore_nodepreview_playback_updates()
-            if panel_api is not None:
-                panel_api.set_status(
-                    f"已完成只读递增预览：{len(matched)} 个形态键当前保持在预览值，模式={'同时递增' if animation_mode == 'simultaneous' else '顺序递增'}；切步骤、重新验证或点重置都会恢复原值",
-                    level="OK",
-                )
-            if module_state is not None:
-                module_state.set(
-                    "last_result",
-                    f"已完成只读递增预览：{len(matched)} 个形态键当前保持在预览值，模式={'同时递增' if animation_mode == 'simultaneous' else '顺序递增'}",
-                )
-            return None
+            return _finish()
         elapsed = max(0.0, time.perf_counter() - float(state["started_at"]))
         value = min(1.0, elapsed / float(duration_seconds))
         try:
@@ -4535,18 +5209,20 @@ def _start_validation_animation(context, scene, workflow, module, panel_api, mod
                     for target_key in target_keys:
                         target_key.value = 1.0
                 state["target_index"] = len(matched)
+                return _finish()
             return ANIMATION_TIMER_INTERVAL
         if value >= 1.0:
             for current_key in current_keys:
                 current_key.value = 1.0
             state["target_index"] = target_index + 1
+            if state["target_index"] >= len(matched):
+                return _finish()
             state["started_at"] = time.perf_counter()
             state["last_value"] = -1.0
             state["last_status_at"] = 0.0
-            if state["target_index"] < len(matched):
-                if not reset_between_segments:
-                    for next_key in matched[state["target_index"]][1]:
-                        next_key.value = 0.0
+            if not reset_between_segments:
+                for next_key in matched[state["target_index"]][1]:
+                    next_key.value = 0.0
         return ANIMATION_TIMER_INTERVAL
 
     _register_validation_timer(_tick)
@@ -4696,7 +5372,6 @@ def _persist_runtime_settings(module, panel_api):
         max(0.1, float(panel_api.get_float("validation_duration_seconds", ANIMATION_DURATION_PER_KEY))),
     )
     for key, default in (
-        ("auto_validate_on_step", False),
         ("auto_zero_others", True),
         ("auto_edit_mode", True),
         ("auto_open_reference", True),
@@ -5437,8 +6112,8 @@ def _draw_preview(layout, item, panel_api):
         return ""
     preview_files = _preview_media_files(item)
     preview_box = layout.box()
-    preview_box.label(text="\u53c2\u8003\u9884\u89c8", icon="IMAGE_REFERENCE")
     media_index = _media_index(panel_api, item)
+    preview_box.label(text=f"\u53c2\u8003\u9884\u89c8: {media_index + 1} / {len(media_files)}", icon="IMAGE_REFERENCE")
     media_path = media_files[media_index]
     preview_path = ""
     if preview_files:
@@ -5727,9 +6402,10 @@ def draw_panel(layout, context, scene, workflow, module, panel_api, module_state
     panel_api.draw_button(full_actions, "TOGGLE_FULL_VALIDATION_PAUSE", "\u91cd\u7f6e\u5168\u9762\u9a8c\u8bc1", icon="LOOP_BACK")
     if _draw_drawer_header(box, panel_api, "settings", "\u8fd0\u884c\u9009\u9879", default=False, module_state=module_state):
         settings = panel_api.section(box, "\u8fd0\u884c\u9009\u9879", icon="TOOL_SETTINGS")
-        panel_api.draw_object_picker(settings, "target_object", "\u76ee\u6807\u7269\u4f53")
+        source_row = panel_api.row(settings, align=True)
+        source_op = source_row.operator("wm.url_open", text="\u53c2\u8003\u6e90", icon="URL")
+        source_op.url = "https://hinzka.hatenablog.com/entry/2020/06/15/072929"
         panel_api.draw_float_input(settings, "validation_duration_seconds", "\u9a8c\u8bc1\u952e\u9012\u589e\u79d2\u6570", default=_get_setting(module, "validation_duration_seconds", ANIMATION_DURATION_PER_KEY))
-        panel_api.draw_toggle(settings, "auto_validate_on_step", "\u4e0a\u4e00\u6b65/\u4e0b\u4e00\u6b65\u540e\u81ea\u52a8\u9a8c\u8bc1\u952e\u9012\u589e", default=_get_setting(module, "auto_validate_on_step", False))
         panel_api.draw_toggle(settings, "auto_zero_others", "\u5207\u6362\u6b65\u9aa4\u65f6\u6e05\u96f6\u5176\u4ed6\u53c2\u8003\u952e", default=True)
         panel_api.draw_toggle(settings, "auto_edit_mode", "\u5e94\u7528\u540e\u81ea\u52a8\u8fdb\u5165\u7f16\u8f91\u6a21\u5f0f", default=True)
         panel_api.draw_toggle(settings, "auto_open_reference", "\u5e94\u7528\u540e\u81ea\u52a8\u6253\u5f00\u7f6e\u9876\u53c2\u8003\u56fe", default=True)
@@ -5755,7 +6431,6 @@ def draw_panel(layout, context, scene, workflow, module, panel_api, module_state
             panel_api.label(perf_box, f"\u9884\u89c8\u7f13\u5b58: {summary['preview_cache_items']} / \u5f85\u91ca\u653e {summary['preview_pending_release']}", icon="IMAGE_DATA")
             panel_api.label(perf_box, f"\u9884\u52a0\u8f7d\u961f\u5217: {summary['preview_preload_queue']}", icon="PREVIEW_RANGE")
             panel_api.label(perf_box, f"\u5185\u5b58(MB): {summary['memory_mb_current']:.2f} / peak {summary['memory_mb_peak']:.2f}", icon="MEMORY")
-    panel_api.draw_run_button(box, "\u8fd0\u884c\u6a21\u5757", icon="PLAY")
     panel_api.draw_status(box)
     if keep_preview_paths:
         _enforce_preview_cache_budget(keep_paths=keep_preview_paths)
@@ -5879,10 +6554,10 @@ def on_panel_action(action, context, scene, workflow, module, panel_api, module_
 
     _payload, items, item, index, _media_index_value = _current_item(panel_api, module_state)
     if action == "PREV":
-        _set_step_and_maybe_validate(context, scene, workflow, module, panel_api, module_state, items, index - 1)
+        _set_step_and_focus(context, scene, workflow, module, panel_api, module_state, items, index - 1)
         return {"FINISHED"}
     if action == "NEXT":
-        _set_step_and_maybe_validate(context, scene, workflow, module, panel_api, module_state, items, index + 1)
+        _set_step_and_focus(context, scene, workflow, module, panel_api, module_state, items, index + 1)
         return {"FINISHED"}
     if action == "FOCUS_SHAPE_KEY":
         _focus_current_shape_key(context, panel_api, module_state, item)
@@ -6668,8 +7343,8 @@ def _build_full_validation_plan(resolved_states, start_frame, fps, total_seconds
     tail_states = list(tail_states or FULL_VALIDATION_TEXT_MIX_STATES or [])
     resolved_states = list(resolved_states or [])
     target_frame_count = max(1, int(target_frames or FULL_VALIDATION_TARGET_FRAMES))
-    core_frame_budget = max(len(resolved_states) * 8, int(round(target_frame_count * 0.86)))
-    tail_frame_budget = int(round(target_frame_count * 0.14)) if tail_states else 0
+    core_frame_budget = max(len(resolved_states) * 6, int(round(target_frame_count * 0.88)))
+    tail_frame_budget = int(round(target_frame_count * 0.12)) if tail_states else 0
     core_weight = sum(max(0.2, float((state or {}).get("seconds", 0.5) or 0.5)) for state in resolved_states) or 1.0
     tail_weight = sum(max(0.1, float((state or {}).get("seconds", 0.3) or 0.3)) for state in tail_states) or 1.0
     cursor = int(start_frame)
@@ -6680,9 +7355,9 @@ def _build_full_validation_plan(resolved_states, start_frame, fps, total_seconds
         nonlocal cursor, previous_values
         weight = max(0.1, float((state or {}).get("seconds", 0.4) or 0.4))
         current_span = max(int(min_span), int(round(float(frame_budget) * (weight / float(weight_total or 1.0)))))
-        transition_ratio = max(0.30, min(0.78, float((state or {}).get("transition_ratio", 0.50) or 0.50)))
-        transition_frames = max(3, min(current_span - 2, int(round(current_span * transition_ratio))))
-        hold_frames = max(2, current_span - transition_frames)
+        transition_ratio = max(0.36, min(0.86, float((state or {}).get("transition_ratio", 0.50) or 0.50)))
+        transition_frames = max(3, min(current_span - 1, int(round(current_span * transition_ratio))))
+        hold_frames = max(1, current_span - transition_frames)
         target_values = _state_target_values(state)
         peak_frame = cursor + transition_frames
         hold_end_frame = peak_frame + hold_frames
@@ -6705,14 +7380,14 @@ def _build_full_validation_plan(resolved_states, start_frame, fps, total_seconds
         cursor = int(hold_end_frame) + 1
 
     for state in resolved_states:
-        append_state(state, core_frame_budget, core_weight, 14)
+        append_state(state, core_frame_budget, core_weight, 9)
     if previous_values:
-        append_state({"name": "Return To Base Before Capture Tail", "seconds": 0.36, "transition_ratio": 0.72, "weights": {}}, int(round(fps * 0.36)), 0.36, 10)
+        append_state({"name": "Return To Base Before Capture Tail", "seconds": 0.18, "transition_ratio": 0.78, "weights": {}}, int(round(fps * 0.18)), 0.18, 6)
         previous_values = {}
     for state in tail_states:
-        append_state(state, tail_frame_budget, tail_weight, 8, fallback_name="Capture Tail")
+        append_state(state, tail_frame_budget, tail_weight, 6, fallback_name="Capture Tail")
     if previous_values:
-        append_state({"name": "Return To Zero", "seconds": 0.28, "transition_ratio": 0.82, "weights": {}}, int(round(fps * 0.28)), 0.28, 8)
+        append_state({"name": "Return To Zero", "seconds": 0.18, "transition_ratio": 0.86, "weights": {}}, int(round(fps * 0.18)), 0.18, 6)
 
     end_frame = int(segments[-1]["end_frame"]) if segments else int(start_frame)
     frame_span = max(1, end_frame - int(start_frame))
@@ -6727,3 +7402,416 @@ def _build_full_validation_plan(resolved_states, start_frame, fps, total_seconds
         "target_frames": int(target_frames or 0),
         "segments": segments,
     }
+
+
+def _state_target_values(state):
+    target_values = {}
+    for key_name, value in dict((state or {}).get("base_weights", {}) or {}).items():
+        target_values[str(key_name)] = max(0.0, min(1.0, float(value or 0.0)))
+    for key_name, value in dict((state or {}).get("weights", {}) or {}).items():
+        target_values[str(key_name)] = max(0.0, min(1.0, float(value or 0.0)))
+
+    target_values = _soften_opposing_target_values(target_values)
+    jaw_open = max(0.0, min(1.0, float(target_values.get("JawOpen", 0.0) or 0.0)))
+    blink_left = max(0.0, min(1.0, float(target_values.get("EyeBlinkLeft", 0.0) or 0.0)))
+    blink_right = max(0.0, min(1.0, float(target_values.get("EyeBlinkRight", 0.0) or 0.0)))
+    squint_left = max(0.0, min(1.0, float(target_values.get("EyeSquintLeft", 0.0) or 0.0)))
+    squint_right = max(0.0, min(1.0, float(target_values.get("EyeSquintRight", 0.0) or 0.0)))
+    smile_left = max(0.0, min(1.0, float(target_values.get("MouthSmileLeft", 0.0) or 0.0)))
+    smile_right = max(0.0, min(1.0, float(target_values.get("MouthSmileRight", 0.0) or 0.0)))
+    pucker = max(0.0, min(1.0, float(target_values.get("MouthPucker", 0.0) or 0.0)))
+    funnel = max(0.0, min(1.0, float(target_values.get("MouthFunnel", 0.0) or 0.0)))
+    mouth_close = max(0.0, min(1.0, float(target_values.get("MouthClose", 0.0) or 0.0)))
+
+    if "EyeWideLeft" in target_values:
+        target_values["EyeWideLeft"] = max(0.0, min(1.0, float(target_values["EyeWideLeft"]) * (1.0 - (0.85 * blink_left)) * (1.0 - (0.62 * squint_left))))
+    if "EyeWideRight" in target_values:
+        target_values["EyeWideRight"] = max(0.0, min(1.0, float(target_values["EyeWideRight"]) * (1.0 - (0.85 * blink_right)) * (1.0 - (0.62 * squint_right))))
+
+    if pucker > 0.0 or funnel > 0.0:
+        target_values["JawOpen"] = max(jaw_open, max(funnel * 0.42, pucker * 0.24))
+        jaw_open = max(0.0, min(1.0, float(target_values.get("JawOpen", 0.0) or 0.0)))
+        if pucker < 1.0:
+            target_values["MouthPucker"] = pucker * (1.0 - (0.30 * jaw_open))
+        if funnel < 1.0:
+            target_values["MouthFunnel"] = funnel * (1.0 - (0.16 * jaw_open))
+
+    if jaw_open > 0.0:
+        target_values["MouthLowerDownLeft"] = max(float(target_values.get("MouthLowerDownLeft", 0.0) or 0.0), jaw_open * 0.12)
+        target_values["MouthLowerDownRight"] = max(float(target_values.get("MouthLowerDownRight", 0.0) or 0.0), jaw_open * 0.12)
+        target_values["MouthStretchLeft"] = max(float(target_values.get("MouthStretchLeft", 0.0) or 0.0), jaw_open * 0.08)
+        target_values["MouthStretchRight"] = max(float(target_values.get("MouthStretchRight", 0.0) or 0.0), jaw_open * 0.08)
+        if smile_left > 0.0:
+            target_values["MouthSmileLeft"] = max(float(target_values.get("MouthSmileLeft", 0.0) or 0.0), smile_left * 0.20)
+            target_values["CheekSquintLeft"] = max(float(target_values.get("CheekSquintLeft", 0.0) or 0.0), smile_left * 0.12)
+        if smile_right > 0.0:
+            target_values["MouthSmileRight"] = max(float(target_values.get("MouthSmileRight", 0.0) or 0.0), smile_right * 0.20)
+            target_values["CheekSquintRight"] = max(float(target_values.get("CheekSquintRight", 0.0) or 0.0), smile_right * 0.12)
+
+    if mouth_close > 0.0:
+        if jaw_open <= 0.0:
+            jaw_open = min(1.0, mouth_close + 0.08)
+            target_values["JawOpen"] = jaw_open
+        else:
+            target_values["JawOpen"] = jaw_open
+        target_values["MouthClose"] = min(mouth_close, jaw_open)
+        for conflict_key in ("MouthPressLeft", "MouthPressRight", "MouthPucker", "MouthFunnel", "MouthShrugUpper", "MouthShrugLower"):
+            if conflict_key in target_values:
+                target_values[conflict_key] = min(float(target_values.get(conflict_key, 0.0) or 0.0), 0.05)
+
+    return _enforce_mouth_close_not_above_jaw_open(target_values)
+
+
+def _state_target_values(state):
+    target_values = {}
+    for key_name, value in dict((state or {}).get("base_weights", {}) or {}).items():
+        target_values[str(key_name)] = max(0.0, min(1.0, float(value or 0.0)))
+    for key_name, value in dict((state or {}).get("weights", {}) or {}).items():
+        target_values[str(key_name)] = max(0.0, min(1.0, float(value or 0.0)))
+
+    jaw_open = max(0.0, min(1.0, float(target_values.get("JawOpen", 0.0) or 0.0)))
+    mouth_close = max(0.0, min(1.0, float(target_values.get("MouthClose", 0.0) or 0.0)))
+    pucker = max(0.0, min(1.0, float(target_values.get("MouthPucker", 0.0) or 0.0)))
+    funnel = max(0.0, min(1.0, float(target_values.get("MouthFunnel", 0.0) or 0.0)))
+    smile_left = max(0.0, min(1.0, float(target_values.get("MouthSmileLeft", 0.0) or 0.0)))
+    smile_right = max(0.0, min(1.0, float(target_values.get("MouthSmileRight", 0.0) or 0.0)))
+
+    if pucker > 0.0 or funnel > 0.0:
+        target_values["JawOpen"] = max(jaw_open, max(funnel * 0.42, pucker * 0.24))
+        jaw_open = max(0.0, min(1.0, float(target_values.get("JawOpen", 0.0) or 0.0)))
+
+    if mouth_close > 0.0:
+        if jaw_open <= 0.0:
+            jaw_open = mouth_close
+            target_values["JawOpen"] = jaw_open
+        target_values["MouthClose"] = min(mouth_close, jaw_open)
+
+    if jaw_open > 0.0:
+        target_values["MouthLowerDownLeft"] = max(float(target_values.get("MouthLowerDownLeft", 0.0) or 0.0), jaw_open * 0.12)
+        target_values["MouthLowerDownRight"] = max(float(target_values.get("MouthLowerDownRight", 0.0) or 0.0), jaw_open * 0.12)
+        target_values["MouthStretchLeft"] = max(float(target_values.get("MouthStretchLeft", 0.0) or 0.0), jaw_open * 0.08)
+        target_values["MouthStretchRight"] = max(float(target_values.get("MouthStretchRight", 0.0) or 0.0), jaw_open * 0.08)
+
+    if smile_left > 0.0:
+        target_values["CheekSquintLeft"] = max(float(target_values.get("CheekSquintLeft", 0.0) or 0.0), smile_left * 0.12)
+    if smile_right > 0.0:
+        target_values["CheekSquintRight"] = max(float(target_values.get("CheekSquintRight", 0.0) or 0.0), smile_right * 0.12)
+
+    return _enforce_mouth_close_not_above_jaw_open(target_values)
+
+
+FULL_VALIDATION_TEXT_MIX_STATES = [
+    {"name": "Mocap Flow Idle 01", "seconds": 0.14, "transition_ratio": 0.82, "weights": {"EyeLookDownLeft": 0.10, "EyeLookDownRight": 0.10, "JawOpen": 0.04, "BrowInnerUp": 0.05}},
+    {"name": "Mocap Flow Idle 02", "seconds": 0.12, "transition_ratio": 0.86, "weights": {"EyeLookDownLeft": 0.16, "EyeLookDownRight": 0.15, "MouthStretchLeft": 0.05, "MouthStretchRight": 0.04, "JawOpen": 0.06}},
+    {"name": "Mocap Flow Speech 01", "seconds": 0.13, "transition_ratio": 0.78, "weights": {"JawOpen": 0.18, "MouthLowerDownLeft": 0.12, "MouthLowerDownRight": 0.11, "MouthStretchLeft": 0.10, "MouthStretchRight": 0.09, "EyeLookDownLeft": 0.12, "EyeLookDownRight": 0.12}},
+    {"name": "Mocap Flow Speech 02", "seconds": 0.11, "transition_ratio": 0.74, "weights": {"JawOpen": 0.31, "MouthLowerDownLeft": 0.23, "MouthLowerDownRight": 0.22, "MouthStretchLeft": 0.20, "MouthStretchRight": 0.18, "BrowInnerUp": 0.10}},
+    {"name": "Mocap Flow Close 01", "seconds": 0.12, "transition_ratio": 0.84, "weights": {"JawOpen": 0.16, "MouthClose": 0.12, "MouthShrugLower": 0.12, "MouthShrugUpper": 0.07, "EyeLookDownLeft": 0.17, "EyeLookDownRight": 0.17}},
+    {"name": "Mocap Flow Pucker 01", "seconds": 0.13, "transition_ratio": 0.78, "weights": {"JawOpen": 0.14, "MouthPucker": 0.24, "MouthFunnel": 0.16, "MouthShrugLower": 0.15, "NoseSneerLeft": 0.08, "NoseSneerRight": 0.09}},
+    {"name": "Mocap Flow Blink Lead", "seconds": 0.08, "transition_ratio": 0.62, "weights": {"EyeBlinkLeft": 0.18, "EyeBlinkRight": 0.16, "EyeSquintLeft": 0.10, "EyeSquintRight": 0.09, "JawOpen": 0.10}},
+    {"name": "Mocap Flow Blink Peak", "seconds": 0.07, "transition_ratio": 0.48, "weights": {"EyeBlinkLeft": 0.72, "EyeBlinkRight": 0.66, "EyeSquintLeft": 0.24, "EyeSquintRight": 0.21, "CheekSquintLeft": 0.14, "CheekSquintRight": 0.12}},
+    {"name": "Mocap Flow Blink Release", "seconds": 0.10, "transition_ratio": 0.88, "weights": {"EyeBlinkLeft": 0.12, "EyeBlinkRight": 0.10, "EyeSquintLeft": 0.08, "EyeSquintRight": 0.07, "JawOpen": 0.12, "MouthStretchLeft": 0.09}},
+    {"name": "Mocap Flow Side Glance", "seconds": 0.13, "transition_ratio": 0.82, "weights": {"EyeLookOutLeft": 0.16, "EyeLookInRight": 0.20, "MouthLeft": 0.07, "MouthSmileLeft": 0.08, "JawOpen": 0.15}},
+    {"name": "Mocap Flow Asym Speech", "seconds": 0.12, "transition_ratio": 0.76, "weights": {"JawOpen": 0.27, "MouthLowerDownLeft": 0.22, "MouthLowerDownRight": 0.20, "MouthSmileLeft": 0.10, "MouthStretchRight": 0.14, "NoseSneerLeft": 0.08}},
+    {"name": "Mocap Flow Soft Smile", "seconds": 0.14, "transition_ratio": 0.84, "weights": {"MouthSmileLeft": 0.18, "MouthSmileRight": 0.14, "CheekSquintLeft": 0.10, "CheekSquintRight": 0.08, "EyeSquintLeft": 0.08, "EyeSquintRight": 0.06, "JawOpen": 0.09}},
+    {"name": "Mocap Flow Open Beat", "seconds": 0.11, "transition_ratio": 0.72, "weights": {"JawOpen": 0.38, "MouthLowerDownLeft": 0.28, "MouthLowerDownRight": 0.27, "MouthStretchLeft": 0.24, "MouthStretchRight": 0.23, "BrowInnerUp": 0.13}},
+    {"name": "Mocap Flow Recover 01", "seconds": 0.13, "transition_ratio": 0.86, "weights": {"JawOpen": 0.18, "MouthFunnel": 0.10, "MouthStretchLeft": 0.11, "MouthStretchRight": 0.10, "EyeLookDownLeft": 0.12, "EyeLookDownRight": 0.12}},
+    {"name": "Mocap Flow Press 01", "seconds": 0.12, "transition_ratio": 0.78, "weights": {"JawOpen": 0.10, "MouthClose": 0.08, "MouthPressLeft": 0.10, "MouthPressRight": 0.11, "MouthShrugLower": 0.13, "NoseSneerRight": 0.08}},
+    {"name": "Mocap Flow Tiny Blink", "seconds": 0.08, "transition_ratio": 0.54, "weights": {"EyeBlinkLeft": 0.34, "EyeBlinkRight": 0.28, "EyeSquintLeft": 0.14, "EyeSquintRight": 0.10, "MouthSmileLeft": 0.08}},
+    {"name": "Mocap Flow Settled Speech", "seconds": 0.13, "transition_ratio": 0.82, "weights": {"JawOpen": 0.22, "MouthLowerDownLeft": 0.17, "MouthLowerDownRight": 0.17, "MouthStretchLeft": 0.15, "MouthStretchRight": 0.14, "BrowInnerUp": 0.07}},
+    {"name": "Mocap Flow Settle", "seconds": 0.18, "transition_ratio": 0.90, "weights": {"EyeLookDownLeft": 0.05, "EyeLookDownRight": 0.05, "JawOpen": 0.04, "MouthSmileLeft": 0.04, "MouthSmileRight": 0.03}},
+    {"name": "Mocap Flow Neutral", "seconds": 0.18, "transition_ratio": 0.92, "weights": {}},
+]
+
+
+FULL_VALIDATION_TEXT_MIX_STATES = []
+
+
+def _full_validation_core_state_specs():
+    left_tests = [
+        ("Brow Down Left", {"BrowDownLeft": 1.0}), ("Brow Outer Up Left", {"BrowOuterUpLeft": 1.0}),
+        ("Eye Blink Left", {"EyeBlinkLeft": 1.0}), ("Eye Wide Left", {"EyeWideLeft": 1.0}), ("Eye Squint Left", {"EyeSquintLeft": 1.0}),
+        ("Eye Look Up Left", {"EyeLookUpLeft": 1.0}), ("Eye Look Down Left", {"EyeLookDownLeft": 1.0}), ("Eye Look In Left", {"EyeLookInLeft": 1.0}), ("Eye Look Out Left", {"EyeLookOutLeft": 1.0}),
+        ("Cheek Squint Left", {"CheekSquintLeft": 1.0}), ("Nose Sneer Left", {"NoseSneerLeft": 1.0}),
+        ("Mouth Smile Left", {"MouthSmileLeft": 1.0}), ("Mouth Frown Left", {"MouthFrownLeft": 1.0}), ("Mouth Dimple Left", {"MouthDimpleLeft": 1.0}), ("Mouth Stretch Left", {"MouthStretchLeft": 1.0}), ("Mouth Press Left", {"MouthPressLeft": 1.0}),
+        ("Mouth Lower Down Left", {"MouthLowerDownLeft": 1.0, "JawOpen": 0.42}), ("Mouth Upper Up Left", {"MouthUpperUpLeft": 1.0}),
+    ]
+    right_tests = [
+        ("Brow Down Right", {"BrowDownRight": 1.0}), ("Brow Outer Up Right", {"BrowOuterUpRight": 1.0}),
+        ("Eye Blink Right", {"EyeBlinkRight": 1.0}), ("Eye Wide Right", {"EyeWideRight": 1.0}), ("Eye Squint Right", {"EyeSquintRight": 1.0}),
+        ("Eye Look Up Right", {"EyeLookUpRight": 1.0}), ("Eye Look Down Right", {"EyeLookDownRight": 1.0}), ("Eye Look In Right", {"EyeLookInRight": 1.0}), ("Eye Look Out Right", {"EyeLookOutRight": 1.0}),
+        ("Cheek Squint Right", {"CheekSquintRight": 1.0}), ("Nose Sneer Right", {"NoseSneerRight": 1.0}),
+        ("Mouth Smile Right", {"MouthSmileRight": 1.0}), ("Mouth Frown Right", {"MouthFrownRight": 1.0}), ("Mouth Dimple Right", {"MouthDimpleRight": 1.0}), ("Mouth Stretch Right", {"MouthStretchRight": 1.0}), ("Mouth Press Right", {"MouthPressRight": 1.0}),
+        ("Mouth Lower Down Right", {"MouthLowerDownRight": 1.0, "JawOpen": 0.42}), ("Mouth Upper Up Right", {"MouthUpperUpRight": 1.0}),
+    ]
+    center_and_mouth_tests = [
+        ("Brow Inner Up", {"BrowInnerUp": 1.0}), ("Cheek Puff", {"CheekPuff": 1.0}),
+        ("Jaw Open", {"JawOpen": 1.0}), ("Jaw Forward", {"JawForward": 1.0}), ("Jaw Left", {"JawLeft": 1.0}), ("Jaw Right", {"JawRight": 1.0}),
+        ("Mouth Close", {"JawOpen": 1.0, "MouthClose": 1.0}), ("Mouth Funnel", {"JawOpen": 0.42, "MouthFunnel": 1.0}), ("Mouth Pucker", {"JawOpen": 0.28, "MouthPucker": 1.0}),
+        ("Mouth Left", {"MouthLeft": 1.0}), ("Mouth Right", {"MouthRight": 1.0}),
+        ("Mouth Roll Lower", {"JawOpen": 0.18, "MouthRollLower": 1.0}), ("Mouth Roll Upper", {"JawOpen": 0.14, "MouthRollUpper": 1.0}),
+        ("Mouth Shrug Lower", {"JawOpen": 0.16, "MouthShrugLower": 1.0}), ("Mouth Shrug Upper", {"JawOpen": 0.12, "MouthShrugUpper": 1.0}),
+        ("Tongue Out", {"JawOpen": 0.70, "TongueOut": 1.0}),
+        ("Mouth A Open", {"JawOpen": 0.78, "MouthLowerDownLeft": 0.55, "MouthLowerDownRight": 0.55}), ("Mouth O Funnel", {"JawOpen": 0.42, "MouthFunnel": 0.95}), ("Mouth U Pucker", {"JawOpen": 0.28, "MouthPucker": 0.95}),
+        ("Mouth E Stretch", {"JawOpen": 0.24, "MouthStretchLeft": 0.85, "MouthStretchRight": 0.85}), ("Mouth Smile Pair", {"MouthSmileLeft": 0.85, "MouthSmileRight": 0.85, "CheekSquintLeft": 0.24, "CheekSquintRight": 0.24}),
+    ]
+    eye_brow_accents = [
+        {"EyeSquintLeft": 0.18, "EyeSquintRight": 0.14, "BrowDownLeft": 0.10},
+        {"EyeSquintRight": 0.18, "EyeSquintLeft": 0.14, "BrowDownRight": 0.10},
+        {"EyeWideLeft": 0.20, "EyeWideRight": 0.16, "BrowInnerUp": 0.16},
+        {"EyeLookDownLeft": 0.18, "EyeLookDownRight": 0.18, "BrowInnerUp": 0.10},
+        {"EyeBlinkLeft": 0.32, "EyeBlinkRight": 0.22, "EyeSquintLeft": 0.12},
+        {"EyeBlinkRight": 0.32, "EyeBlinkLeft": 0.22, "EyeSquintRight": 0.12},
+    ]
+    states = [{"name": "00 Neutral", "seconds": 0.20, "transition_ratio": 0.72, "weights": {}}]
+    mouth_index = 0
+    for index, (name, weights) in enumerate(left_tests + right_tests + center_and_mouth_tests, start=1):
+        next_weights = dict(weights)
+        if name.startswith("Mouth"):
+            for key_name, value in eye_brow_accents[mouth_index % len(eye_brow_accents)].items():
+                next_weights.setdefault(key_name, value)
+            mouth_index += 1
+        states.append({"name": f"{index:02d} {name}", "seconds": 0.26, "transition_ratio": 0.52, "weights": next_weights})
+    states.append({"name": f"{len(states):02d} Return To Neutral", "seconds": 0.24, "transition_ratio": 0.84, "weights": {}})
+    return states
+
+
+_final_regular_full_validation_core_state_specs = _full_validation_core_state_specs
+
+
+def _full_validation_core_state_specs():
+    base_states = _final_regular_full_validation_core_state_specs()
+    eye_brow_accents = [
+        {"EyeSquintLeft": 0.18, "EyeSquintRight": 0.14, "BrowDownLeft": 0.10},
+        {"EyeSquintRight": 0.18, "EyeSquintLeft": 0.14, "BrowDownRight": 0.10},
+        {"EyeWideLeft": 0.20, "EyeWideRight": 0.16, "BrowInnerUp": 0.16},
+        {"EyeLookDownLeft": 0.18, "EyeLookDownRight": 0.18, "BrowInnerUp": 0.10},
+        {"EyeBlinkLeft": 0.32, "EyeBlinkRight": 0.22, "EyeSquintLeft": 0.12},
+        {"EyeBlinkRight": 0.32, "EyeBlinkLeft": 0.22, "EyeSquintRight": 0.12},
+    ]
+    accent_keys = {key for accent in eye_brow_accents for key in accent}
+    expanded_states = []
+    mouth_index = 0
+
+    def renumbered_name(label):
+        parts = str(label or "").split(" ", 1)
+        clean_label = parts[1] if parts and parts[0].isdigit() and len(parts) > 1 else str(label or "")
+        return f"{len(expanded_states):02d} {clean_label}"
+
+    for state in base_states:
+        label = str(state.get("name", "State"))
+        weights = dict(state.get("weights") or {})
+        if "Mouth" not in label:
+            next_state = dict(state)
+            next_state["name"] = renumbered_name(label)
+            next_state["weights"] = weights
+            expanded_states.append(next_state)
+            continue
+
+        base_weights = {key: value for key, value in weights.items() if key not in accent_keys}
+        for accent_offset in range(3):
+            next_weights = dict(base_weights)
+            next_weights.update(eye_brow_accents[(mouth_index + accent_offset) % len(eye_brow_accents)])
+            next_state = dict(state)
+            next_state["name"] = f"{renumbered_name(label)} Eye Brow Mix {accent_offset + 1}"
+            next_state["seconds"] = 0.20
+            next_state["transition_ratio"] = min(float(state.get("transition_ratio", 0.52) or 0.52), 0.50)
+            next_state["weights"] = next_weights
+            expanded_states.append(next_state)
+        mouth_index += 3
+
+    return expanded_states
+
+
+# AI定位：全面混合验证最终生效表；前面历史定义会被这里覆盖，当前逻辑按 v0.7.1 行为恢复。
+# Restored full validation behavior from go_workflow_v0.7.1.
+FULL_VALIDATION_TOTAL_SECONDS = 30.0
+
+
+FULL_VALIDATION_TARGET_FRAMES = 1400
+
+
+FULL_VALIDATION_SEQUENCE = [
+    ["EyeBlinkLeft", "EyeBlinkRight"],
+    ["EyeSquintLeft", "EyeSquintRight"],
+    ["BrowInnerUp", "BrowOuterUpLeft", "BrowOuterUpRight"],
+    ["BrowDownLeft", "BrowDownRight"],
+    ["EyeLookUpLeft", "EyeLookUpRight"],
+    ["EyeLookDownLeft", "EyeLookDownRight"],
+    ["EyeLookInLeft", "EyeLookInRight"],
+    ["EyeLookOutLeft", "EyeLookOutRight"],
+    ["CheekPuff"],
+    ["NoseSneerLeft", "NoseSneerRight"],
+    ["JawForward"],
+    ["JawLeft", "JawRight"],
+    ["JawOpen", "MouthClose"],
+    ["MouthPressLeft", "MouthPressRight"],
+    ["MouthShrugUpper", "MouthShrugLower"],
+    ["MouthRollUpper", "MouthRollLower"],
+    ["MouthUpperUpLeft", "MouthUpperUpRight", "MouthLowerDownLeft", "MouthLowerDownRight"],
+    ["JawOpen", "MouthFunnel", "MouthPucker"],
+    ["MouthSmileLeft", "MouthSmileRight"],
+    ["MouthFrownLeft", "MouthFrownRight"],
+    ["MouthStretchLeft", "MouthStretchRight"],
+    ["TongueOut", "JawOpen", "MouthSmileLeft", "MouthSmileRight"],
+]
+
+
+FULL_VALIDATION_STATES = [
+    {"name": "眼部提神-半强度", "weights": {"BrowInnerUp": 0.5, "BrowOuterUpLeft": 0.45, "BrowOuterUpRight": 0.45, "EyeWideLeft": 0.5, "EyeWideRight": 0.5}},
+    {"name": "眼部提神-满强度", "weights": {"BrowInnerUp": 1.0, "BrowOuterUpLeft": 0.85, "BrowOuterUpRight": 0.85, "EyeWideLeft": 1.0, "EyeWideRight": 1.0}},
+    {"name": "闭眼压眉-半强度", "weights": {"EyeBlinkLeft": 0.5, "EyeBlinkRight": 0.5, "BrowDownLeft": 0.5, "BrowDownRight": 0.5, "CheekSquintLeft": 0.3, "CheekSquintRight": 0.3}},
+    {"name": "闭眼压眉-满强度", "weights": {"EyeBlinkLeft": 1.0, "EyeBlinkRight": 1.0, "BrowDownLeft": 1.0, "BrowDownRight": 1.0, "CheekSquintLeft": 0.65, "CheekSquintRight": 0.65}},
+    {"name": "眼球上看", "weights": {"EyeLookUpLeft": 0.82, "EyeLookUpRight": 0.82, "BrowOuterUpLeft": 0.22, "BrowOuterUpRight": 0.22}},
+    {"name": "眼球下看", "weights": {"EyeLookDownLeft": 0.82, "EyeLookDownRight": 0.82, "BrowInnerUp": 0.18}},
+    {"name": "眼球左看", "weights": {"EyeLookOutLeft": 0.86, "EyeLookInRight": 0.86, "BrowOuterUpLeft": 0.16, "MouthLeft": 0.12}},
+    {"name": "眼球右看", "weights": {"EyeLookInLeft": 0.86, "EyeLookOutRight": 0.86, "BrowOuterUpRight": 0.16, "MouthRight": 0.12}},
+    {"name": "左侧挑眉挤眼", "weights": {"EyeSquintLeft": 0.9, "BrowDownLeft": 0.92, "BrowOuterUpRight": 0.55, "CheekSquintLeft": 0.48, "MouthSmileLeft": 0.28}},
+    {"name": "右侧挑眉挤眼", "weights": {"EyeSquintRight": 0.9, "BrowDownRight": 0.92, "BrowOuterUpLeft": 0.55, "CheekSquintRight": 0.48, "MouthSmileRight": 0.28}},
+    {"name": "鼻翼收缩", "weights": {"NoseSneerLeft": 0.88, "NoseSneerRight": 0.88, "BrowDownLeft": 0.22, "BrowDownRight": 0.22}},
+    {"name": "鼓腮憋气", "weights": {"CheekPuff": 1.0, "MouthClose": 0.4, "JawOpen": 0.4}},
+    {"name": "完整微笑", "weights": {"MouthSmileLeft": 1.0, "MouthSmileRight": 1.0, "MouthDimpleLeft": 0.7, "MouthDimpleRight": 0.7, "CheekSquintLeft": 0.42, "CheekSquintRight": 0.42, "JawOpen": 0.22, "EyeSquintLeft": 0.2, "EyeSquintRight": 0.2}},
+    {"name": "嘴角下压", "weights": {"JawOpen": 0.36, "MouthFrownLeft": 0.9, "MouthFrownRight": 0.9, "MouthShrugUpper": 0.42, "MouthShrugLower": 0.34, "BrowInnerUp": 0.16}},
+    {"name": "横向拉伸", "weights": {"MouthStretchLeft": 0.92, "MouthStretchRight": 0.92, "MouthUpperUpLeft": 0.24, "MouthUpperUpRight": 0.24, "JawOpen": 0.22, "EyeSquintLeft": 0.18, "EyeSquintRight": 0.18}},
+    {"name": "抿唇收紧", "weights": {"MouthClose": 0.82, "MouthPressLeft": 0.62, "MouthPressRight": 0.62, "JawOpen": 0.82}},
+    {"name": "卷唇咀嚼", "weights": {"MouthRollUpper": 0.78, "MouthRollLower": 0.78, "MouthClose": 0.28, "JawOpen": 0.28}},
+    {"name": "A口型", "weights": {"JawOpen": 0.84, "MouthLowerDownLeft": 0.56, "MouthLowerDownRight": 0.56, "MouthUpperUpLeft": 0.22, "MouthUpperUpRight": 0.22}},
+    {"name": "E口型", "weights": {"JawOpen": 0.54, "MouthStretchLeft": 0.62, "MouthStretchRight": 0.62, "MouthSmileLeft": 0.18, "MouthSmileRight": 0.18, "MouthDimpleLeft": 0.16, "MouthDimpleRight": 0.16}},
+    {"name": "I口型", "weights": {"JawOpen": 0.2, "MouthSmileLeft": 0.58, "MouthSmileRight": 0.58, "MouthStretchLeft": 0.36, "MouthStretchRight": 0.36, "MouthDimpleLeft": 0.2, "MouthDimpleRight": 0.2}},
+    {"name": "O口型", "weights": {"JawOpen": 0.62, "MouthFunnel": 0.88, "MouthPucker": 0.34, "MouthUpperUpLeft": 0.14, "MouthUpperUpRight": 0.14}},
+    {"name": "U口型", "weights": {"JawOpen": 0.28, "MouthPucker": 0.74, "MouthFunnel": 0.44, "MouthClose": 0.18}},
+    {"name": "左歪嘴", "weights": {"MouthLeft": 0.88, "JawLeft": 0.46, "MouthStretchLeft": 0.28, "MouthPressLeft": 0.14}},
+    {"name": "右歪嘴", "weights": {"MouthRight": 0.88, "JawRight": 0.46, "MouthStretchRight": 0.28, "MouthPressRight": 0.14}},
+    {"name": "Single side left upper", "weights": {"BrowDownLeft": 0.72, "EyeSquintLeft": 0.82, "EyeBlinkLeft": 0.42, "CheekSquintLeft": 0.46, "NoseSneerLeft": 0.2}},
+    {"name": "Single side right upper", "weights": {"BrowDownRight": 0.72, "EyeSquintRight": 0.82, "EyeBlinkRight": 0.42, "CheekSquintRight": 0.46, "NoseSneerRight": 0.2}},
+    {"name": "Single side left mouth", "weights": {"JawOpen": 0.38, "MouthLeft": 0.72, "MouthSmileLeft": 0.58, "MouthDimpleLeft": 0.42, "MouthStretchLeft": 0.35, "MouthLowerDownLeft": 0.22}},
+    {"name": "Single side right mouth", "weights": {"JawOpen": 0.38, "MouthRight": 0.72, "MouthSmileRight": 0.58, "MouthDimpleRight": 0.42, "MouthStretchRight": 0.35, "MouthLowerDownRight": 0.22}},
+    {"name": "张口吐舌", "weights": {"TongueOut": 1.0, "JawOpen": 0.78, "MouthLowerDownLeft": 0.24, "MouthLowerDownRight": 0.24, "MouthStretchLeft": 0.12, "MouthStretchRight": 0.12}},
+    {"name": "张口吐舌-偏左", "weights": {"TongueOut": 0.94, "JawOpen": 0.84, "MouthLeft": 0.42, "JawLeft": 0.24, "MouthSmileLeft": 0.16, "MouthStretchLeft": 0.16}},
+    {"name": "张口吐舌-偏右", "weights": {"TongueOut": 0.94, "JawOpen": 0.84, "MouthRight": 0.42, "JawRight": 0.24, "MouthSmileRight": 0.16, "MouthStretchRight": 0.16}},
+    {"name": "张嘴画圆-上", "base_weights": {"JawOpen": 0.86, "TongueOut": 0.86}, "weights": {"MouthUpperUpLeft": 0.72, "MouthUpperUpRight": 0.72, "MouthShrugUpper": 0.24}},
+    {"name": "张嘴画圆-右上", "base_weights": {"JawOpen": 0.86, "TongueOut": 0.86}, "weights": {"MouthRight": 0.46, "JawRight": 0.18, "MouthUpperUpRight": 0.72, "MouthStretchRight": 0.16, "MouthUpperUpLeft": 0.14}},
+    {"name": "张嘴画圆-右", "base_weights": {"JawOpen": 0.86, "TongueOut": 0.86}, "weights": {"MouthRight": 0.82, "JawRight": 0.4, "MouthStretchRight": 0.26}},
+    {"name": "张嘴画圆-右下", "base_weights": {"JawOpen": 0.86, "TongueOut": 0.86}, "weights": {"MouthRight": 0.46, "JawRight": 0.18, "MouthLowerDownRight": 0.74, "MouthStretchRight": 0.16, "MouthLowerDownLeft": 0.14}},
+    {"name": "张嘴画圆-下", "base_weights": {"JawOpen": 0.86, "TongueOut": 0.86}, "weights": {"MouthLowerDownLeft": 0.78, "MouthLowerDownRight": 0.78, "MouthShrugLower": 0.24}},
+    {"name": "张嘴画圆-左下", "base_weights": {"JawOpen": 0.86, "TongueOut": 0.86}, "weights": {"MouthLeft": 0.46, "JawLeft": 0.18, "MouthLowerDownLeft": 0.74, "MouthStretchLeft": 0.16, "MouthLowerDownRight": 0.14}},
+    {"name": "张嘴画圆-左", "base_weights": {"JawOpen": 0.86, "TongueOut": 0.86}, "weights": {"MouthLeft": 0.82, "JawLeft": 0.4, "MouthStretchLeft": 0.26}},
+    {"name": "张嘴画圆-左上", "base_weights": {"JawOpen": 0.86, "TongueOut": 0.86}, "weights": {"MouthLeft": 0.46, "JawLeft": 0.18, "MouthUpperUpLeft": 0.72, "MouthStretchLeft": 0.16, "MouthUpperUpRight": 0.14}},
+    {"name": "张口吐舌圆形歪嘴-上", "base_weights": {"JawOpen": 0.88, "TongueOut": 0.86}, "weights": {"MouthUpperUpLeft": 0.82, "MouthUpperUpRight": 0.82, "MouthShrugUpper": 0.24}},
+    {"name": "张口吐舌圆形歪嘴-右上", "base_weights": {"JawOpen": 0.88, "TongueOut": 0.86}, "weights": {"MouthRight": 0.48, "JawRight": 0.22, "MouthUpperUpRight": 0.82, "MouthStretchRight": 0.18, "MouthUpperUpLeft": 0.14}},
+    {"name": "张口吐舌圆形歪嘴-右", "base_weights": {"JawOpen": 0.88, "TongueOut": 0.86}, "weights": {"MouthRight": 0.88, "JawRight": 0.46, "MouthStretchRight": 0.32, "MouthUpperUpRight": 0.18, "MouthLowerDownRight": 0.18}},
+    {"name": "张口吐舌圆形歪嘴-右下", "base_weights": {"JawOpen": 0.88, "TongueOut": 0.86}, "weights": {"MouthRight": 0.48, "JawRight": 0.22, "MouthLowerDownRight": 0.82, "MouthStretchRight": 0.18, "MouthLowerDownLeft": 0.14}},
+    {"name": "张口吐舌圆形歪嘴-下", "base_weights": {"JawOpen": 0.88, "TongueOut": 0.86}, "weights": {"MouthLowerDownLeft": 0.88, "MouthLowerDownRight": 0.88, "MouthShrugLower": 0.24}},
+    {"name": "张口吐舌圆形歪嘴-左下", "base_weights": {"JawOpen": 0.88, "TongueOut": 0.86}, "weights": {"MouthLeft": 0.48, "JawLeft": 0.22, "MouthLowerDownLeft": 0.82, "MouthStretchLeft": 0.18, "MouthLowerDownRight": 0.14}},
+    {"name": "张口吐舌圆形歪嘴-左", "base_weights": {"JawOpen": 0.88, "TongueOut": 0.86}, "weights": {"MouthLeft": 0.88, "JawLeft": 0.46, "MouthStretchLeft": 0.32, "MouthUpperUpLeft": 0.18, "MouthLowerDownLeft": 0.18}},
+    {"name": "张口吐舌圆形歪嘴-左上", "base_weights": {"JawOpen": 0.88, "TongueOut": 0.86}, "weights": {"MouthLeft": 0.48, "JawLeft": 0.22, "MouthUpperUpLeft": 0.82, "MouthStretchLeft": 0.18, "MouthUpperUpRight": 0.14}},
+    {"name": "欢乐协同", "weights": {"BrowOuterUpLeft": 0.82, "BrowOuterUpRight": 0.82, "EyeSquintLeft": 0.62, "EyeSquintRight": 0.62, "MouthSmileLeft": 1.0, "MouthSmileRight": 1.0, "CheekSquintLeft": 0.45, "CheekSquintRight": 0.45, "JawOpen": 0.28}},
+    {"name": "生气协同", "weights": {"BrowDownLeft": 1.0, "BrowDownRight": 1.0, "EyeSquintLeft": 0.74, "EyeSquintRight": 0.74, "MouthFrownLeft": 0.84, "MouthFrownRight": 0.84, "MouthPressLeft": 0.36, "MouthPressRight": 0.36, "NoseSneerLeft": 0.2, "NoseSneerRight": 0.2, "JawForward": 0.26}},
+    {"name": "惊讶协同", "weights": {"BrowInnerUp": 1.0, "BrowOuterUpLeft": 0.84, "BrowOuterUpRight": 0.84, "EyeWideLeft": 1.0, "EyeWideRight": 1.0, "JawOpen": 0.84, "MouthFunnel": 0.18}},
+    {"name": "悲伤协同", "weights": {"BrowInnerUp": 0.88, "EyeLookDownLeft": 0.42, "EyeLookDownRight": 0.42, "MouthFrownLeft": 0.76, "MouthFrownRight": 0.76, "MouthShrugUpper": 0.28, "MouthShrugLower": 0.24}},
+    {"name": "闭眼张口大笑", "weights": {"EyeBlinkLeft": 1.0, "EyeBlinkRight": 1.0, "MouthSmileLeft": 1.0, "MouthSmileRight": 1.0, "JawOpen": 0.96, "TongueOut": 0.14}},
+    {"name": "困倦压嘴", "weights": {"BrowDownLeft": 0.9, "BrowDownRight": 0.9, "EyeLookDownLeft": 0.78, "EyeLookDownRight": 0.78, "MouthPressLeft": 0.72, "MouthPressRight": 0.72, "JawForward": 0.58}},
+    {"name": "左半脸极限", "weights": {"BrowDownLeft": 1.0, "BrowOuterUpLeft": 1.0, "EyeBlinkLeft": 1.0, "EyeSquintLeft": 1.0, "EyeWideLeft": 1.0, "MouthSmileLeft": 1.0, "MouthFrownLeft": 1.0, "MouthStretchLeft": 1.0, "MouthUpperUpLeft": 1.0, "MouthLowerDownLeft": 1.0, "JawLeft": 1.0}},
+    {"name": "右半脸极限", "weights": {"BrowDownRight": 1.0, "BrowOuterUpRight": 1.0, "EyeBlinkRight": 1.0, "EyeSquintRight": 1.0, "EyeWideRight": 1.0, "MouthSmileRight": 1.0, "MouthFrownRight": 1.0, "MouthStretchRight": 1.0, "MouthUpperUpRight": 1.0, "MouthLowerDownRight": 1.0, "JawRight": 1.0}},
+    {"name": "极限堆叠压测", "weights": {"BrowInnerUp": 1.0, "BrowDownLeft": 1.0, "BrowDownRight": 1.0, "EyeBlinkLeft": 1.0, "EyeBlinkRight": 1.0, "EyeWideLeft": 1.0, "EyeWideRight": 1.0, "MouthSmileLeft": 1.0, "MouthSmileRight": 1.0, "MouthStretchLeft": 1.0, "MouthStretchRight": 1.0, "JawOpen": 1.0, "JawForward": 1.0, "CheekSquintLeft": 1.0, "CheekSquintRight": 1.0}},
+    {"name": "开心咧嘴笑", "weights": {"MouthSmileLeft": 1.0, "MouthSmileRight": 1.0, "MouthStretchLeft": 0.78, "MouthStretchRight": 0.78, "JawOpen": 0.36, "CheekSquintLeft": 0.42, "CheekSquintRight": 0.42, "EyeSquintLeft": 0.18, "EyeSquintRight": 0.18, "MouthDimpleLeft": 0.38, "MouthDimpleRight": 0.38}},
+    {"name": "闭眼鼓起脸颊嘟嘟嘴", "weights": {"EyeBlinkLeft": 1.0, "EyeBlinkRight": 1.0, "CheekPuff": 1.0, "MouthPucker": 0.8, "MouthClose": 0.24, "JawOpen": 0.24, "MouthPressLeft": 0.12, "MouthPressRight": 0.12}},
+    {"name": "不屑的表情嘴巴不屑上抬", "weights": {"MouthShrugUpper": 0.72, "MouthUpperUpRight": 0.58, "MouthSmileRight": 0.22, "MouthFrownLeft": 0.18, "MouthRight": 0.16, "JawOpen": 0.18, "EyeSquintRight": 0.12}},
+    {"name": "张开嘴巴歪嘴伸舌头", "weights": {"TongueOut": 1.0, "JawOpen": 0.96, "MouthLeft": 0.34, "JawLeft": 0.18, "MouthStretchLeft": 0.22, "MouthLowerDownLeft": 0.18, "MouthStretchRight": 0.12, "CheekSquintLeft": 0.14}},
+    {"name": "往左上方歪嘴", "weights": {"MouthLeft": 0.92, "JawLeft": 0.34, "MouthUpperUpLeft": 0.72, "MouthStretchLeft": 0.24, "MouthSmileLeft": 0.18, "JawOpen": 0.18, "EyeSquintLeft": 0.12, "MouthUpperUpRight": 0.14}},
+]
+
+
+def _resolve_full_validation_states_for_object(key_blocks, items, target_count=70):
+    resolved_states = []
+    for state in _expanded_full_validation_states(_full_validation_states(items), target_count=target_count):
+        matched_weights = {}
+        matched_base_weights = {}
+        for shape_key_name, target_value in dict(state.get("base_weights", {}) or {}).items():
+            target_key = _find_matching_shape_key(key_blocks, shape_key_name)
+            if target_key is not None:
+                matched_base_weights[target_key.name] = float(target_value)
+        for shape_key_name, target_value in dict(state.get("weights", {}) or {}).items():
+            target_key = _find_matching_shape_key(key_blocks, shape_key_name)
+            if target_key is not None:
+                matched_weights[target_key.name] = float(target_value)
+        if matched_weights or matched_base_weights:
+            resolved_states.append(
+                {
+                    "name": str(state.get("name", "混合状态") or "混合状态"),
+                    "weights": matched_weights,
+                    "base_weights": matched_base_weights,
+                }
+            )
+    return resolved_states
+
+
+# AI定位：全面混合验证动画排布入口；实际时长看 FULL_VALIDATION_TOTAL_SECONDS，target_frames 主要保留兼容。
+def _build_full_validation_plan(resolved_states, start_frame, fps, total_seconds, action_name, object_name, target_frames=FULL_VALIDATION_TARGET_FRAMES, tail_states=None):
+    total_frames = max(len(resolved_states) * 4, int(round(max(1.0, float(total_seconds)) * max(1.0, float(fps)))))
+    state_span = max(4, int(round(float(total_frames) / max(1, len(resolved_states)))))
+    transition_frames = max(2, int(round(state_span * 0.78)))
+    hold_frames = max(1, state_span - transition_frames)
+    cursor = int(start_frame)
+    segments = []
+    previous_values = {}
+    for index, state in enumerate(resolved_states, start=1):
+        target_values = _state_target_values(state)
+        peak_frame = cursor + transition_frames
+        hold_end_frame = peak_frame + hold_frames
+        end_frame = hold_end_frame
+        segments.append(
+            {
+                "index": index,
+                "name": str(state.get("name", "混合状态") or "混合状态"),
+                "start_frame": int(cursor),
+                "peak_frame": int(peak_frame),
+                "hold_end_frame": int(hold_end_frame),
+                "end_frame": int(end_frame),
+                "from_values": dict(previous_values),
+                "base_weights": dict(state.get("base_weights", {}) or {}),
+                "weights": dict(state.get("weights", {}) or {}),
+                "target_values": target_values,
+            }
+        )
+        previous_values = dict(target_values)
+        cursor = int(end_frame) + 1
+    if previous_values:
+        reset_peak = cursor + max(3, int(round(state_span * 0.9)))
+        segments.append(
+            {
+                "index": len(segments) + 1,
+                "name": "回到基型",
+                "start_frame": int(cursor),
+                "peak_frame": int(reset_peak),
+                "hold_end_frame": int(reset_peak),
+                "end_frame": int(reset_peak),
+                "from_values": dict(previous_values),
+                "base_weights": {},
+                "weights": {},
+                "target_values": {},
+            }
+        )
+    return {
+        "object_name": str(object_name or ""),
+        "action_name": str(action_name or ""),
+        "start_frame": int(start_frame),
+        "end_frame": int(segments[-1]["end_frame"]) if segments else int(start_frame),
+
+        "total_seconds": float(total_seconds),
+
+        "fps": float(fps),
+
+        "segments": segments,
+
+    }
+
+
+
+def _state_target_values(state):
+    target_values = dict((state or {}).get("base_weights", {}) or {})
+    for key_name, value in dict((state or {}).get("weights", {}) or {}).items():
+        target_values[key_name] = float(value)
+    mouth_close_floor = _mouth_close_floor(target_values)
+    if mouth_close_floor is not None:
+        target_values["JawOpen"] = max(float(target_values.get("JawOpen", 0.0) or 0.0), float(mouth_close_floor))
+    return _enforce_mouth_close_not_above_jaw_open(target_values)

@@ -97,11 +97,34 @@ REPLAY_KEY_SET_VALUES = {
     REPLAY_KEY_SET_ALL,
 }
 REPLAY_KEY_SET_LABELS = {
-    REPLAY_KEY_SET_AUTO: "自动",
+    REPLAY_KEY_SET_AUTO: "\u81ea\u52a8",
     REPLAY_KEY_SET_ARKIT: "ARKit",
     REPLAY_KEY_SET_MMD: "MMD",
-    REPLAY_KEY_SET_ALL: "全部",
+    REPLAY_KEY_SET_ALL: "\u5168\u90e8",
 }
+
+
+def _addon_root_dir():
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    if os.path.basename(current_dir) in {"builtin_scripts", "go_workflow_modules"}:
+        return os.path.dirname(current_dir)
+    return current_dir
+
+
+def _builtin_replay_preset_path(filename):
+    return os.path.join(_addon_root_dir(), "replay_presets", filename)
+
+
+DEFAULT_REPLAY_PRESETS = (
+    (
+        "arkit\u9762\u6355\u6d4b\u8bd5\u9884\u8bbev22\u4e8c\u8f6ev20\u878d\u54081\u5206\u949f",
+        _builtin_replay_preset_path("arkit\u9762\u6355\u6d4b\u8bd5\u9884\u8bbev22\u4e8c\u8f6ev20\u878d\u54081\u5206\u949f.jsonl"),
+    ),
+    (
+        "arkit\u9762\u6355\u6d4b\u8bd5\u9884\u8bbev20",
+        _builtin_replay_preset_path("arkit\u9762\u6355\u6d4b\u8bd5\u9884\u8bbev20.jsonl"),
+    ),
+)
 
 MMD_SHAPE_NAMES = {
     "あ",
@@ -156,6 +179,33 @@ MMD_SHAPE_NAMES = {
     "fun",
 }
 _REPLAY_FAMILY_REFERENCE_CACHE = {}
+
+# AI定位：MMD/ARKit 回放按钮识别入口之一；用于补足常见简写，匹配时会做大小写兼容。
+MMD_FALLBACK_SHAPE_NAMES = {
+    "a",
+    "i",
+    "u",
+    "e",
+    "o",
+    "aa",
+    "ih",
+    "ou",
+    "ee",
+    "oh",
+    "blink",
+    "blinkleft",
+    "blinkright",
+    "wink",
+    "winkleft",
+    "winkright",
+    "smile",
+    "angry",
+    "sad",
+    "sorrow",
+    "fun",
+    "joy",
+    "surprised",
+}
 
 
 def _runtime_state():
@@ -292,7 +342,7 @@ def _shape_key_allowed(name, index, include_basis, skip_separator_keys, arkit_on
         return False
     if skip_separator_keys and _is_separator_shape_key(name):
         return False
-    if arkit_only and name not in ARKIT_SHAPE_NAMES:
+    if arkit_only and _shape_name_family(name) != REPLAY_KEY_SET_ARKIT:
         return False
     return True
 
@@ -432,21 +482,45 @@ def _normalize_replay_key_set(value):
 def _normalized_reference_shape_names(cache_key, names):
     cached = _REPLAY_FAMILY_REFERENCE_CACHE.get(cache_key)
     if cached is None:
-        cached = {_normalize_shape_key_name(item).replace(" ", "") for item in names}
+        cached = {
+            _normalize_shape_key_name(item).replace(" ", "")
+            for item in names
+            if _normalize_shape_key_name(item).replace(" ", "")
+        }
         _REPLAY_FAMILY_REFERENCE_CACHE[cache_key] = cached
     return cached
 
 
+def _collapsed_name_matches_reference(collapsed_name, reference_names):
+    collapsed_name = str(collapsed_name or "").strip()
+    if not collapsed_name:
+        return False
+    for reference_name in reference_names or ():
+        reference_name = str(reference_name or "").strip()
+        if not reference_name:
+            continue
+        if collapsed_name == reference_name:
+            return True
+        # AI定位：允许 Head_eyeBlinkLeft、eyeBlinkLeft.L 这类前后缀命名也能识别到。
+        if len(reference_name) >= 3 and reference_name in collapsed_name:
+            return True
+    return False
+
+
+# AI定位：ARKit/MMD/自动 三个按钮是否可用、是否高亮，核心都依赖这个形态键家族判断。
 def _shape_name_family(name):
     raw_name = str(name or "").strip()
     if not raw_name or raw_name.lower() == "basis":
         return ""
     collapsed = _normalize_shape_key_name(raw_name).replace(" ", "")
     arkit_names = _normalized_reference_shape_names(REPLAY_KEY_SET_ARKIT, ARKIT_SHAPE_NAMES)
-    if raw_name in ARKIT_SHAPE_NAMES or collapsed in arkit_names:
+    if _collapsed_name_matches_reference(collapsed, arkit_names):
         return REPLAY_KEY_SET_ARKIT
-    mmd_names = _normalized_reference_shape_names(REPLAY_KEY_SET_MMD, MMD_SHAPE_NAMES)
-    if raw_name in MMD_SHAPE_NAMES or collapsed in mmd_names:
+    mmd_names = (
+        _normalized_reference_shape_names(REPLAY_KEY_SET_MMD, MMD_SHAPE_NAMES)
+        | _normalized_reference_shape_names("MMD_FALLBACK", MMD_FALLBACK_SHAPE_NAMES)
+    )
+    if _collapsed_name_matches_reference(collapsed, mmd_names):
         return REPLAY_KEY_SET_MMD
     return ""
 
@@ -521,6 +595,21 @@ def _format_family_counts(counts):
     if unknown_count:
         parts.append(f"其他 {unknown_count}")
     return " / ".join(parts) if parts else "未识别"
+
+
+def _empty_family_counts():
+    return {REPLAY_KEY_SET_ARKIT: 0, REPLAY_KEY_SET_MMD: 0, "UNKNOWN": 0}
+
+
+def _family_counts_total(counts):
+    counts = counts or {}
+    return sum(int(value or 0) for value in counts.values())
+
+
+def _merge_family_counts(total, counts):
+    for key_name, value in dict(counts or {}).items():
+        total[key_name] = int(total.get(key_name, 0) or 0) + int(value or 0)
+    return total
 
 
 def _target_object_from_panel(context, panel_api):
@@ -695,6 +784,210 @@ def _apply_replay_mapping(target_object, sample, mapping_info, strength):
     return applied_count
 
 
+def _scene_replay_target_objects(scene):
+    objects = []
+    if scene is None:
+        return objects
+    for obj in getattr(scene, "objects", []) or []:
+        if getattr(obj, "type", "") != "MESH":
+            continue
+        if _target_key_blocks(obj) is None:
+            continue
+        objects.append(obj)
+    return objects
+
+
+
+# AI定位：多选物体同时回放从这里收集目标，只接受当前场景内带形态键的网格。
+def _selected_replay_target_objects(context, scene):
+    selected = []
+    view_layer = getattr(context, "view_layer", None) if context is not None else None
+    scene_objects = set(getattr(scene, "objects", []) or []) if scene is not None else set()
+    candidates = []
+    if view_layer is not None:
+        candidates.extend(list(getattr(getattr(view_layer, "objects", None), "selected", []) or []))
+    selected_objects = getattr(context, "selected_objects", None) if context is not None else None
+    if selected_objects:
+        candidates.extend(list(selected_objects))
+    seen = set()
+    for obj in candidates:
+        if obj is None or obj.name in seen:
+            continue
+        if scene_objects and obj not in scene_objects:
+            continue
+        seen.add(obj.name)
+        if getattr(obj, "type", "") != "MESH":
+            continue
+        if _target_key_blocks(obj) is None:
+            continue
+        selected.append(obj)
+    return selected
+
+
+def _replay_detection_target_objects(context, scene, panel_api=None):
+    selected = _selected_replay_target_objects(context, scene)
+    if selected:
+        return selected
+    target_object = _target_object_from_panel(context, panel_api)
+    if _target_key_blocks(target_object) is not None:
+        return [target_object]
+    return _scene_replay_target_objects(scene)
+
+
+def _replay_target_family_counts(context, scene, panel_api=None):
+    target_family_counts = _empty_family_counts()
+    seen_objects = set()
+    for target_object in _replay_detection_target_objects(context, scene, panel_api):
+        object_name = getattr(target_object, "name", "")
+        object_key = object_name or str(id(target_object))
+        if object_key in seen_objects:
+            continue
+        seen_objects.add(object_key)
+        _merge_family_counts(target_family_counts, _shape_names_family_counts(_object_shape_key_names(target_object)))
+    return target_family_counts
+
+
+# AI定位：单个记录源投射到多个已选目标物体时，走这条多目标映射逻辑。
+def _build_multi_target_replay_mapping(target_objects, sample, source_object_name, replay_key_set=REPLAY_KEY_SET_ALL):
+    object_mappings = []
+    aggregate_source_counts = {REPLAY_KEY_SET_ARKIT: 0, REPLAY_KEY_SET_MMD: 0, "UNKNOWN": 0}
+    aggregate_target_counts = {REPLAY_KEY_SET_ARKIT: 0, REPLAY_KEY_SET_MMD: 0, "UNKNOWN": 0}
+    seen_targets = set()
+    for target_object in list(target_objects or []):
+        if target_object is None or target_object.name in seen_targets:
+            continue
+        seen_targets.add(target_object.name)
+        try:
+            mapping_info = _build_replay_mapping(target_object, sample, source_object_name, replay_key_set)
+        except Exception:
+            continue
+        if int(mapping_info.get("mapped_count", 0) or 0) <= 0:
+            continue
+        object_mappings.append(mapping_info)
+        for key, value in dict(mapping_info.get("source_family_counts", {}) or {}).items():
+            aggregate_source_counts[key] = aggregate_source_counts.get(key, 0) + int(value or 0)
+        for key, value in dict(mapping_info.get("target_family_counts", {}) or {}).items():
+            aggregate_target_counts[key] = aggregate_target_counts.get(key, 0) + int(value or 0)
+    if not object_mappings:
+        raise RuntimeError("\u672a\u5339\u914d\u5230\u53ef\u7528\u7684\u591a\u76ee\u6807\u5f62\u6001\u952e\u6620\u5c04\u3002")
+    effective_key_sets = [item.get("effective_key_set", REPLAY_KEY_SET_ALL) for item in object_mappings]
+    effective_key_set = effective_key_sets[0] if len(set(effective_key_sets)) == 1 else REPLAY_KEY_SET_ALL
+    return {
+        "target_object_name": ", ".join(item["target_object_name"] for item in object_mappings),
+        "source_object_name": source_object_name,
+        "mapped_count": sum(int(item.get("mapped_count", 0) or 0) for item in object_mappings),
+        "source_count": sum(int(item.get("source_count", 0) or 0) for item in object_mappings),
+        "source_total_count": sum(int(item.get("source_total_count", 0) or 0) for item in object_mappings),
+        "requested_key_set": _normalize_replay_key_set(replay_key_set),
+        "effective_key_set": effective_key_set,
+        "source_family_counts": aggregate_source_counts,
+        "target_family_counts": aggregate_target_counts,
+        "unmapped_source_names": [],
+        "object_mappings": object_mappings,
+        "mapping": [],
+    }
+
+def _normalized_object_name_score(source_name, target_name):
+    source = _normalize_shape_key_name(source_name).replace(" ", "")
+    target = _normalize_shape_key_name(target_name).replace(" ", "")
+    if not source or not target:
+        return 0.0
+    if source == target:
+        return 4.0
+    if source in target or target in source:
+        return 2.0
+    source_tokens = set(_tokenize_shape_key_name(source_name))
+    target_tokens = set(_tokenize_shape_key_name(target_name))
+    if not source_tokens or not target_tokens:
+        return 0.0
+    return len(source_tokens & target_tokens) / max(len(source_tokens), 1)
+
+
+# AI定位：记录文件里包含多个源物体时，按物体名相似度和映射数量自动匹配场景目标。
+def _build_multi_replay_mapping(scene, sample, source_objects, replay_key_set=REPLAY_KEY_SET_ALL, preferred_target=None):
+    target_objects = _scene_replay_target_objects(scene)
+    if not target_objects:
+        raise RuntimeError("场景中没有可回放的带形态键网格。")
+    source_objects = [name for name in list(source_objects or []) if sample.get("objects", {}).get(name)]
+    if not source_objects:
+        raise RuntimeError("回放文件中没有可用源对象。")
+
+    object_mappings = []
+    used_target_names = set()
+    aggregate_source_counts = {REPLAY_KEY_SET_ARKIT: 0, REPLAY_KEY_SET_MMD: 0, "UNKNOWN": 0}
+    aggregate_target_counts = {REPLAY_KEY_SET_ARKIT: 0, REPLAY_KEY_SET_MMD: 0, "UNKNOWN": 0}
+
+    for source_object_name in source_objects:
+        candidates = []
+        for target_object in target_objects:
+            if target_object.name in used_target_names:
+                continue
+            try:
+                mapping_info = _build_replay_mapping(target_object, sample, source_object_name, replay_key_set)
+            except Exception:
+                continue
+            mapped_count = int(mapping_info.get("mapped_count", 0) or 0)
+            if mapped_count <= 0:
+                continue
+            name_score = _normalized_object_name_score(source_object_name, target_object.name)
+            if preferred_target is not None and target_object.name == getattr(preferred_target, "name", ""):
+                name_score += 0.35
+            source_count = max(1, int(mapping_info.get("source_count", 0) or 0))
+            coverage = mapped_count / source_count
+            candidates.append((name_score, coverage, mapped_count, target_object.name, mapping_info))
+        if not candidates:
+            continue
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        chosen = candidates[0][4]
+        object_mappings.append(chosen)
+        used_target_names.add(chosen["target_object_name"])
+        for key, value in dict(chosen.get("source_family_counts", {}) or {}).items():
+            aggregate_source_counts[key] = aggregate_source_counts.get(key, 0) + int(value or 0)
+        for key, value in dict(chosen.get("target_family_counts", {}) or {}).items():
+            aggregate_target_counts[key] = aggregate_target_counts.get(key, 0) + int(value or 0)
+
+    if not object_mappings:
+        raise RuntimeError("未匹配到可用的多物体形态键映射。")
+
+    effective_key_sets = [item.get("effective_key_set", REPLAY_KEY_SET_ALL) for item in object_mappings]
+    effective_key_set = effective_key_sets[0] if len(set(effective_key_sets)) == 1 else REPLAY_KEY_SET_ALL
+    return {
+        "target_object_name": ", ".join(item["target_object_name"] for item in object_mappings),
+        "source_object_name": ", ".join(item["source_object_name"] for item in object_mappings),
+        "mapped_count": sum(int(item.get("mapped_count", 0) or 0) for item in object_mappings),
+        "source_count": sum(int(item.get("source_count", 0) or 0) for item in object_mappings),
+        "source_total_count": sum(int(item.get("source_total_count", 0) or 0) for item in object_mappings),
+        "requested_key_set": _normalize_replay_key_set(replay_key_set),
+        "effective_key_set": effective_key_set,
+        "source_family_counts": aggregate_source_counts,
+        "target_family_counts": aggregate_target_counts,
+        "unmapped_source_names": [],
+        "object_mappings": object_mappings,
+        "mapping": [],
+    }
+
+
+def _apply_replay_mapping_info(sample, mapping_info, strength):
+    object_mappings = list((mapping_info or {}).get("object_mappings", []) or [])
+    if not object_mappings:
+        target_object = bpy.data.objects.get(mapping_info.get("target_object_name", ""))
+        if target_object is None:
+            raise RuntimeError("目标物体已不存在。")
+        return _apply_replay_mapping(target_object, sample, mapping_info, strength)
+
+    applied_count = 0
+    missing_targets = []
+    for object_mapping in object_mappings:
+        target_object = bpy.data.objects.get(object_mapping.get("target_object_name", ""))
+        if target_object is None:
+            missing_targets.append(object_mapping.get("target_object_name", ""))
+            continue
+        applied_count += _apply_replay_mapping(target_object, sample, object_mapping, strength)
+    if missing_targets and applied_count <= 0:
+        raise RuntimeError("目标物体已不存在: " + ", ".join(str(name) for name in missing_targets if name))
+    return applied_count
+
+
 class _LowPassFilter:
     def __init__(self):
         self.initialized = False
@@ -843,11 +1136,18 @@ class ShapeKeyCaptureRecorder:
         self._write_summary()
         self._flush_streams()
         self._close_streams()
+        self._sync_scene_capture_state("空闲")
 
     def timer_tick(self):
         if not self.is_running:
             return None
-        self._write_sample()
+        try:
+            self._write_sample()
+        except Exception as exc:
+            self._log_event("capture_error", {"message": str(exc)})
+            _status(f"采集失败: {exc}", level="ERROR")
+            _stop_capture("capture_error")
+            return None
         return self.sample_interval
 
     def _scene_or_raise(self):
@@ -998,6 +1298,11 @@ class ShapeKeyCaptureRecorder:
         self.last_elapsed_s = elapsed_s
         if self.sample_index % FLUSH_EVERY_SAMPLES == 0:
             self._flush_streams()
+        self._sync_scene_capture_state("采集中")
+
+    def _sync_scene_capture_state(self, status_text=None):
+        # AI定位：采集进度是运行态，只保存在录制器对象里，避免高频写 Scene 污染撤回栈。
+        return
 
     def _update_per_key_stats(self, object_name, shape_name, value, shape_entry):
         key = f"{object_name}::{shape_name}"
@@ -1236,42 +1541,57 @@ class ShapeKeyReplaySession:
         self.is_running = False
         self.file_path_resolved = ""
         self.current_index = max(0, int(settings["replay_sample_index"]))
+        self.status_text = ""
+        self.initial_values = {}
 
+    # AI定位：回放启动前的分流点；在这里决定单目标、多选多目标、还是多源物体回放。
     def prepare(self):
         scene = self._scene_or_raise()
-        target_object = _target_object_from_panel(self.context, _panel_api())
-        if target_object is None:
-            raise RuntimeError("请指定目标物体，或先选中一个带形态键的物体。")
-        self.target_object_name = target_object.name
         self.file_path_resolved, self.samples, source_objects = _load_replay_samples(self.file_path)
-        self.source_object_name = _choose_source_object_name(source_objects, self.preferred_source_object)
-        self.mapping_info = _build_replay_mapping(target_object, self.samples[0], self.source_object_name, self.replay_key_set)
-        self.effective_key_set = self.mapping_info.get("effective_key_set", REPLAY_KEY_SET_ALL)
-        if hasattr(scene, "sk_replay_total_samples"):
-            scene.sk_replay_total_samples = len(self.samples)
-        if hasattr(scene, "sk_replay_total_source_keys"):
-            scene.sk_replay_total_source_keys = int(self.mapping_info["source_count"])
-        if hasattr(scene, "sk_replay_mapped_count"):
-            scene.sk_replay_mapped_count = int(self.mapping_info["mapped_count"])
-        if hasattr(scene, "sk_replay_source_object"):
-            scene.sk_replay_source_object = self.source_object_name
-        if hasattr(scene, "sk_replay_key_set"):
-            scene.sk_replay_key_set = self.replay_key_set
-        if self.mapping_info["mapped_count"] == 0:
-            if hasattr(scene, "sk_replay_status"):
-                scene.sk_replay_status = "未匹配到可用形态键"
-            raise RuntimeError("未匹配到可用形态键。")
-        if hasattr(scene, "sk_replay_status"):
-            scene.sk_replay_status = (
-                f"已加载：{self.mapping_info['mapped_count']}/"
-                f"{self.mapping_info['source_count']} 键 -> {self.target_object_name}"
+        preferred_target = _target_object_from_panel(self.context, _panel_api())
+        selected_targets = _selected_replay_target_objects(self.context, scene)
+        if len(source_objects) == 1 and len(selected_targets) > 1:
+            self.source_object_name = _choose_source_object_name(source_objects, self.preferred_source_object)
+            self.mapping_info = _build_multi_target_replay_mapping(
+                selected_targets,
+                self.samples[0],
+                self.source_object_name,
+                self.replay_key_set,
             )
+            self.target_object_name = self.mapping_info.get("target_object_name", "")
+        elif len(source_objects) > 1:
+            self.mapping_info = _build_multi_replay_mapping(
+                scene,
+                self.samples[0],
+                source_objects,
+                self.replay_key_set,
+                preferred_target=preferred_target,
+            )
+            self.source_object_name = self.mapping_info.get("source_object_name", "")
+            self.target_object_name = self.mapping_info.get("target_object_name", "")
+        else:
+            target_object = preferred_target or (selected_targets[0] if selected_targets else None)
+            if target_object is None:
+                raise RuntimeError("\u8bf7\u6307\u5b9a\u76ee\u6807\u7269\u4f53\uff0c\u6216\u5148\u9009\u4e2d\u4e00\u4e2a\u5e26\u5f62\u6001\u952e\u7684\u7269\u4f53\u3002")
+            self.target_object_name = target_object.name
+            self.source_object_name = _choose_source_object_name(source_objects, self.preferred_source_object)
+            self.mapping_info = _build_replay_mapping(target_object, self.samples[0], self.source_object_name, self.replay_key_set)
+        self.effective_key_set = self.mapping_info.get("effective_key_set", REPLAY_KEY_SET_ALL)
+        if self.mapping_info["mapped_count"] == 0:
+            self.status_text = "\u672a\u5339\u914d\u5230\u53ef\u7528\u5f62\u6001\u952e"
+            raise RuntimeError("\u672a\u5339\u914d\u5230\u53ef\u7528\u5f62\u6001\u952e\u3002")
+        target_count = len(self.mapping_info.get("object_mappings", []) or []) or 1
+        self.status_text = (
+            f"\u5df2\u52a0\u8f7d\uff1a{self.mapping_info['mapped_count']}/"
+            f"{self.mapping_info['source_count']} \u952e -> {target_count} \u4e2a\u76ee\u6807"
+        )
         return self.mapping_info
 
     def start(self):
         scene = self._scene_or_raise()
         if self.mapping_info is None:
             self.prepare()
+        self.capture_initial_values()
         current_index = self.current_index
         if hasattr(scene, "sk_replay_sample_index"):
             current_index = int(getattr(scene, "sk_replay_sample_index", current_index) or current_index)
@@ -1280,24 +1600,17 @@ class ShapeKeyReplaySession:
             float(self.samples[self.current_index].get("elapsed_s", 0.0)) * 1_000_000_000.0 / self.speed
         )
         self.is_running = True
-        if hasattr(scene, "sk_replay_running"):
-            scene.sk_replay_running = True
         self.apply_index(self.current_index)
 
     def stop(self, reason):
         self.is_running = False
-        scene = bpy.data.scenes.get(self.scene_name)
-        if scene is not None:
-            if hasattr(scene, "sk_replay_running"):
-                scene.sk_replay_running = False
-            if hasattr(scene, "sk_replay_status"):
-                reason_map = {
-                    "user_stop": "用户停止",
-                    "completed": "播放完成，已回到初始",
-                    "replay_error": "回放错误",
-                    "module_cleanup": "模块清理",
-                }
-                scene.sk_replay_status = f"回放已停止（{reason_map.get(str(reason), str(reason))}）"
+        reason_map = {
+            "user_stop": "\u7528\u6237\u505c\u6b62",
+            "completed": "\u64ad\u653e\u5b8c\u6210\uff0c\u5df2\u6062\u590d\u56de\u653e\u524d\u72b6\u6001",
+            "replay_error": "\u56de\u653e\u9519\u8bef",
+            "module_cleanup": "\u6a21\u5757\u6e05\u7406",
+        }
+        self.status_text = f"\u56de\u653e\u5df2\u505c\u6b62\uff08{reason_map.get(str(reason), str(reason))}\uff09"
 
     def timer_tick(self):
         if not self.is_running:
@@ -1315,32 +1628,25 @@ class ShapeKeyReplaySession:
                 self.current_index = 0
                 self.start_perf_ns = time.perf_counter_ns()
                 self.apply_index(self.current_index)
-                if hasattr(scene, "sk_replay_status"):
-                    scene.sk_replay_status = "回放循环中"
+                self.status_text = "回放循环中"
                 return 0.01
             return None
         return 0.01
 
     def apply_index(self, sample_index):
         scene = self._scene_or_raise()
-        target_object = bpy.data.objects.get(self.target_object_name)
-        if target_object is None:
-            raise RuntimeError("目标物体已不存在。")
         clamped_index = max(0, min(int(sample_index), len(self.samples) - 1))
-        applied_count = _apply_replay_mapping(
-            target_object,
+        applied_count = _apply_replay_mapping_info(
             self.samples[clamped_index],
             self.mapping_info,
             self.strength,
         )
         self.current_index = clamped_index
-        if hasattr(scene, "sk_replay_sample_index"):
-            scene.sk_replay_sample_index = clamped_index
-        if hasattr(scene, "sk_replay_status"):
-            scene.sk_replay_status = (
-                f"已应用样本 {clamped_index + 1}/{len(self.samples)}"
-                f"，映射 {applied_count}/{self.mapping_info['mapped_count']} 键"
-            )
+        target_count = len(self.mapping_info.get("object_mappings", []) or []) or 1
+        self.status_text = (
+            f"\u5df2\u5e94\u7528\u6837\u672c {clamped_index + 1}/{len(self.samples)}"
+            f"\uff0c\u6620\u5c04 {applied_count}/{self.mapping_info['mapped_count']} \u952e -> {target_count} \u4e2a\u76ee\u6807"
+        )
         return {
             "sample_index": clamped_index,
             "sample_count": len(self.samples),
@@ -1349,14 +1655,48 @@ class ShapeKeyReplaySession:
         }
 
     def reset_to_initial(self):
-        if not self.samples or self.mapping_info is None:
+        return self.restore_initial_values()
+
+    def _iter_target_blocks(self):
+        if not self.mapping_info:
+            return
+        object_mappings = list(self.mapping_info.get("object_mappings", []) or [])
+        if not object_mappings:
+            object_mappings = [self.mapping_info]
+        for object_mapping in object_mappings:
+            target_object = bpy.data.objects.get(object_mapping.get("target_object_name", ""))
+            key_blocks = _target_key_blocks(target_object)
+            if key_blocks is None:
+                continue
+            for item in object_mapping.get("mapping", []) or []:
+                target_block = key_blocks.get(item.get("target_name", ""))
+                if target_block is not None:
+                    yield target_object.name, target_block
+
+    def capture_initial_values(self):
+        self.initial_values = {
+            f"{object_name}::{target_block.name}": float(target_block.value)
+            for object_name, target_block in self._iter_target_blocks()
+        }
+        return dict(self.initial_values)
+
+    def restore_initial_values(self):
+        if not self.initial_values:
             return None
-        return self.apply_index(0)
+        restored = 0
+        for object_name, target_block in self._iter_target_blocks():
+            key = f"{object_name}::{target_block.name}"
+            if key not in self.initial_values:
+                continue
+            target_block.value = float(self.initial_values[key])
+            restored += 1
+        self.status_text = f"已恢复回放前形态键状态：{restored} 键"
+        return {"restored_count": restored, "sample_index": self.current_index, "sample_count": len(self.samples)}
 
     def _scene_or_raise(self):
         scene = bpy.data.scenes.get(self.scene_name)
         if scene is None:
-            raise RuntimeError("回放所在场景已不可用。")
+            raise RuntimeError("\u56de\u653e\u6240\u5728\u573a\u666f\u5df2\u4e0d\u53ef\u7528\u3002")
         return scene
 
 
@@ -1398,30 +1738,8 @@ def _apply_scene_settings(scene, settings):
 def _sync_scene_runtime(scene, recorder=None, replayer=None, module_state=None):
     if scene is None:
         return
-    if hasattr(scene, "sk_capture_running"):
-        scene.sk_capture_running = recorder is not None
-    if hasattr(scene, "sk_capture_status"):
-        scene.sk_capture_status = (
-            module_state.get("last_result", "") if module_state is not None and module_state.get("last_result", "") else ("采集中" if recorder is not None else "空闲")
-        )
-    if hasattr(scene, "sk_capture_sample_count"):
-        scene.sk_capture_sample_count = int(getattr(recorder, "sample_count", 0) or 0)
-    if hasattr(scene, "sk_capture_session_dir"):
-        scene.sk_capture_session_dir = str(getattr(recorder, "session_dir", "") or "")
-    if hasattr(scene, "sk_replay_running"):
-        scene.sk_replay_running = replayer is not None
-    if hasattr(scene, "sk_replay_status"):
-        current_status = str(getattr(scene, "sk_replay_status", "") or "").strip()
-        if not current_status:
-            scene.sk_replay_status = "回放中" if replayer is not None else "空闲"
-    if hasattr(scene, "sk_replay_sample_index") and replayer is not None:
-        scene.sk_replay_sample_index = int(getattr(replayer, "current_index", 0) or 0)
-    if hasattr(scene, "sk_replay_mapped_count"):
-        scene.sk_replay_mapped_count = int(module_state.get("replay_mapped_count", 0) if module_state is not None else 0)
-    if hasattr(scene, "sk_replay_total_source_keys"):
-        scene.sk_replay_total_source_keys = int(module_state.get("replay_total_source_keys", 0) if module_state is not None else 0)
-    if hasattr(scene, "sk_replay_total_samples"):
-        scene.sk_replay_total_samples = int(module_state.get("replay_total_samples", 0) if module_state is not None else 0)
+    # AI定位：运行状态由 recorder/replayer/module_state 内存态提供，不回写 Scene。
+    return
 
 
 def _settings_from_ui(context, module, panel_api):
@@ -1507,7 +1825,10 @@ def _register_capture_timer():
             return None
 
     state["capture_callback"] = _tick
-    bpy.app.timers.register(_tick, first_interval=max(0.001, token_recorder.sample_interval))
+    try:
+        bpy.app.timers.register(_tick, first_interval=max(0.001, token_recorder.sample_interval), persistent=True)
+    except TypeError:
+        bpy.app.timers.register(_tick, first_interval=max(0.001, token_recorder.sample_interval))
 
 
 def _register_replay_timer():
@@ -1522,7 +1843,7 @@ def _register_replay_timer():
             if next_interval is None:
                 info = token_replayer.reset_to_initial()
                 _status(
-                    f"回放完成，已回到初始: {info['sample_index'] + 1}/{info['sample_count']}，映射 {info['applied_count']} 键",
+                    f"回放完成，已恢复回放前状态: {info.get('restored_count', 0)} 键",
                     level="OK",
                 )
                 _stop_replay("completed")
@@ -1539,10 +1860,45 @@ def _register_replay_timer():
 
 def run(context, scene, workflow, module):
     settings = _settings_from_ui(context, module, _panel_api())
-    _persist_settings(module, settings)
     if _runtime_state().get("recorder") is not None:
         return on_panel_action("STOP_CAPTURE", context, scene, workflow, module, _panel_api(), _module_state())
     return on_panel_action("START_CAPTURE", context, scene, workflow, module, _panel_api(), _module_state())
+
+
+def _draw_replay_key_set_button(layout, panel_api, action, label, icon, active=False):
+    try:
+        op = layout.operator(
+            "bworkflow.module_runtime_action",
+            text=str(label),
+            icon=icon,
+            depress=bool(active),
+        )
+        op.workflow_name = str(getattr(panel_api, "workflow_name", "") or "")
+        op.module_name = str(getattr(panel_api, "module_name", "") or "")
+        op.action_name = str(action)
+        return op
+    except Exception:
+        return panel_api.draw_button(layout, action, label, icon=icon)
+
+
+def _analyze_and_apply_replay_sample(scene, context, settings, module_state):
+    replay = ShapeKeyReplaySession(scene, context, settings)
+    replay.prepare()
+    result = replay.apply_index(settings["replay_sample_index"])
+    mapping_info = result["mapping_info"]
+    if module_state is not None:
+        module_state.set("replay_total_samples", result["sample_count"])
+        module_state.set("replay_total_source_keys", mapping_info["source_count"])
+        module_state.set("replay_mapped_count", mapping_info["mapped_count"])
+        module_state.set("replay_source_family_counts", mapping_info.get("source_family_counts", {}))
+        module_state.set("replay_target_family_counts", mapping_info.get("target_family_counts", {}))
+        module_state.set("replay_effective_key_set", mapping_info.get("effective_key_set", REPLAY_KEY_SET_ALL))
+        module_state.set("last_result", f"已应用样本 {result['sample_index'] + 1}/{result['sample_count']}，映射 {result['applied_count']} 键")
+    _status(
+        f"已分析并应用样本 {result['sample_index'] + 1}/{result['sample_count']}，映射 {result['applied_count']}/{mapping_info['source_count']} 键",
+        level="OK",
+    )
+    return result
 
 
 def draw_panel(layout, context, scene, workflow, module, panel_api, module_state):
@@ -1555,12 +1911,12 @@ def draw_panel(layout, context, scene, workflow, module, panel_api, module_state
     capture_status_text = module_state.get("last_result", "") if module_state is not None else ""
     if not capture_status_text:
         capture_status_text = "采集中" if capture_running else "空闲"
-    capture_sample_count = int(getattr(recorder, "sample_count", 0) or 0)
+    capture_sample_count = int(getattr(recorder, "sample_index", 0) or 0)
     capture_session_dir = str(getattr(recorder, "session_dir", "") or "")
-    replay_status_text = str(getattr(scene, "sk_replay_status", "") or ("回放中" if replay_running else "空闲"))
-    replay_mapped_count = int(getattr(scene, "sk_replay_mapped_count", 0) or 0)
-    replay_total_source_keys = int(getattr(scene, "sk_replay_total_source_keys", 0) or 0)
-    replay_total_samples = int(getattr(scene, "sk_replay_total_samples", 0) or 0)
+    replay_status_text = str(getattr(replayer, "status_text", "") or (module_state.get("last_result", "") if module_state is not None else "") or ("回放中" if replay_running else "空闲"))
+    replay_mapped_count = int(module_state.get("replay_mapped_count", 0) if module_state is not None else 0)
+    replay_total_source_keys = int(module_state.get("replay_total_source_keys", 0) if module_state is not None else 0)
+    replay_total_samples = int(module_state.get("replay_total_samples", 0) if module_state is not None else 0)
 
     capture_box = panel_api.section(layout, "采集设置", icon="REC")
     panel_api.prop(capture_box, scene, "sk_capture_interval")
@@ -1611,56 +1967,80 @@ def draw_panel(layout, context, scene, workflow, module, panel_api, module_state
 
     replay_box = panel_api.section(layout, "数据投射/回放", icon="FILE_REFRESH")
     panel_api.prop(replay_box, scene, "sk_replay_file_path", text="记录文件")
+    panel_api.label(replay_box, "记录文件需要填写形态键采集导出的 .jsonl 文件。", icon="INFO")
+    preset_box = panel_api.section(replay_box, "默认预设", icon="PRESET")
+    for preset_label, _preset_path in DEFAULT_REPLAY_PRESETS:
+        panel_api.draw_button(preset_box, f"SET_REPLAY_FILE_PRESET::{preset_label}", preset_label, icon="FILE_TEXT")
     panel_api.prop(replay_box, scene, "sk_replay_strength")
     panel_api.prop(replay_box, scene, "sk_replay_speed")
     panel_api.prop(replay_box, scene, "sk_replay_loop")
     panel_api.prop(replay_box, scene, "sk_replay_sample_index")
 
     replay_key_set = _normalize_replay_key_set(settings.get("replay_key_set", REPLAY_KEY_SET_AUTO))
-    replay_target_object = _target_object_from_panel(context, panel_api)
-    target_family_counts = _shape_names_family_counts(_object_shape_key_names(replay_target_object))
+    target_family_counts = _replay_target_family_counts(context, scene, panel_api)
+    if _family_counts_total(target_family_counts) <= 0:
+        target_family_counts = module_state.get("replay_target_family_counts", {}) if module_state is not None else {}
+    if not isinstance(target_family_counts, dict):
+        target_family_counts = _empty_family_counts()
+    if (
+        _family_counts_total(target_family_counts) <= 0
+        and replay_mapped_count > 0
+        and module_state is not None
+    ):
+        effective_from_mapping = _normalize_replay_key_set(module_state.get("replay_effective_key_set", REPLAY_KEY_SET_AUTO))
+        if effective_from_mapping in {REPLAY_KEY_SET_ARKIT, REPLAY_KEY_SET_MMD}:
+            target_family_counts = {effective_from_mapping: replay_mapped_count, "UNKNOWN": 0}
+        else:
+            source_counts_for_display = module_state.get("replay_source_family_counts", {})
+            if isinstance(source_counts_for_display, dict) and (
+                int(source_counts_for_display.get(REPLAY_KEY_SET_ARKIT, 0) or 0) > 0
+                or int(source_counts_for_display.get(REPLAY_KEY_SET_MMD, 0) or 0) > 0
+            ):
+                target_family_counts = dict(source_counts_for_display)
+    has_arkit_target_keys = int(target_family_counts.get(REPLAY_KEY_SET_ARKIT, 0) or 0) > 0
+    has_mmd_target_keys = int(target_family_counts.get(REPLAY_KEY_SET_MMD, 0) or 0) > 0
+    display_replay_key_set = replay_key_set
+    if (
+        (replay_key_set == REPLAY_KEY_SET_ARKIT and not has_arkit_target_keys)
+        or (replay_key_set == REPLAY_KEY_SET_MMD and not has_mmd_target_keys)
+    ):
+        display_replay_key_set = REPLAY_KEY_SET_AUTO
     source_family_counts = module_state.get("replay_source_family_counts", {}) if module_state is not None else {}
-    effective_key_set = _effective_replay_key_set(replay_key_set, source_family_counts, target_family_counts)
-    key_set_label = REPLAY_KEY_SET_LABELS.get(replay_key_set, replay_key_set)
+    effective_key_set = _effective_replay_key_set(display_replay_key_set, source_family_counts, target_family_counts)
+    key_set_label = REPLAY_KEY_SET_LABELS.get(display_replay_key_set, display_replay_key_set)
     effective_label = REPLAY_KEY_SET_LABELS.get(effective_key_set, effective_key_set)
-    arkit_available = int(target_family_counts.get(REPLAY_KEY_SET_ARKIT, 0) or 0) > 0
-    mmd_available = int(target_family_counts.get(REPLAY_KEY_SET_MMD, 0) or 0) > 0
     panel_api.draw_key_value(replay_box, "识别套件", _format_family_counts(target_family_counts))
-    panel_api.draw_key_value(replay_box, "验证套件", f"{key_set_label} -> {effective_label}" if replay_key_set == REPLAY_KEY_SET_AUTO else key_set_label)
+    panel_api.draw_key_value(replay_box, "验证套件", f"{key_set_label} -> {effective_label}" if display_replay_key_set == REPLAY_KEY_SET_AUTO else key_set_label)
     key_set_row = panel_api.row(replay_box, align=True)
     auto_button_row = key_set_row.row(align=True)
-    panel_api.draw_button(
+    _draw_replay_key_set_button(
         auto_button_row,
+        panel_api,
         "SET_REPLAY_KEY_SET::AUTO",
-        ("[自动]" if replay_key_set == REPLAY_KEY_SET_AUTO else "自动"),
+        "自动",
         icon="FILE_REFRESH",
+        active=display_replay_key_set == REPLAY_KEY_SET_AUTO,
     )
     arkit_button_row = key_set_row.row(align=True)
-    try:
-        arkit_button_row.enabled = arkit_available
-    except Exception:
-        pass
-    panel_api.draw_button(
+    arkit_button_row.enabled = has_arkit_target_keys
+    _draw_replay_key_set_button(
         arkit_button_row,
+        panel_api,
         "SET_REPLAY_KEY_SET::ARKIT",
-        ("[ARKit]" if replay_key_set == REPLAY_KEY_SET_ARKIT else "ARKit"),
+        "ARKit",
         icon="SHAPEKEY_DATA",
+        active=display_replay_key_set == REPLAY_KEY_SET_ARKIT,
     )
     mmd_button_row = key_set_row.row(align=True)
-    try:
-        mmd_button_row.enabled = mmd_available
-    except Exception:
-        pass
-    panel_api.draw_button(
+    mmd_button_row.enabled = has_mmd_target_keys
+    _draw_replay_key_set_button(
         mmd_button_row,
+        panel_api,
         "SET_REPLAY_KEY_SET::MMD",
-        ("[MMD]" if replay_key_set == REPLAY_KEY_SET_MMD else "MMD"),
+        "MMD",
         icon="OUTLINER_OB_ARMATURE",
+        active=display_replay_key_set == REPLAY_KEY_SET_MMD,
     )
-
-    replay_actions = panel_api.row(replay_box, align=True)
-    panel_api.draw_button(replay_actions, "ANALYZE_REPLAY", "分析映射", icon="VIEWZOOM")
-    panel_api.draw_button(replay_actions, "APPLY_REPLAY_SAMPLE", "应用当前样本", icon="IMPORT")
 
     replay_actions_2 = panel_api.row(replay_box, align=True)
     if replay_running:
@@ -1677,23 +2057,47 @@ def draw_panel(layout, context, scene, workflow, module, panel_api, module_state
 
 def on_panel_action(action, context, scene, workflow, module, panel_api, module_state):
     settings = _settings_from_ui(context, module, panel_api)
-    _persist_settings(module, settings)
+    # AI定位：不要每次按钮动作都写 module.config_payload，避免普通操作污染 Blender 撤回栈。
     state = _runtime_state()
 
     if action.startswith("SET_REPLAY_KEY_SET::"):
         replay_key_set = _normalize_replay_key_set(action.split("::", 1)[1])
+        target_family_counts = _replay_target_family_counts(context, scene, panel_api)
+        if module_state is not None:
+            module_state.set("replay_target_family_counts", target_family_counts)
         if replay_key_set in {REPLAY_KEY_SET_ARKIT, REPLAY_KEY_SET_MMD}:
-            target_counts = _shape_names_family_counts(_object_shape_key_names(_target_object_from_panel(context, panel_api)))
-            if int(target_counts.get(replay_key_set, 0) or 0) <= 0:
-                _status(f"当前活动物体未识别到 {REPLAY_KEY_SET_LABELS.get(replay_key_set, replay_key_set)} 形态键", level="WARNING")
-                return {"CANCELLED"}
+            if int(target_family_counts.get(replay_key_set, 0) or 0) <= 0:
+                _status(f"未检测到 {REPLAY_KEY_SET_LABELS.get(replay_key_set, replay_key_set)} 形态键名称，已保持当前验证套件", level="WARNING")
+                return {"FINISHED"}
         _config_set(module, "replay_key_set", replay_key_set)
         if hasattr(scene, "sk_replay_key_set"):
             scene.sk_replay_key_set = replay_key_set
         settings["replay_key_set"] = replay_key_set
         if state.get("replayer") is not None:
             _stop_replay("user_stop", reset_to_initial=True)
-        _status(f"验证套件已切换为 {REPLAY_KEY_SET_LABELS.get(replay_key_set, replay_key_set)}", level="OK")
+        try:
+            _analyze_and_apply_replay_sample(scene, context, settings, module_state)
+        except Exception as exc:
+            _status(f"验证套件已切换为 {REPLAY_KEY_SET_LABELS.get(replay_key_set, replay_key_set)}；自动分析/应用失败: {exc}", level="WARNING")
+            return {"FINISHED"}
+        return {"FINISHED"}
+
+    if action.startswith("SET_REPLAY_FILE_PRESET::"):
+        preset_name = action.split("::", 1)[1]
+        preset_path = ""
+        for label, path in DEFAULT_REPLAY_PRESETS:
+            if label == preset_name:
+                preset_path = path
+                break
+        if not preset_path:
+            _status("找不到指定的默认记录文件预设", level="WARNING")
+            return {"CANCELLED"}
+        scene.sk_replay_file_path = preset_path
+        _config_set(module, "replay_file_path", preset_path)
+        settings["replay_file_path"] = preset_path
+        if state.get("replayer") is not None:
+            _stop_replay("user_stop", reset_to_initial=True)
+        _status(f"已填入记录文件: {preset_name}", level="OK")
         return {"FINISHED"}
 
     if action == "START_CAPTURE":
@@ -1702,6 +2106,7 @@ def on_panel_action(action, context, scene, workflow, module, panel_api, module_
         recorder.start()
         state["recorder"] = recorder
         _register_capture_timer()
+        _sync_scene_runtime(scene, recorder=recorder, module_state=module_state)
         _status(f"采集已开始: {recorder.session_dir}", level="OK")
         return {"FINISHED"}
 
@@ -1727,20 +2132,7 @@ def on_panel_action(action, context, scene, workflow, module, panel_api, module_
         return {"FINISHED"}
 
     if action == "APPLY_REPLAY_SAMPLE":
-        replay = ShapeKeyReplaySession(scene, context, settings)
-        replay.prepare()
-        result = replay.apply_index(settings["replay_sample_index"])
-        module_state.set("replay_total_samples", result["sample_count"])
-        module_state.set("replay_total_source_keys", result["mapping_info"]["source_count"])
-        module_state.set("replay_mapped_count", result["mapping_info"]["mapped_count"])
-        module_state.set("replay_source_family_counts", result["mapping_info"].get("source_family_counts", {}))
-        module_state.set("replay_target_family_counts", result["mapping_info"].get("target_family_counts", {}))
-        module_state.set("replay_effective_key_set", result["mapping_info"].get("effective_key_set", REPLAY_KEY_SET_ALL))
-        module_state.set("last_result", f"已应用样本 {result['sample_index'] + 1}/{result['sample_count']}，映射 {result['applied_count']} 键")
-        _status(
-            f"已应用样本 {result['sample_index'] + 1}/{result['sample_count']}，映射 {result['applied_count']} 键",
-            level="OK",
-        )
+        _analyze_and_apply_replay_sample(scene, context, settings, module_state)
         return {"FINISHED"}
 
     if action == "START_REPLAY":

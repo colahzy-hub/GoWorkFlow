@@ -1,14 +1,15 @@
 bl_info = {
     "name": "Go工作流 / Go Workflow",
     "author": "OpenAI Codex",
-    "version": (0, 9, 1),
+    "version": (0, 9, 20),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Go工作流",
     "description": "基于工作流的 N 面板筛选与自定义脚本模块工具 / Workflow panel filter and script module manager",
     "category": "3D View",
 }
 
-__version__ = (0, 9, 2)
+# AI定位：插件升版本时同步更新这里的 bl_info["version"]、__version__ 和 blender_manifest.toml。
+__version__ = (0, 9, 20)
 
 import json
 import csv
@@ -83,6 +84,8 @@ UI_BUTTON_MAX_CHARS = 24
 PANEL_GROUP_DRAW_LIMIT = 12
 SELECTED_PANEL_GROUP_DRAW_LIMIT = 12
 MAX_PRESET_FILE_BYTES = 50 * 1024 * 1024
+MAX_PRESET_MANIFEST_BYTES = 8 * 1024 * 1024
+MAX_PRESET_SCRIPT_ASSET_BYTES = 8 * 1024 * 1024
 MAX_GLOBAL_STATE_FILE_BYTES = 12 * 1024 * 1024
 DEFAULT_WORKFLOW_NAME = "默认工作流"
 DEFAULT_WORKFLOW_DESCRIPTION = "这是默认的工作流配置，可自定义面板与脚本模板"
@@ -166,6 +169,7 @@ MODULE_RUNTIME_CLEANUP_CACHE = {}
 MODULE_RUNTIME_NAMESPACE_CACHE = {}
 MODULE_SOURCE_TEXT_CACHE = {}
 MODULE_RUNTIME_FIELD_INIT_CACHE = {}
+MODULE_RUNTIME_VOLATILE_STORE = {}
 CACHED_MODULE_STATE_PROXY_CLASS = None
 CACHED_MODULE_PANEL_API_CLASS = None
 BUILTIN_DEFAULT_PANEL_PREFIXES = (
@@ -671,12 +675,28 @@ def panel_component_key(title):
 def panel_group_index_signature(state, space_type):
     if state is None:
         return ()
-    registry = getattr(state, "panel_registry", [])
     return (
         space_type,
-        len(registry),
-        getattr(state, "panel_registry_index", 0),
+        panel_registry_content_signature(state),
     )
+
+
+def panel_registry_record_signature(record):
+    return (
+        getattr(record, "panel_id", ""),
+        getattr(record, "title", ""),
+        getattr(record, "category", ""),
+        getattr(record, "tags", ""),
+        getattr(record, "source_module", ""),
+        getattr(record, "addon_version", ""),
+        bool(getattr(record, "discovered", False)),
+    )
+
+
+def panel_registry_content_signature(state):
+    if state is None:
+        return ()
+    return tuple(panel_registry_record_signature(record) for record in getattr(state, "panel_registry", []))
 
 
 def get_panel_group_index(state):
@@ -759,10 +779,9 @@ def get_panel_group_index(state):
 def panel_registry_lookup_signature(state):
     if state is None:
         return ()
-    registry = getattr(state, "panel_registry", [])
     return (
-        len(registry),
-        getattr(state, "panel_registry_index", 0),
+        getattr(state, "space_type", "VIEW_3D"),
+        panel_registry_content_signature(state),
     )
 
 
@@ -1060,19 +1079,30 @@ def iter_supported_space_types():
     return tuple(SUPPORTED_SPACE_TYPES)
 
 
+def iter_workflow_lookup_space_types(preferred_space_type=""):
+    preferred_space_type = str(preferred_space_type or "").strip()
+    ordered = []
+    if preferred_space_type in SUPPORTED_SPACE_TYPES:
+        ordered.append(preferred_space_type)
+    for space_type in iter_supported_space_types():
+        if space_type not in ordered:
+            ordered.append(space_type)
+    return tuple(ordered)
+
+
 def get_active_workflow(state):
     if state is None or not state.workflows:
         return None
     return state.workflows[clamp_index(state.active_workflow_index, len(state.workflows))]
 
 
-def resolve_workflow_module(scene, workflow_name="", module_name=""):
+def resolve_workflow_module(scene, workflow_name="", module_name="", space_type=None):
     workflow_name = str(workflow_name or "").strip()
     module_name = str(module_name or "").strip()
     if scene is None:
         return None, None
-    for space_type in iter_supported_space_types():
-        state = get_state(scene=scene, space_type=space_type)
+    for lookup_space_type in iter_workflow_lookup_space_types(space_type):
+        state = get_state(scene=scene, space_type=lookup_space_type)
         if state is None:
             continue
         for workflow in state.workflows:
@@ -1125,6 +1155,7 @@ def workflow_module_signature(module):
         bool(getattr(module, "enabled", False)),
         bool(getattr(module, "use_custom_panel", False)),
         bool(getattr(module, "runtime_panel_expanded", True)),
+        bool(getattr(module, "runtime_description_expanded", False)),
         getattr(module, "panel_title", ""),
         getattr(module, "panel_description", ""),
         getattr(module, "script_path", ""),
@@ -1153,14 +1184,9 @@ def workflow_panel_membership_signature(workflow):
     if workflow is None:
         return ()
     panels = getattr(workflow, "panels", [])
-    first_panel_id = panels[0].panel_id if panels else ""
-    last_panel_id = panels[-1].panel_id if panels else ""
     return (
         bool(getattr(workflow, "is_default", False)),
-        len(panels),
-        getattr(workflow, "active_panel_index", 0),
-        first_panel_id,
-        last_panel_id,
+        tuple(getattr(item, "panel_id", "") for item in panels),
     )
 
 
@@ -1278,6 +1304,7 @@ def dedupe_workflows(state):
                         "enabled": module.enabled,
                         "use_custom_panel": module.use_custom_panel,
                         "runtime_panel_expanded": getattr(module, "runtime_panel_expanded", True),
+                        "runtime_description_expanded": getattr(module, "runtime_description_expanded", False),
                         "panel_title": module.panel_title,
                         "panel_description": module.panel_description,
                         "script_path": module.script_path,
@@ -1309,6 +1336,7 @@ def dedupe_workflows(state):
             module.enabled = module_data["enabled"]
             module.use_custom_panel = module_data["use_custom_panel"]
             module.runtime_panel_expanded = module_data.get("runtime_panel_expanded", not module_prefers_collapsed_runtime_panel(module_data))
+            module.runtime_description_expanded = module_data.get("runtime_description_expanded", False)
             module.panel_title = module_data["panel_title"]
             module.panel_description = module_data["panel_description"]
             module.script_path = module_data["script_path"]
@@ -1611,6 +1639,7 @@ def sanitize_module_payload(module_data):
             module_data.get("runtime_panel_expanded", not module_prefers_collapsed_runtime_panel(module_data)),
             not module_prefers_collapsed_runtime_panel(module_data),
         ),
+        "runtime_description_expanded": coerce_bool_value(module_data.get("runtime_description_expanded", False), False),
         "panel_title": normalize_text_value(coerce_text_value(module_data.get("panel_title", ""), max_chars=MAX_RNA_NAME_CHARS), ""),
         "panel_description": normalize_text_value(coerce_text_value(module_data.get("panel_description", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS), ""),
         "script_path": coerce_text_value(module_data.get("script_path", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS),
@@ -1710,6 +1739,7 @@ def sanitize_space_payload(space_payload):
                     module_item["enabled"],
                     module_item["use_custom_panel"],
                     module_item["runtime_panel_expanded"],
+                    module_item["runtime_description_expanded"],
                     module_item["panel_title"],
                     module_item["panel_description"],
                     module_item["script_path"],
@@ -2115,8 +2145,18 @@ def panel_groups_filter_signature(groups, filter_text):
     source = list(groups or [])
     return (
         str(filter_text or ""),
-        len(source),
-        tuple(group.get("key", "") for group in source),
+        tuple(
+            (
+                group.get("key", ""),
+                group.get("title", ""),
+                group.get("panel_id", ""),
+                tuple(group.get("drawer_ids", ()) or ()),
+                tuple(group.get("panel_ids", ()) or ()),
+                int(group.get("panel_count", 0) or 0),
+                int(group.get("selected_count", 0) or 0),
+            )
+            for group in source
+        ),
     )
 
 
@@ -2220,90 +2260,6 @@ def workflow_panel_registry_index(state, workflow, panel_id):
         first_panel_id = getattr(drawer_records[0], "panel_id", "")
         return lookup["index_by_id"].get(first_panel_id, -1)
     return -1
-
-
-def build_selected_panel_groups_legacy_unused(state, workflow):
-    if state is None or workflow is None:
-        return []
-    cache_key = getattr(state, "space_type", "VIEW_3D")
-    signature = selected_panel_group_summary_signature(state, workflow)
-    cached = SELECTED_PANEL_GROUP_SUMMARY_CACHE_BY_SPACE.get(cache_key)
-    if cached is not None and cached.get("signature") == signature:
-        return cached.get("groups", [])
-
-    active_panel_id = ""
-    if workflow.panels:
-        active_index = clamp_index(workflow.active_panel_index, len(workflow.panels))
-        active_panel_id = workflow.panels[active_index].panel_id
-
-    selected_entries = []
-    seen_panel_ids = set()
-    space_type = getattr(state, "space_type", "VIEW_3D")
-    selected_ids = {item.panel_id for item in workflow.panels}
-    selected_drawer_ids = {
-        panel_drawer_root_id(panel_id, space_type=space_type)
-        for panel_id in selected_ids
-    }
-    selected_lookup_ids = selected_ids.union(selected_drawer_ids)
-    for index, item in enumerate(workflow.panels):
-        if item.panel_id == "BWFLOW_PT_workflow":
-            continue
-        panel_id = item.panel_id
-        if is_builtin_default_panel_id(panel_id, space_type=space_type):
-            continue
-        if panel_id in seen_panel_ids:
-            continue
-        seen_panel_ids.add(panel_id)
-        entry = panel_drawer_entry_for_id(
-            state,
-            panel_id,
-            selected_ids=selected_lookup_ids,
-            active_panel_id=active_panel_id,
-            fallback_index=workflow_panel_registry_index(state, workflow, item.panel_id),
-        )
-        entry["workflow_index"] = index
-        selected_entries.append(entry)
-
-    groups = {}
-    for entry in selected_entries:
-        group_key = workflow_group_key_for_panel(state, entry["panel_id"])
-        family_title = workflow_family_group_title(state, entry["panel_id"])
-        group = groups.setdefault(
-            group_key,
-            {
-                "key": group_key,
-                "title": family_title or "未分类插件",
-                "entries": [],
-            },
-        )
-        group["entries"].append(entry)
-
-    ordered_groups = []
-    for group in groups.values():
-        entries = sorted(group["entries"], key=lambda entry: (entry["workflow_index"], entry["title"].casefold(), entry["panel_id"]))
-        group_panel_id = entries[0]["panel_id"] if entries else ""
-
-        ordered_groups.append(
-            {
-                "key": group["key"],
-                "title": group["title"] or "未分类插件",
-                "panel_id": group_panel_id,
-                "panel_count": drawer_count_for_entries(entries),
-                "plugin_title": panel_count_label(drawer_count_for_entries(entries)),
-                "entries": entries,
-                "is_active": any(entry.get("is_active", False) for entry in entries),
-            }
-        )
-
-    ordered_groups.sort(
-        key=lambda item: (
-            min((entry["workflow_index"] for entry in item["entries"]), default=999999),
-            item["title"].casefold(),
-            item["key"],
-        )
-    )
-    SELECTED_PANEL_GROUPS_CACHE_BY_SPACE[cache_key] = {"signature": signature, "groups": ordered_groups}
-    return ordered_groups
 
 
 def build_selected_panel_groups(state, workflow):
@@ -2600,17 +2556,22 @@ def panel_drawer_default_order_index(state, drawer_id, space_type=None):
         return 999999
 
     target_space = space_type or (getattr(state, "space_type", "VIEW_3D") if state is not None else "VIEW_3D")
+    for index, panel_id in enumerate(get_panel_cache(target_space).keys()):
+        if panel_id == drawer_id or panel_drawer_root_id(panel_id, space_type=target_space) == drawer_id:
+            return index
+
     registration_order = panel_registration_order_map(space_type=target_space)
+    registry = get_panel_registry(target_space)
+    for index, panel_id in enumerate(registry.keys()):
+        if panel_id == drawer_id or panel_drawer_root_id(panel_id, space_type=target_space) == drawer_id:
+            return 100000 + registration_order.get(panel_id, index)
+
     for index, record in enumerate(getattr(state, "panel_registry", [])):
         record_id = getattr(record, "panel_id", "")
         if not record_id:
             continue
         if record_id == drawer_id or panel_drawer_root_id(record_id, space_type=target_space) == drawer_id:
-            return index
-
-    for index, panel_id in enumerate(get_panel_registry(target_space).keys()):
-        if panel_id == drawer_id or panel_drawer_root_id(panel_id, space_type=target_space) == drawer_id:
-            return registration_order.get(panel_id, 100000 + index)
+            return 200000 + index
     return 999999
 
 
@@ -3226,8 +3187,7 @@ def workflow_visibility_data_signature(state, workflow):
         panel_registry_lookup_signature(state),
         workflow_panel_membership_signature(workflow),
         getattr(workflow, "tag_filter", ""),
-        len(registry),
-        getattr(state, "panel_registry_index", 0),
+        tuple(registry.keys()),
     )
 
 
@@ -3334,60 +3294,6 @@ def panel_filter_signature(state):
         registry_ids,
         hidden_ids,
     )
-
-
-def workflow_ordered_panel_ids_legacy_unused(state, workflow):
-    if workflow is None or workflow.is_default:
-        return list(get_panel_registry(getattr(state, "space_type", "VIEW_3D")).keys())
-
-    space_type = getattr(state, "space_type", "VIEW_3D")
-    explicit_workflow_ids = [
-        panel_id
-        for panel_id in workflow_panel_order_ids(workflow)
-        if panel_id != "BWFLOW_PT_workflow" and not is_builtin_default_panel_id(panel_id, space_type=space_type)
-    ]
-    panel_order_ids = unique_panel_ids(
-        panel_drawer_root_id(panel_id, space_type=space_type)
-        for panel_id in explicit_workflow_ids
-    )
-    explicit_ids = [panel_id for panel_id in panel_order_ids if panel_id != "BWFLOW_PT_workflow"]
-    auto_ids = [panel_id for panel_id in workflow_auto_tag_panel_ids(state, workflow) if panel_id not in explicit_ids]
-    visible_ids = explicit_ids + auto_ids
-    allowed_ids = expand_panel_family(panel_descendant_ids(visible_ids, space_type=space_type), space_type=space_type)
-
-    registry = get_panel_registry(space_type)
-    explicit_member_ids = []
-    for panel_id in explicit_workflow_ids:
-        drawer_id = panel_drawer_root_id(panel_id, space_type=space_type)
-        if drawer_id not in visible_ids:
-            continue
-        if panel_id in allowed_ids and panel_id in registry:
-            explicit_member_ids.append(panel_id)
-        elif drawer_id in allowed_ids and drawer_id in registry:
-            explicit_member_ids.append(drawer_id)
-
-    # 先尊重右侧“当前勾选”的抽屉顺序，再把每个抽屉展开到真实注册的子面板。
-    ordered_drawer_member_ids = []
-    for drawer_id in visible_ids:
-        preferred_members = [
-            panel_id
-            for panel_id in explicit_member_ids
-            if panel_drawer_root_id(panel_id, space_type=space_type) == drawer_id
-        ]
-        members = [
-            panel_id
-            for panel_id in registry.keys()
-            if panel_id in allowed_ids and panel_drawer_root_id(panel_id, space_type=space_type) == drawer_id
-        ]
-        members = unique_panel_ids(preferred_members + members)
-        if drawer_id in registry and drawer_id not in members:
-            members.insert(0, drawer_id)
-        ordered_drawer_member_ids.extend(members)
-
-    trailing_ids = [panel_id for panel_id in registry.keys() if panel_id in allowed_ids and panel_id not in visible_ids]
-    preferred_ids = [panel_id for panel_id in ordered_drawer_member_ids if panel_id in registry]
-    preferred_ids.extend(panel_id for panel_id in trailing_ids if panel_id not in preferred_ids)
-    return ordered_panel_ids_for_register(preferred_ids, space_type=space_type)
 
 
 def workflow_ordered_panel_ids(state, workflow):
@@ -4520,6 +4426,7 @@ def apply_script_library_item_to_module(module, item):
     module.description = normalize_text_value(getattr(item, "description", ""), "")
     module.use_custom_panel = bool(getattr(item, "use_custom_panel", False))
     module.runtime_panel_expanded = False
+    module.runtime_description_expanded = False
     module.panel_title = normalize_text_value(getattr(item, "panel_title", ""), "")
     module.panel_description = normalize_text_value(getattr(item, "panel_description", ""), "")
     # 脚本库是模板仓库，载入到模块后必须绑定到当前工作流自己的 .py，
@@ -4757,7 +4664,7 @@ def export_script_source_from_item(item):
         try:
             filepath = bpy.path.abspath(raw_path)
             if os.path.isfile(filepath):
-                return read_cached_text_file(filepath, encodings=("utf-8", "utf-8-sig")).lstrip("\ufeff")
+                return read_cached_text_file(filepath).lstrip("\ufeff")
         except Exception:
             traceback.print_exc()
     return ""
@@ -4780,7 +4687,7 @@ def sync_script_library_item_source(item):
     filepath = bpy.path.abspath(raw_path)
     if not os.path.isfile(filepath):
         return False
-    source = read_cached_text_file(filepath, encodings=("utf-8", "utf-8-sig"))
+    source = read_cached_text_file(filepath)
     if source != getattr(item, "script_source", ""):
         item.script_source = source
     return True
@@ -4931,6 +4838,7 @@ def serialize_workflow(workflow, state=None):
                 "enabled": module.enabled,
                 "use_custom_panel": module.use_custom_panel,
                 "runtime_panel_expanded": getattr(module, "runtime_panel_expanded", True),
+                "runtime_description_expanded": getattr(module, "runtime_description_expanded", False),
                 "panel_title": module.panel_title,
                 "panel_description": module.panel_description,
                 "script_path": module.script_path,
@@ -5092,6 +5000,34 @@ def write_preset_archive(filepath, payload):
     return target_path
 
 
+def normalize_preset_archive_member_name(name):
+    return str(name or "").replace("\\", "/").lstrip("/")
+
+
+def find_preset_archive_member(names, requested_name):
+    requested = normalize_preset_archive_member_name(requested_name)
+    if not requested:
+        return ""
+    normalized_lookup = {}
+    for name in names:
+        normalized = normalize_preset_archive_member_name(name)
+        if name == requested or normalized == requested:
+            return name
+        normalized_lookup.setdefault(normalized.casefold(), name)
+    return normalized_lookup.get(requested.casefold(), "")
+
+
+def read_preset_archive_text_member(archive, member_name, max_bytes=None, label="archive member"):
+    try:
+        info = archive.getinfo(member_name)
+    except KeyError:
+        raise ValueError(f"Preset archive missing {label}: {member_name}")
+    if max_bytes is not None and int(getattr(info, "file_size", 0) or 0) > max_bytes:
+        raise ValueError(f"Preset {label} is too large: {info.file_size / (1024 * 1024):.1f} MB")
+    with archive.open(member_name, "r") as handle:
+        return handle.read().decode("utf-8-sig", errors="replace")
+
+
 def read_preset_archive(filepath, max_bytes=None):
     target_path = bpy.path.abspath(str(filepath or "").strip())
     if not target_path:
@@ -5101,11 +5037,18 @@ def read_preset_archive(filepath, max_bytes=None):
     if max_bytes is not None and os.path.getsize(target_path) > max_bytes:
         raise ValueError("Preset archive is too large")
     with zipfile.ZipFile(target_path, "r") as archive:
-        names = set(archive.namelist())
-        if "manifest.json" not in names:
+        names = archive.namelist()
+        manifest_name = find_preset_archive_member(names, "manifest.json")
+        if not manifest_name:
             raise ValueError("Preset archive missing manifest.json")
-        with archive.open("manifest.json", "r") as handle:
-            payload = json.loads(handle.read().decode("utf-8-sig"))
+        payload = json.loads(
+            read_preset_archive_text_member(
+                archive,
+                manifest_name,
+                max_bytes=MAX_PRESET_MANIFEST_BYTES,
+                label="manifest.json",
+            )
+        )
         if isinstance(payload, dict):
             payload["preset_archive_format"] = "zip"
 
@@ -5113,10 +5056,16 @@ def read_preset_archive(filepath, max_bytes=None):
             if not isinstance(module, dict):
                 return
             asset_name = str(module.get("script_asset", "") or "")
-            if not asset_name or asset_name not in names or not asset_name.startswith("scripts/"):
+            archive_asset_name = find_preset_archive_member(names, asset_name)
+            normalized_asset_name = normalize_preset_archive_member_name(archive_asset_name)
+            if not archive_asset_name or not normalized_asset_name.startswith("scripts/"):
                 return
-            with archive.open(asset_name, "r") as handle:
-                module["script_source"] = handle.read().decode("utf-8-sig", errors="replace")
+            module["script_source"] = read_preset_archive_text_member(
+                archive,
+                archive_asset_name,
+                max_bytes=MAX_PRESET_SCRIPT_ASSET_BYTES,
+                label="script asset",
+            )
 
         def hydrate_workflow(workflow):
             if not isinstance(workflow, dict):
@@ -5138,8 +5087,8 @@ def read_preset_archive(filepath, max_bytes=None):
         return payload
 
 
-def build_current_workflow_preset_payload(scene, context=None):
-    space_type = current_space_type(context=context)
+def build_current_workflow_preset_payload(scene, context=None, space_type=None):
+    space_type = space_type or current_space_type(context=context)
     state = get_state(context=context, scene=scene, space_type=space_type)
     workflow = get_active_workflow(state)
     workflow_payload = serialize_workflow(workflow, state=state)
@@ -5154,15 +5103,15 @@ def build_current_workflow_preset_payload(scene, context=None):
         "space_label": SPACE_LABELS.get(space_type, space_type),
         "workflow_name": workflow_payload.get("name", ""),
         "settings": serialize_space_settings(state),
-        "panel_registry": [],
+        "panel_registry": collect_workflow_panel_registry_records(state, [workflow]),
         "script_library": serialize_script_library_items(related_scripts),
         "workflow": workflow_payload,
     }
     return sanitize_current_workflow_preset_payload(payload)
 
 
-def build_selected_workflows_preset_payload(scene, context=None):
-    space_type = current_space_type(context=context)
+def build_selected_workflows_preset_payload(scene, context=None, space_type=None):
+    space_type = space_type or current_space_type(context=context)
     state = get_state(context=context, scene=scene, space_type=space_type)
     workflows = selected_preset_export_workflows(state)
     if state is None or not workflows:
@@ -5190,7 +5139,7 @@ def build_selected_workflows_preset_payload(scene, context=None):
             "label": SPACE_LABELS.get(space_type, space_type),
             "active_workflow_index": active_workflow_index,
             "settings": serialize_space_settings(state),
-            "panel_registry": [],
+            "panel_registry": collect_workflow_panel_registry_records(state, workflows),
             "script_library": serialize_script_library_items(related_scripts),
             "workflows": workflow_payloads,
         }
@@ -5259,18 +5208,6 @@ def apply_space_state_payload(state, space_payload):
     for script_data in cleaned_payload.get("script_library", []):
         item = state.script_library.add()
         apply_safe_imported_script_library_payload(state, item, script_data)
-        continue
-        item.name = unique_script_library_name(state, script_data.get("name", ""), exclude_index=None)
-        item.description = normalize_text_value(script_data.get("description", ""), "")
-        item.tags = script_data.get("tags", "")
-        item.use_custom_panel = script_data.get("use_custom_panel", False)
-        item.panel_title = normalize_text_value(script_data.get("panel_title", ""), "")
-        item.panel_description = normalize_text_value(script_data.get("panel_description", ""), "")
-        item.script_path = script_data.get("script_path", "")
-        item.text_block_name = normalize_text_value(script_data.get("text_block_name", ""), "")
-        item.script_source = script_data.get("script_source", "")
-        item.config_payload = script_data.get("config_payload", "")
-        item.ai_doc = script_data.get("ai_doc", "")
 
     for workflow_data in cleaned_payload.get("workflows", []):
         workflow = state.workflows.add()
@@ -5290,19 +5227,6 @@ def apply_space_state_payload(state, space_payload):
         for module_data in workflow_data.get("modules", []):
             module = workflow.modules.add()
             apply_safe_imported_module_payload(workflow, module, module_data)
-            continue
-            module.name = normalize_workflow_name(module_data.get("name", ""), "默认脚本模板")
-            module.enabled = module_data.get("enabled", True)
-            module.use_custom_panel = module_data.get("use_custom_panel", False)
-            module.runtime_panel_expanded = module_data.get("runtime_panel_expanded", not module_prefers_collapsed_runtime_panel(module_data))
-            module.panel_title = normalize_text_value(module_data.get("panel_title", ""), "")
-            module.panel_description = normalize_text_value(module_data.get("panel_description", ""), "")
-            module.script_path = module_data.get("script_path", "")
-            module.description = normalize_text_value(module_data.get("description", ""), "")
-            module.text_block_name = normalize_text_value(module_data.get("text_block_name", ""), "")
-            module.script_source = module_data.get("script_source", "")
-            module.config_payload = module_data.get("config_payload", "")
-            module.ai_doc = module_data.get("ai_doc", "")
 
     ensure_one_default_workflow(state)
     ensure_go_workflow_panel_entry(state)
@@ -5679,6 +5603,7 @@ def apply_safe_imported_module_payload(workflow, module, module_data):
         module_data.get("runtime_panel_expanded", not module_prefers_collapsed_runtime_panel(module_data)),
         not module_prefers_collapsed_runtime_panel(module_data),
     )
+    module.runtime_description_expanded = coerce_bool_value(module_data.get("runtime_description_expanded", False), False)
     module.panel_title = normalize_text_value(coerce_text_value(module_data.get("panel_title", ""), max_chars=MAX_RNA_NAME_CHARS), "")
     module.panel_description = normalize_text_value(coerce_text_value(module_data.get("panel_description", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS), "")
     module.description = normalize_text_value(coerce_text_value(module_data.get("description", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS), "")
@@ -5724,20 +5649,6 @@ def apply_safe_imported_module_payload(workflow, module, module_data):
 def apply_module_payload_to_workflow(workflow, module_data):
     module = workflow.modules.add()
     return apply_safe_imported_module_payload(workflow, module, module_data)
-    module.name = normalize_workflow_name(module_data.get("name", ""), "导入模块")
-    module.enabled = bool(module_data.get("enabled", True))
-    module.use_custom_panel = bool(module_data.get("use_custom_panel", False))
-    module.runtime_panel_expanded = bool(module_data.get("runtime_panel_expanded", not module_prefers_collapsed_runtime_panel(module_data)))
-    module.panel_title = normalize_text_value(module_data.get("panel_title", ""), "")
-    module.panel_description = normalize_text_value(module_data.get("panel_description", ""), "")
-    module.script_path = module_data.get("script_path", "")
-    module.description = normalize_text_value(module_data.get("description", ""), "")
-    module.text_block_name = normalize_text_value(module_data.get("text_block_name", ""), "")
-    module.script_source = module_data.get("script_source", "")
-    module.config_payload = module_data.get("config_payload", "")
-    module.ai_doc = module_data.get("ai_doc", "")
-    if not module.script_path:
-        module.script_path = unique_default_module_script_path(workflow, module)
 
 
 def apply_current_workflow_preset_payload(state, preset_payload, merge_shared=True):
@@ -5768,10 +5679,6 @@ def apply_current_workflow_preset_payload(state, preset_payload, merge_shared=Tr
     ensure_go_workflow_panel_entry(state)
     normalize_workflow_active_panel_index(workflow)
     return workflow
-
-
-def merge_preset_entries_shared_payloads(state, entries):
-    return
 
 
 def workflow_entry_is_default(entry):
@@ -5982,17 +5889,32 @@ def set_preset_import_cache(state, filepath, entries, selected_index=0):
     key = preset_import_cache_key(state)
     if not key:
         return
+    entries = list(entries or [])
+    selected_index = clamp_index(int(selected_index or 0), len(entries)) if entries else 0
     PRESET_IMPORT_ENTRY_CACHE[key] = {
         "filepath": str(filepath or ""),
-        "entries": list(entries or []),
-        "selected_index": int(selected_index or 0),
+        "entries": entries,
+        "selected_index": selected_index,
     }
+    try:
+        state.preset_filepath = str(filepath or "")
+        state.preset_workflow_index = selected_index
+        clear_collection(state.preset_workflows)
+    except Exception:
+        pass
 
 
 def clear_preset_import_cache(state):
     key = preset_import_cache_key(state)
     if key:
         PRESET_IMPORT_ENTRY_CACHE.pop(key, None)
+    try:
+        state.preset_filepath = ""
+        state.preset_status = ""
+        state.preset_workflow_index = 0
+        clear_collection(state.preset_workflows)
+    except Exception:
+        pass
 
 
 def get_preset_import_cache(state):
@@ -6439,7 +6361,7 @@ def _file_cache_signature(filepath):
     return (int(getattr(stat, "st_mtime_ns", 0)), int(getattr(stat, "st_size", 0)))
 
 
-def read_cached_text_file(filepath, encodings=("utf-8", "utf-8-sig"), errors=None):
+def read_cached_text_file(filepath, encodings=("utf-8", "utf-8-sig", "gb18030"), errors=None):
     normalized = os.path.normcase(os.path.abspath(filepath))
     signature = _file_cache_signature(normalized)
     if signature is None:
@@ -6521,7 +6443,7 @@ def builtin_script_library_payloads():
         source = ""
         if script_file and os.path.isfile(script_file):
             try:
-                source = read_cached_text_file(script_file, encodings=("utf-8", "utf-8-sig"))
+                source = read_cached_text_file(script_file)
             except Exception:
                 traceback.print_exc()
                 continue
@@ -6575,12 +6497,7 @@ def ensure_builtin_script_library(state):
     if state is None:
         return False
     changed = False
-    legacy_arkit_names = {
-        "ARKit 鍚堟垚 VRM 鍩虹褰㈡€侀敭 - 甯歌",
-        "ARKit 鍚堟垚 VRM 鍩虹褰㈡€侀敭 - 婵€杩?",
-        "ARKit 鍚堟垚 MMD 鍙瀯鎴愬舰鎬侀敭 - 甯歌",
-        "ARKit 鍚堟垚 MMD 鍙瀯鎴愬舰鎬侀敭 - 婵€杩?",
-    }
+    legacy_arkit_names = set()
     current_arkit_names = {payload.get("name", "") for payload in builtin_script_library_payloads()}
     for index in range(len(getattr(state, "script_library", [])) - 1, -1, -1):
         item = state.script_library[index]
@@ -6648,6 +6565,7 @@ def apply_special_preset_to_module(workflow, module, spec):
     module.enabled = True
     module.use_custom_panel = True
     module.runtime_panel_expanded = False
+    module.runtime_description_expanded = False
     module.panel_title = spec.get("preset_name", module.name)
     module.panel_description = spec.get("workflow_description", "")
     module.description = spec.get("module_description", "")
@@ -6656,7 +6574,7 @@ def apply_special_preset_to_module(workflow, module, spec):
         module.script_path = script_file
         try:
             if os.path.isfile(script_file):
-                module.script_source = read_cached_text_file(script_file, encodings=("utf-8", "utf-8-sig"))
+                module.script_source = read_cached_text_file(script_file)
         except Exception:
             traceback.print_exc()
     return True
@@ -6671,6 +6589,7 @@ def apply_module_payload_to_existing_module(module, module_data):
         ("enabled", bool(module_data.get("enabled", True))),
         ("use_custom_panel", bool(module_data.get("use_custom_panel", False))),
         ("runtime_panel_expanded", bool(module_data.get("runtime_panel_expanded", not module_prefers_collapsed_runtime_panel(module_data)))),
+        ("runtime_description_expanded", bool(module_data.get("runtime_description_expanded", False))),
         ("panel_title", normalize_text_value(module_data.get("panel_title", ""), "")),
         ("panel_description", normalize_text_value(module_data.get("panel_description", ""), "")),
         ("script_path", module_data.get("script_path", "")),
@@ -6723,9 +6642,11 @@ def refresh_builtin_workflow_modules(state):
                     getattr(module, "description", ""),
                     getattr(module, "use_custom_panel", False),
                     getattr(module, "runtime_panel_expanded", True),
+                    getattr(module, "runtime_description_expanded", False),
                 )
                 apply_special_preset_to_module(workflow, module, special_spec)
                 module.runtime_panel_expanded = False
+                module.runtime_description_expanded = False
                 after = (
                     getattr(module, "script_path", ""),
                     getattr(module, "script_source", ""),
@@ -6735,6 +6656,7 @@ def refresh_builtin_workflow_modules(state):
                     getattr(module, "description", ""),
                     getattr(module, "use_custom_panel", False),
                     getattr(module, "runtime_panel_expanded", True),
+                    getattr(module, "runtime_description_expanded", False),
                 )
                 if before != after:
                     changed += 1
@@ -6747,6 +6669,7 @@ def refresh_builtin_workflow_modules(state):
             payload_data = dict(payload)
             payload_data["enabled"] = getattr(module, "enabled", True)
             payload_data["runtime_panel_expanded"] = False
+            payload_data["runtime_description_expanded"] = False
             if apply_module_payload_to_existing_module(module, payload_data):
                 changed += 1
         if workflow_has_special_preset and special_spec:
@@ -6759,6 +6682,7 @@ def refresh_builtin_workflow_modules(state):
                 module_data = dict(payload)
                 module_data["enabled"] = True
                 module_data["runtime_panel_expanded"] = False
+                module_data["runtime_description_expanded"] = False
                 apply_module_payload_to_workflow(workflow, module_data)
                 existing_module_names.add(script_name)
                 changed += 1
@@ -6783,6 +6707,7 @@ def create_special_preset_workflow(scene, preset_type):
             module_data = dict(payload)
             module_data["enabled"] = True
             module_data["runtime_panel_expanded"] = False
+            module_data["runtime_description_expanded"] = False
             apply_module_payload_to_workflow(workflow, module_data)
         workflow.active_module_index = 0
     return created
@@ -6870,159 +6795,6 @@ def normalize_module_script_path(workflow, module):
     legacy_path = legacy_default_module_script_path(workflow.name, module.name)
     if normalized_abs_path(absolute_path) == normalized_abs_path(legacy_path):
         module.script_path = unique_default_module_script_path(workflow, module)
-
-
-def build_module_ai_doc_legacy_unused(workflow, module):
-    script_path = module.script_path or unique_default_module_script_path(workflow, module)
-    panel_title = module.panel_title.strip() or module.name or "自定义面板"
-    return "\n".join(
-        [
-            "# Go工作流通用脚本模块说明",
-            f"- 模块名称: {module.name}",
-            f"- 所属工作流: {workflow.name}",
-            f"- 建议脚本路径: {script_path}",
-            f"- 需要自定义面板: {'是' if module.use_custom_panel else '否'}",
-            f"- 自定义面板显示名: {panel_title}",
-            "",
-            "目标: 生成一个可以直接放进 Go工作流 的 Blender Python 工具脚本。请根据模块名称和模块说明判断具体用途，不要假设固定任务类型；脚本应该可读、可维护、错误提示清楚，并优先使用 Blender 数据 API。",
-            "",
-            "必须遵守的接口:",
-            "1. 必须定义 run(context, scene, workflow, module)。点击“运行模块”时会调用它。",
-            "2. 可选定义 draw_panel(layout, context, scene, workflow, module, panel_api, module_state)。只绘制本模块的 UI，不要注册新的 Panel/Class，不要修改 Go工作流 外壳。",
-            "3. 可选定义 on_panel_action(action, context, scene, workflow, module, panel_api, module_state)。按钮通过 panel_api.draw_button(...) 触发。",
-            "4. 运行环境会把 bpy、context、scene、workflow、module、panel_api、module_state 放进脚本全局变量；run(...) 虽然只有 5 个参数，也可以直接读取 panel_api/module_state。",
-            "5. 绘制 draw_panel 时不要写入场景数据；需要改数据时放到 run(...) 或 on_panel_action(...)。",
-            "6. 成功返回 {'FINISHED'}；用户操作不满足条件时 raise Exception('清楚的人类可读错误') 或返回 {'CANCELLED'}。",
-            "",
-            "panel_api 可用能力:",
-            "- 布局: box/section/row/column/separator/label/split/grid_flow，用于组织清楚的参数区、操作区、提示区。",
-            "- Blender 原生 UI 透传: prop/prop_search/operator/menu/operator_menu_enum/template_list/template_id/template_icon。",
-            "- 可读写字段: draw_object_picker、draw_active_object_capture、draw_text_input、draw_toggle、draw_float_input、draw_int_input。",
-            "- 读取字段: get_object、get_text、get_bool、get_float、get_int。",
-            "- 写入字段: set_object、set_text、set_bool、set_float、set_int。字段会保存到当前场景，不要自己写全局变量。",
-            "- 操作按钮: draw_button(layout, action, label, icon) 调用 on_panel_action；draw_run_button(...) 调用 run(...)。",
-            "",
-            "生成代码时的安全规则:",
-            "- 根据任务先校验上下文、对象、模式、选择数量、数据类型和用户输入；错误信息要说明用户该怎么修正。",
-            "- 批量处理时跳过非法项，或在确实无法继续时 raise Exception。",
-            "- 创建修改器、约束、材质、集合、文本、属性或其他数据块时优先复用同名项，避免重复叠加。",
-            "- 不要自动删除用户数据；如需覆盖、应用、删除或写文件，提供明确开关，例如 overwrite、apply_result、delete_source。",
-            "- 不要在 draw_panel 里执行耗时操作、切换模式、创建物体、写文件或调用 bpy.ops。",
-            "- 如果需要 bpy.ops，先检查 context/mode/active_object，并尽量用数据 API 替代。",
-            "",
-            "通用骨架:",
-            "import bpy",
-            "",
-            "def _selected_objects(context):",
-            "    return list(getattr(context, 'selected_objects', []) or [])",
-            "",
-            "def _validate(context, scene, workflow, module):",
-            "    # 按模块需求改写这里：检查对象、模式、输入参数、文件路径或场景状态。",
-            "    return _selected_objects(context)",
-            "",
-            "def run(context, scene, workflow, module):",
-            "    items = _validate(context, scene, workflow, module)",
-            "    processed = 0",
-            "    for item in items:",
-            "        # TODO: 在这里写模块真正要做的事情。",
-            "        # 示例: 读取/修改对象属性、创建数据块、批量重命名、检查场景、导入导出等。",
-            "        processed += 1",
-            "    module_state.set('last_result', f'已检查 {len(items)} 项，执行 {processed} 项')",
-            "    return {'FINISHED'}",
-            "",
-            "def draw_panel(layout, context, scene, workflow, module, panel_api, module_state):",
-            "    settings = panel_api.section(layout, '参数', icon='TOOL_SETTINGS')",
-            "    panel_api.draw_text_input(settings, 'name_prefix', '名称/前缀', default=module.name or 'GoWorkflowTool')",
-            "    status = module_state.get('last_result', '')",
-            "    if status:",
-            "        panel_api.label(layout, status, icon='CHECKMARK')",
-            "    actions = panel_api.row(layout)",
-            "    panel_api.draw_button(actions, 'preview', '预览/检查', icon='VIEWZOOM')",
-            "    panel_api.draw_run_button(actions, '执行', icon='PLAY')",
-            "",
-            "def on_panel_action(action, context, scene, workflow, module, panel_api, module_state):",
-            "    if action == 'preview':",
-            "        items = _selected_objects(context)",
-            "        module_state.set('last_result', f'当前选择 {len(items)} 项；请根据模块说明补充更具体的检查。')",
-            "        return {'FINISHED'}",
-            "    return {'CANCELLED'}",
-        ]
-    )
-
-def build_module_script_template(workflow, module):
-    return ""
-
-
-def build_module_ai_doc_v029_unused(workflow, module):
-    script_path = module.script_path or unique_default_module_script_path(workflow, module)
-    panel_title = module.panel_title.strip() or module.name or "自定义面板"
-    return "\n".join(
-        [
-            "# Go工作流脚本模块开发说明",
-            f"- 模块名称: {module.name}",
-            f"- 所属工作流: {workflow.name}",
-            f"- 目标 .py 路径: {script_path}",
-            f"- 是否需要自定义面板: {'是' if module.use_custom_panel else '否'}",
-            f"- 面板显示名: {panel_title}",
-            "",
-            "任务: 根据模块名称和模块说明，生成一个可直接保存为 .py 的 Blender Python 脚本。代码要短、清楚、可维护，优先使用 bpy 数据 API。",
-            "",
-            "必须接口:",
-            "1. 必须定义 run(context, scene, workflow, module)，按钮运行时会调用它。",
-            "2. 成功返回 {'FINISHED'}；条件不满足时 raise Exception('给用户看的中文错误原因')。",
-            "3. 不要在导入脚本时执行真实操作，所有写入都放进 run 或按钮回调。",
-            "",
-            "可选自定义面板:",
-            "def draw_panel(layout, context, scene, workflow, module, panel_api, module_state):",
-            "    # 只画 UI，不改场景、不写文件、不调用 bpy.ops",
-            "    pass",
-            "",
-            "def on_panel_action(action, context, scene, workflow, module, panel_api, module_state):",
-            "    # 处理 draw_button 触发的轻量按钮",
-            "    return {'FINISHED'}",
-            "",
-            "panel_api 常用方法:",
-            "- 布局: section(layout, title), row(layout), column(layout), label(layout, text, icon='INFO')",
-            "- 输入: draw_object_picker, draw_text_input, draw_toggle, draw_float_input, draw_int_input",
-            "- 读取: get_object, get_text, get_bool, get_float, get_int",
-            "- 写入: set_object, set_text, set_bool, set_float, set_int",
-            "- 按钮: draw_button(layout, action, label, icon='PLAY'), draw_run_button(layout, label, icon='PLAY')",
-            "",
-            "生成要求:",
-            "- 先检查对象、模式、选择、路径、输入参数；错误信息写给普通用户看。",
-            "- 批处理时跳过不适用对象，必要时统计处理数量。",
-            "- 不自动删除用户数据；覆盖、删除、写文件前要有明确开关。",
-            "- draw_panel 只负责显示和读取参数，真正修改数据放到 run 或 on_panel_action。",
-            "",
-            "推荐代码骨架:",
-            "import bpy",
-            "",
-            "def _selected(context):",
-            "    return list(getattr(context, 'selected_objects', []) or [])",
-            "",
-            "def _validate(context):",
-            "    items = _selected(context)",
-            "    if not items:",
-            "        raise Exception('请先选择要处理的对象')",
-            "    return items",
-            "",
-            "def run(context, scene, workflow, module):",
-            "    items = _validate(context)",
-            "    processed = 0",
-            "    for obj in items:",
-            "        # TODO: 在这里写模块真正要做的事",
-            "        processed += 1",
-            "    module_state.set('last_result', f'已处理 {processed} 个对象')",
-            "    return {'FINISHED'}",
-            "",
-            "def draw_panel(layout, context, scene, workflow, module, panel_api, module_state):",
-            "    box = panel_api.section(layout, '参数')",
-            "    status = module_state.get('last_result', '')",
-            "    if status:",
-            "        panel_api.label(layout, status, icon='CHECKMARK')",
-            "    panel_api.draw_run_button(layout, '运行', icon='PLAY')",
-        ]
-    )
 
 
 def build_module_ai_doc(workflow, module):
@@ -7342,27 +7114,20 @@ def ensure_module_runtime_store(scene, workflow, module, allow_writes=True):
     module_store = workflow_store.get(module_key)
     if not isinstance(module_store, dict):
         module_store = {}
-    if allow_writes:
-        workflow_store[module_key] = module_store
-        root_store[workflow_key] = workflow_store
-        scene[root_key] = root_store
-    return module_store
+    volatile_key = module_runtime_cleanup_cache_key(scene, workflow, module)
+    volatile_store = MODULE_RUNTIME_VOLATILE_STORE.get(volatile_key)
+    if isinstance(volatile_store, dict):
+        merged = dict(module_store)
+        merged.update(volatile_store)
+        return merged
+    return dict(module_store)
 
 
 def save_module_runtime_store(scene, workflow, module, module_store):
     if scene is None:
         return
-    root_key = "_go_workflow_module_state"
-    root_store = scene.get(root_key)
-    if not isinstance(root_store, dict):
-        root_store = {}
-    workflow_key = slugify_filename(getattr(workflow, "name", ""), "workflow")
-    workflow_store = root_store.get(workflow_key)
-    if not isinstance(workflow_store, dict):
-        workflow_store = {}
-    workflow_store[module_state_key(module)] = dict(module_store or {})
-    root_store[workflow_key] = workflow_store
-    scene[root_key] = root_store
+    # AI定位：运行状态只写内存缓存，避免状态提示/分析结果进入 Blender 撤回栈。
+    MODULE_RUNTIME_VOLATILE_STORE[module_runtime_cleanup_cache_key(scene, workflow, module)] = dict(module_store or {})
 
 
 def save_module_runtime_specs(scene, workflow, module, field_specs):
@@ -7390,6 +7155,22 @@ def save_module_runtime_specs(scene, workflow, module, field_specs):
             }
         )
     scene[specs_key] = saved
+
+
+def ensure_module_runtime_scene_defaults(scene, workflow, module, field_specs):
+    if scene is None:
+        return False
+    changed = False
+    for spec in field_specs or []:
+        prop_key = spec.get("prop_key")
+        if not prop_key or not module_scene_prop_key_usable(prop_key) or prop_key in scene:
+            continue
+        try:
+            scene[prop_key] = normalize_module_field_default(spec.get("kind", "text"), spec.get("default"))
+            changed = True
+        except Exception:
+            continue
+    return changed
 
 
 def load_module_runtime_specs(scene, workflow, module):
@@ -7454,6 +7235,16 @@ def migrate_module_runtime_scene_values(scene, workflow, module, field_specs):
             changed = True
         except Exception:
             continue
+    return changed
+
+
+def sync_module_runtime_field_specs(scene, workflow, module, field_specs):
+    field_specs = list(field_specs or [])
+    if scene is None or workflow is None or module is None or not field_specs:
+        return False
+    save_module_runtime_specs(scene, workflow, module, field_specs)
+    changed = migrate_module_runtime_scene_values(scene, workflow, module, field_specs)
+    changed = ensure_module_runtime_scene_defaults(scene, workflow, module, field_specs) or changed
     return changed
 
 
@@ -7619,6 +7410,7 @@ class CachedModulePanelAPI:
         "workflow_name",
         "module_name",
         "module_index",
+        "space_type",
     )
 
     def __init__(self, ctx, scn, store_proxy, workflow, module, allow_writes=True, field_specs=None):
@@ -7632,6 +7424,7 @@ class CachedModulePanelAPI:
         self.workflow_name = getattr(workflow, "name", "")
         self.module_name = getattr(module, "name", "")
         self.module_index = -1
+        self.space_type = current_space_type(context=ctx)
         try:
             for item_index, item in enumerate(getattr(workflow, "modules", [])):
                 if item == module:
@@ -7669,13 +7462,7 @@ class CachedModulePanelAPI:
     def _ensure_scene_value(self, key, default, kind="value"):
         prop_key = self._prop_key(key, kind=kind)
         self._remember_field(key, default, kind=kind)
-        if self.scene is None:
-            return prop_key
-        if module_scene_prop_key_usable(prop_key) and prop_key not in self.scene and self.allow_writes:
-            try:
-                self.scene[prop_key] = default
-            except Exception:
-                pass
+        # AI定位：绘制阶段只登记字段，不主动写 Scene，避免打开面板污染 Blender 撤回栈。
         return prop_key
 
     def __getattr__(self, name):
@@ -8094,9 +7881,9 @@ class CachedModulePanelAPI:
         except Exception:
             pass
         header = box.row(align=True)
-        if self.scene is not None and module_scene_prop_key_usable(prop_key):
+        if self.scene is not None and module_scene_prop_key_usable(prop_key) and (prop_key in self.scene or self.allow_writes):
             try:
-                if prop_key not in self.scene:
+                if prop_key not in self.scene and self.allow_writes:
                     self.scene[prop_key] = bool(default_open)
                 header.prop(
                     self.scene,
@@ -8132,6 +7919,7 @@ class CachedModulePanelAPI:
         )
         op.workflow_name = self.workflow_name
         op.module_name = self.module_name
+        op.space_type = self.space_type
         op.action_name = str(action)
         op.tooltip_text = str(tooltip or "")
         return op
@@ -8145,6 +7933,7 @@ class CachedModulePanelAPI:
         )
         op.workflow_name = self.workflow_name
         op.module_name = self.module_name
+        op.space_type = self.space_type
         op.action_name = str(action)
         op.tooltip_text = str(tooltip or "")
         return op
@@ -8503,6 +8292,7 @@ class CachedModulePanelAPI:
         op = row.operator("bworkflow.module_runtime_field_write", text=self.compact_text(value, UI_BUTTON_MAX_CHARS, "编辑"), translate=False)
         op.workflow_name = self.workflow_name
         op.module_name = self.module_name
+        op.space_type = self.space_type
         op.field_key = key
         op.field_kind = "text"
         op.text_value = value
@@ -8514,7 +8304,7 @@ class CachedModulePanelAPI:
         _left, right = self.split_field(layout, label, factor=factor)
         if self.scene is not None and module_scene_prop_key_usable(prop_key):
             try:
-                if prop_key not in self.scene:
+                if prop_key not in self.scene and self.allow_writes:
                     self.scene[prop_key] = value
                 right.prop(self.scene, f'["{prop_key}"]', text="")
                 if self.allow_writes:
@@ -8525,6 +8315,7 @@ class CachedModulePanelAPI:
         op = right.operator("bworkflow.module_runtime_field_write", text=self.compact_text(value, UI_BUTTON_MAX_CHARS, ""), translate=False)
         op.workflow_name = self.workflow_name
         op.module_name = self.module_name
+        op.space_type = self.space_type
         op.field_key = key
         op.field_kind = "text"
         op.text_value = value
@@ -8538,6 +8329,7 @@ class CachedModulePanelAPI:
         op = row.operator("bworkflow.module_runtime_field_write", text="开" if value else "关", depress=value)
         op.workflow_name = self.workflow_name
         op.module_name = self.module_name
+        op.space_type = self.space_type
         op.field_key = key
         op.field_kind = "bool"
         op.bool_value = not value
@@ -8548,7 +8340,7 @@ class CachedModulePanelAPI:
         _left, right = self.split_field(layout, label, factor=factor)
         if self.scene is not None and module_scene_prop_key_usable(prop_key):
             try:
-                if prop_key not in self.scene:
+                if prop_key not in self.scene and self.allow_writes:
                     self.scene[prop_key] = default_value
                 right.prop(self.scene, f'["{prop_key}"]', text="")
                 if self.allow_writes:
@@ -8560,6 +8352,7 @@ class CachedModulePanelAPI:
         op = right.operator("bworkflow.module_runtime_field_write", text="", icon="CHECKBOX_HLT" if value else "CHECKBOX_DEHLT", emboss=False)
         op.workflow_name = self.workflow_name
         op.module_name = self.module_name
+        op.space_type = self.space_type
         op.field_key = key
         op.field_kind = "bool"
         op.bool_value = not value
@@ -8574,7 +8367,7 @@ class CachedModulePanelAPI:
         prop_kwargs = runtime_numeric_prop_kwargs(**kwargs)
         if self.scene is not None and module_scene_prop_key_usable(prop_key):
             try:
-                if prop_key not in self.scene:
+                if prop_key not in self.scene and self.allow_writes:
                     self.scene[prop_key] = value
                 row.prop(self.scene, f'["{prop_key}"]', text="", **prop_kwargs)
                 if self.allow_writes:
@@ -8585,6 +8378,7 @@ class CachedModulePanelAPI:
         op = row.operator("bworkflow.module_runtime_field_write", text=f"{value:.3f}", translate=False)
         op.workflow_name = self.workflow_name
         op.module_name = self.module_name
+        op.space_type = self.space_type
         op.field_key = key
         op.field_kind = "float"
         op.float_value = value
@@ -8597,7 +8391,7 @@ class CachedModulePanelAPI:
         prop_kwargs = runtime_numeric_prop_kwargs(**kwargs)
         if self.scene is not None and module_scene_prop_key_usable(prop_key):
             try:
-                if prop_key not in self.scene:
+                if prop_key not in self.scene and self.allow_writes:
                     self.scene[prop_key] = value
                 right.prop(self.scene, f'["{prop_key}"]', text="", **prop_kwargs)
                 if self.allow_writes:
@@ -8608,6 +8402,7 @@ class CachedModulePanelAPI:
         op = right.operator("bworkflow.module_runtime_field_write", text=f"{value:.3f}", translate=False)
         op.workflow_name = self.workflow_name
         op.module_name = self.module_name
+        op.space_type = self.space_type
         op.field_key = key
         op.field_kind = "float"
         op.float_value = value
@@ -8632,6 +8427,7 @@ class CachedModulePanelAPI:
         op = row.operator("bworkflow.module_runtime_field_write", text=str(value), translate=False)
         op.workflow_name = self.workflow_name
         op.module_name = self.module_name
+        op.space_type = self.space_type
         op.field_key = key
         op.field_kind = "int"
         op.int_value = value
@@ -8644,7 +8440,7 @@ class CachedModulePanelAPI:
         prop_kwargs = runtime_numeric_prop_kwargs(**kwargs)
         if self.scene is not None and module_scene_prop_key_usable(prop_key):
             try:
-                if prop_key not in self.scene:
+                if prop_key not in self.scene and self.allow_writes:
                     self.scene[prop_key] = value
                 right.prop(self.scene, f'["{prop_key}"]', text="", **prop_kwargs)
                 if self.allow_writes:
@@ -8655,6 +8451,7 @@ class CachedModulePanelAPI:
         op = right.operator("bworkflow.module_runtime_field_write", text=str(value), translate=False)
         op.workflow_name = self.workflow_name
         op.module_name = self.module_name
+        op.space_type = self.space_type
         op.field_key = key
         op.field_kind = "int"
         op.int_value = value
@@ -8696,6 +8493,7 @@ class CachedModulePanelAPI:
             )
             op.workflow_name = self.workflow_name
             op.module_name = self.module_name
+            op.space_type = self.space_type
             op.field_key = key
             op.field_kind = "enum"
             op.text_value = identifier
@@ -8711,6 +8509,7 @@ class CachedModulePanelAPI:
         op = row.operator("bworkflow.module_runtime_field_write", text=self.compact_text(value, UI_BUTTON_MAX_CHARS, "选择物体"), translate=False)
         op.workflow_name = self.workflow_name
         op.module_name = self.module_name
+        op.space_type = self.space_type
         op.field_key = key
         op.field_kind = "object"
         op.object_name = value
@@ -8722,7 +8521,7 @@ class CachedModulePanelAPI:
         _left, right = self.split_field(layout, label, factor=factor)
         if self.scene is not None and module_scene_prop_key_usable(prop_key):
             try:
-                if prop_key not in self.scene:
+                if prop_key not in self.scene and self.allow_writes:
                     self.scene[prop_key] = value
                 field_row = right.row(align=True)
                 field_row.prop(self.scene, f'["{prop_key}"]', text="")
@@ -8737,6 +8536,7 @@ class CachedModulePanelAPI:
         op = field_row.operator("bworkflow.module_runtime_field_write", text=self.compact_text(value, UI_BUTTON_MAX_CHARS, ""), translate=False)
         op.workflow_name = self.workflow_name
         op.module_name = self.module_name
+        op.space_type = self.space_type
         op.field_key = key
         op.field_kind = "object"
         op.object_name = value
@@ -8751,13 +8551,14 @@ class CachedModulePanelAPI:
         _left, right = self.split_field(layout, label, factor=factor)
         if self.scene is not None and module_scene_prop_key_usable(prop_key):
             try:
-                if prop_key not in self.scene:
+                if prop_key not in self.scene and self.allow_writes:
                     self.scene[prop_key] = value
                 field_row = right.row(align=True)
                 field_row.prop(self.scene, f'["{prop_key}"]', text="")
                 op = field_row.operator("bworkflow.module_pick_file_path", text="", icon="FILE_FOLDER")
                 op.workflow_name = self.workflow_name
                 op.module_name = self.module_name
+                op.space_type = self.space_type
                 op.target_text_key = key
                 op.filter_glob = str(filter_glob or "*.*")
                 op.status_prefix = str(status_prefix or "已选择文件")
@@ -8777,6 +8578,7 @@ class CachedModulePanelAPI:
         )
         op.workflow_name = self.workflow_name
         op.module_name = self.module_name
+        op.space_type = self.space_type
         op.field_key = key
         op.field_kind = "object"
         op.object_name = active_name
@@ -8796,6 +8598,7 @@ class CachedModulePanelAPI:
         )
         op.workflow_name = self.workflow_name
         op.module_name = self.module_name
+        op.space_type = self.space_type
         op.field_key = key
         op.field_kind = kind
         op.text_value = value
@@ -8824,1328 +8627,6 @@ def module_runtime_context(context, scene, workflow, module, allow_writes=True, 
         field_specs=field_specs,
     )
     return proxy, panel_api
-
-    module_store = ensure_module_runtime_store(scene, workflow, module, allow_writes=allow_writes)
-    class ModuleStateProxy:
-        def __init__(self, initial):
-            self._data = dict(initial or {})
-
-        def get(self, key, default=None):
-            return self._data.get(key, default)
-
-        def __contains__(self, key):
-            return key in self._data
-
-        def __getitem__(self, key):
-            return self._data[key]
-
-        def __setitem__(self, key, value):
-            self._data[key] = value
-
-        def __delitem__(self, key):
-            del self._data[key]
-
-        def __len__(self):
-            return len(self._data)
-
-        def values(self):
-            return self._data.values()
-
-        def copy(self):
-            return dict(self._data)
-
-        def as_dict(self):
-            return dict(self._data)
-
-        def set(self, key, value):
-            self._data[key] = value
-            return value
-
-        def has(self, key):
-            return key in self._data
-
-        def get_value(self, key, default=None):
-            return self.get(key, default)
-
-        def set_value(self, key, value):
-            return self.set(key, value)
-
-        def get_text(self, key, default=""):
-            return str(self.get(key, default))
-
-        def set_text(self, key, value):
-            return self.set(key, str(value))
-
-        def get_bool(self, key, default=False):
-            value = self.get(key, default)
-            if isinstance(value, str):
-                return value.strip().lower() in {"1", "true", "yes", "on", "是", "开", "启用"}
-            return bool(value)
-
-        def set_bool(self, key, value):
-            return self.set(key, bool(value))
-
-        def get_float(self, key, default=0.0):
-            try:
-                return float(self.get(key, default))
-            except Exception:
-                return float(default)
-
-        def set_float(self, key, value):
-            try:
-                value = float(value)
-            except Exception:
-                value = 0.0
-            return self.set(key, value)
-
-        def get_int(self, key, default=0):
-            try:
-                return int(self.get(key, default))
-            except Exception:
-                return int(default)
-
-        def set_int(self, key, value):
-            try:
-                value = int(value)
-            except Exception:
-                value = 0
-            return self.set(key, value)
-
-        def get_enum(self, key, default=""):
-            return str(self.get(key, default))
-
-        def set_enum(self, key, value):
-            return self.set(key, str(value))
-
-        def pop(self, key, default=None):
-            return self._data.pop(key, default)
-
-        def update(self, values=None, **kwargs):
-            if isinstance(values, dict):
-                self._data.update(values)
-            elif values is not None:
-                try:
-                    self._data.update(dict(values))
-                except Exception:
-                    pass
-            if kwargs:
-                self._data.update(kwargs)
-            return dict(self._data)
-
-        def clear(self):
-            self._data.clear()
-
-        def keys(self):
-            return self._data.keys()
-
-        def items(self):
-            return self._data.items()
-
-        def append_log(self, message, key="debug_log", max_items=20):
-            items = self._data.get(key)
-            if not isinstance(items, list):
-                items = []
-            items.append(str(message))
-            if max_items and len(items) > max_items:
-                items = items[-max_items:]
-            self._data[key] = items
-            return items
-
-        def to_dict(self):
-            return dict(self._data)
-
-    class ModulePanelAPI:
-        def __init__(self, ctx, scn, store_proxy):
-            self.context = ctx
-            self.scene = scn
-            self.state = store_proxy
-            self.allow_writes = allow_writes
-            self.field_specs = field_specs if field_specs is not None else []
-            self.workflow_name = getattr(workflow, "name", "")
-            self.module_name = getattr(module, "name", "")
-            self.module_index = -1
-            try:
-                for item_index, item in enumerate(getattr(workflow, "modules", [])):
-                    if item == module:
-                        self.module_index = item_index
-                        break
-            except Exception:
-                self.module_index = -1
-
-        def _prop_key(self, key, kind="value"):
-            return module_scene_prop_key(workflow, module, key, kind=kind)
-
-        def _prop_path(self, key, kind="value"):
-            return f'["{self._prop_key(key, kind=kind)}"]'
-
-        def _data_kind(self, collection_name):
-            return f"datablock_{slugify_filename(collection_name, 'data')}"
-
-        def compact_text(self, text, max_chars=UI_LABEL_MAX_CHARS, fallback=""):
-            return compact_inline_text(text, max_chars=max_chars, fallback=fallback)
-
-        def plain_text(self, text, fallback=""):
-            value = str(text if text is not None else fallback)
-            return value if value else str(fallback or "")
-
-        def _remember_field(self, key, default, kind="value"):
-            self.field_specs.append(
-                {
-                    "key": key,
-                    "kind": kind,
-                    "default": default,
-                    "prop_key": self._prop_key(key, kind=kind),
-                }
-            )
-
-        def _ensure_scene_value(self, key, default, kind="value"):
-            prop_key = self._prop_key(key, kind=kind)
-            self._remember_field(key, default, kind=kind)
-            if self.scene is None:
-                return prop_key
-            if module_scene_prop_key_usable(prop_key) and prop_key not in self.scene and self.allow_writes:
-                try:
-                    self.scene[prop_key] = default
-                except Exception:
-                    pass
-            return prop_key
-
-        def __getattr__(self, name):
-            if name.startswith("_"):
-                raise AttributeError(name)
-
-            def layout_passthrough(layout, *args, **kwargs):
-                method = getattr(layout, name, None)
-                if method is None:
-                    raise AttributeError(name)
-                try:
-                    return method(*args, **kwargs)
-                except TypeError:
-                    safe_kwargs = dict(kwargs)
-                    if safe_kwargs.get("icon") == "NONE":
-                        safe_kwargs.pop("icon", None)
-                    if safe_kwargs != kwargs:
-                        return method(*args, **safe_kwargs)
-                    raise
-
-            return layout_passthrough
-
-        def box(self, layout):
-            return layout.box()
-
-        def row(self, layout, align=True):
-            return layout.row(align=align)
-
-        def column(self, layout, align=True):
-            return layout.column(align=align)
-
-        def separator(self, layout):
-            layout.separator()
-
-        def label(self, layout, text, icon="NONE"):
-            layout.label(text=self.plain_text(text), icon=icon)
-
-        def section(self, layout, title, icon="NONE", enabled=True, description=""):
-            box = layout.box()
-            try:
-                box.enabled = bool(enabled)
-            except Exception:
-                pass
-            if title:
-                box.label(text=self.plain_text(title), icon=icon)
-            if description:
-                self.draw_note(box, description, icon="NONE")
-            return box
-
-        def set_enabled(self, layout, enabled=True):
-            try:
-                layout.enabled = bool(enabled)
-            except Exception:
-                pass
-            return layout
-
-        def set_alert(self, layout, enabled=True):
-            try:
-                layout.alert = bool(enabled)
-            except Exception:
-                pass
-            return layout
-
-        def draw_note(self, layout, text, icon="INFO", limit=4, width=48):
-            for line in split_preview_lines(str(text or ""), limit=limit, width=width):
-                layout.label(text=self.plain_text(line), icon=icon)
-                icon = "NONE"
-
-        def draw_key_value(self, layout, label, value, icon="NONE", value_icon="NONE"):
-            row = layout.row(align=True)
-            row.label(text=self.compact_text(label), icon=icon)
-            row.label(text=self.compact_text(value, max_chars=UI_BUTTON_MAX_CHARS, fallback="-"), icon=value_icon)
-            return row
-
-        def draw_status_block(self, layout, title="状态", lines=None, icon="INFO", enabled=True):
-            box = self.section(layout, title, icon=icon, enabled=enabled)
-            for line in lines or []:
-                if isinstance(line, dict):
-                    self.draw_key_value(
-                        box,
-                        line.get("label", ""),
-                        line.get("value", ""),
-                        icon=line.get("icon", "NONE"),
-                        value_icon=line.get("value_icon", "NONE"),
-                    )
-                else:
-                    box.label(text=self.plain_text(line), icon="NONE")
-            return box
-
-        def draw_image_preview(self, layout, image=None, label="", scale=8.0, fallback=""):
-            if label:
-                layout.label(text=self.plain_text(label), icon="IMAGE_REFERENCE")
-            if image is None:
-                if fallback:
-                    layout.label(text=self.plain_text(fallback), icon="INFO")
-                return False
-            try:
-                icon_id = cached_image_preview_icon_id(image)
-                if icon_id:
-                    layout.template_icon(icon_value=icon_id, scale=max(1.0, float(scale)))
-                    return True
-            except Exception:
-                pass
-            fallback_name = getattr(image, "name", "") or fallback
-            if fallback_name:
-                layout.label(text=self.plain_text(fallback_name), icon="FILE_IMAGE")
-            return False
-
-        def prop(self, layout, data, prop_name, **kwargs):
-            if layout is None or data is None or not prop_name:
-                return None
-            try:
-                return layout.prop(data, prop_name, **kwargs)
-            except TypeError:
-                safe_kwargs = dict(kwargs)
-                if safe_kwargs.get("icon") == "NONE":
-                    safe_kwargs.pop("icon", None)
-                try:
-                    return layout.prop(data, prop_name, **safe_kwargs)
-                except Exception:
-                    return None
-            except Exception:
-                return None
-
-        def prop_search(self, layout, data, prop_name, search_data, search_prop, **kwargs):
-            if layout is None or data is None or search_data is None or not prop_name or not search_prop:
-                return None
-            try:
-                return layout.prop_search(data, prop_name, search_data, search_prop, **kwargs)
-            except TypeError:
-                safe_kwargs = dict(kwargs)
-                if safe_kwargs.get("icon") == "NONE":
-                    safe_kwargs.pop("icon", None)
-                try:
-                    return layout.prop_search(data, prop_name, search_data, search_prop, **safe_kwargs)
-                except Exception:
-                    return None
-            except Exception:
-                return None
-
-        def operator(self, layout, operator_id, text=None, icon="NONE", **properties):
-            if layout is None or not operator_id:
-                return None
-            kwargs = {}
-            if text is not None:
-                kwargs["text"] = self.compact_text(text, max_chars=UI_BUTTON_MAX_CHARS)
-            if icon != "NONE":
-                kwargs["icon"] = icon
-            try:
-                op = layout.operator(str(operator_id), **kwargs)
-            except Exception:
-                return None
-            for key, value in properties.items():
-                try:
-                    setattr(op, key, value)
-                except Exception:
-                    pass
-            return op
-
-        def menu(self, layout, menu_id, text=None, icon="NONE"):
-            if layout is None or not menu_id:
-                return None
-            kwargs = {}
-            if text is not None:
-                kwargs["text"] = self.compact_text(text, max_chars=UI_BUTTON_MAX_CHARS)
-            if icon != "NONE":
-                kwargs["icon"] = icon
-            try:
-                return layout.menu(str(menu_id), **kwargs)
-            except Exception:
-                return None
-
-        def operator_menu_enum(self, layout, operator_id, prop_name, text=None, icon="NONE"):
-            if layout is None or not operator_id or not prop_name:
-                return None
-            kwargs = {}
-            if text is not None:
-                kwargs["text"] = self.compact_text(text, max_chars=UI_BUTTON_MAX_CHARS)
-            if icon != "NONE":
-                kwargs["icon"] = icon
-            try:
-                return layout.operator_menu_enum(str(operator_id), str(prop_name), **kwargs)
-            except Exception:
-                return None
-
-        def operator_enum(self, layout, operator_id, prop_name):
-            if layout is None or not operator_id or not prop_name:
-                return None
-            try:
-                return layout.operator_enum(str(operator_id), str(prop_name))
-            except Exception:
-                return None
-
-        def prop_menu_enum(self, layout, data, prop_name, **kwargs):
-            if layout is None or data is None or not prop_name:
-                return None
-            try:
-                return layout.prop_menu_enum(data, prop_name, **kwargs)
-            except TypeError:
-                safe_kwargs = dict(kwargs)
-                if safe_kwargs.get("icon") == "NONE":
-                    safe_kwargs.pop("icon", None)
-                try:
-                    return layout.prop_menu_enum(data, prop_name, **safe_kwargs)
-                except Exception:
-                    return None
-            except Exception:
-                return None
-
-        def prop_enum(self, layout, data, prop_name, value, **kwargs):
-            if layout is None or data is None or not prop_name:
-                return None
-            try:
-                return layout.prop_enum(data, prop_name, value, **kwargs)
-            except TypeError:
-                safe_kwargs = dict(kwargs)
-                if safe_kwargs.get("icon") == "NONE":
-                    safe_kwargs.pop("icon", None)
-                try:
-                    return layout.prop_enum(data, prop_name, value, **safe_kwargs)
-                except Exception:
-                    return None
-            except Exception:
-                return None
-
-        def popover(self, layout, panel_id, text=None, icon="NONE"):
-            if layout is None or not panel_id:
-                return None
-            kwargs = {}
-            if text is not None:
-                kwargs["text"] = self.compact_text(text, max_chars=UI_BUTTON_MAX_CHARS)
-            if icon != "NONE":
-                kwargs["icon"] = icon
-            try:
-                return layout.popover(str(panel_id), **kwargs)
-            except Exception:
-                return None
-
-        def menu_contents(self, layout, menu_id):
-            if layout is None or not menu_id:
-                return None
-            try:
-                return layout.menu_contents(str(menu_id))
-            except Exception:
-                return None
-
-        def context_pointer_set(self, layout, name, data):
-            if layout is None or not name:
-                return None
-            try:
-                return layout.context_pointer_set(str(name), data)
-            except Exception:
-                return None
-
-        def split(self, layout, factor=0.5, align=False):
-            if layout is None:
-                return None
-            try:
-                return layout.split(factor=max(0.0, min(1.0, float(factor))), align=bool(align))
-            except Exception:
-                return None
-
-        def grid_flow(self, layout, **kwargs):
-            if layout is None:
-                return None
-            try:
-                return layout.grid_flow(**kwargs)
-            except Exception:
-                return None
-
-        def template_list(self, layout, *args, **kwargs):
-            if layout is None:
-                return None
-            try:
-                return layout.template_list(*args, **kwargs)
-            except Exception:
-                return None
-
-        def template_id(self, layout, data, prop_name, **kwargs):
-            if layout is None or data is None or not prop_name:
-                return None
-            try:
-                return layout.template_ID(data, prop_name, **kwargs)
-            except Exception:
-                return None
-
-        def template_icon(self, layout, icon_value=0, scale=1.0):
-            if layout is None:
-                return None
-            try:
-                return layout.template_icon(icon_value=int(icon_value or 0), scale=max(1.0, float(scale)))
-            except Exception:
-                return None
-
-        def template_id_preview(self, layout, data, prop_name, **kwargs):
-            if layout is None or data is None or not prop_name:
-                return None
-            try:
-                return layout.template_ID_preview(data, prop_name, **kwargs)
-            except Exception:
-                return None
-
-        def template_search(self, layout, data, prop_name, search_data, search_prop, **kwargs):
-            if layout is None or data is None or search_data is None or not prop_name or not search_prop:
-                return None
-            try:
-                return layout.template_search(data, prop_name, search_data, search_prop, **kwargs)
-            except Exception:
-                return None
-
-        def template_icon_view(self, layout, data, prop_name, **kwargs):
-            if layout is None or data is None or not prop_name:
-                return None
-            try:
-                return layout.template_icon_view(data, prop_name, **kwargs)
-            except Exception:
-                return None
-
-        def template_color_picker(self, layout, data, prop_name, **kwargs):
-            if layout is None or data is None or not prop_name:
-                return None
-            try:
-                return layout.template_color_picker(data, prop_name, **kwargs)
-            except Exception:
-                return None
-
-        def template_curve_mapping(self, layout, data, prop_name, **kwargs):
-            if layout is None or data is None or not prop_name:
-                return None
-            try:
-                return layout.template_curve_mapping(data, prop_name, **kwargs)
-            except Exception:
-                return None
-
-        def template_preview(self, layout, id_data, **kwargs):
-            if layout is None or id_data is None:
-                return None
-            try:
-                return layout.template_preview(id_data, **kwargs)
-            except Exception:
-                return None
-
-        def draw_prop(self, layout, data, prop_name, label=None, icon="NONE", slider=False, expand=False, toggle=-1, emboss=True):
-            if data is None or not prop_name:
-                return None
-            kwargs = {"text": "" if label is None else self.compact_text(label), "slider": slider, "expand": expand, "emboss": emboss}
-            if toggle in {0, 1}:
-                kwargs["toggle"] = bool(toggle)
-            if icon != "NONE":
-                kwargs["icon"] = icon
-            try:
-                return layout.prop(data, prop_name, **kwargs)
-            except TypeError:
-                kwargs.pop("icon", None)
-                kwargs.pop("toggle", None)
-                try:
-                    return layout.prop(data, prop_name, **kwargs)
-                except Exception:
-                    return None
-            except Exception:
-                return None
-
-        def draw_scene_prop(self, layout, prop_name, label=None, icon="NONE", slider=False, expand=False, toggle=-1, emboss=True):
-            return self.draw_prop(
-                layout,
-                self.scene,
-                prop_name,
-                label=label,
-                icon=icon,
-                slider=slider,
-                expand=expand,
-                toggle=toggle,
-                emboss=emboss,
-            )
-
-        def draw_runtime_prop(self, layout, key, default=None, kind="value", label=None, icon="NONE", slider=False, expand=False, toggle=-1, emboss=True):
-            prop_key = self._ensure_scene_value(key, default, kind=kind)
-            if self.scene is None or not prop_key:
-                return None
-            kwargs = {
-                "text": "" if label is None else self.compact_text(label),
-                "slider": slider,
-                "expand": expand,
-                "emboss": emboss,
-            }
-            if toggle in {0, 1}:
-                kwargs["toggle"] = bool(toggle)
-            if icon != "NONE":
-                kwargs["icon"] = icon
-            try:
-                return layout.prop(self.scene, f'["{prop_key}"]', **kwargs)
-            except TypeError:
-                kwargs.pop("icon", None)
-                kwargs.pop("toggle", None)
-                try:
-                    return layout.prop(self.scene, f'["{prop_key}"]', **kwargs)
-                except Exception:
-                    return None
-            except Exception:
-                return None
-
-        def split_field(self, layout, label="", factor=0.34, align=True):
-            split = layout.split(factor=max(0.1, min(0.9, float(factor))), align=align)
-            left = split.row(align=align)
-            right = split.row(align=align)
-            if label:
-                left.label(text=self.compact_text(label))
-            return left, right
-
-        def foldout_section(self, layout, key, title, icon="NONE", default_open=True, enabled=True):
-            prop_key = self._ensure_scene_value(key, bool(default_open), kind="bool")
-            is_open = bool(module_runtime_field_value(self.scene, workflow, module, key, "bool", bool(default_open)))
-            box = layout.box()
-            try:
-                box.enabled = bool(enabled)
-            except Exception:
-                pass
-            header = box.row(align=True)
-            if self.scene is not None and module_scene_prop_key_usable(prop_key):
-                try:
-                    if prop_key not in self.scene:
-                        self.scene[prop_key] = bool(default_open)
-                    header.prop(
-                        self.scene,
-                        f'["{prop_key}"]',
-                        text=self.plain_text(title),
-                        icon="TRIA_DOWN" if bool(self.scene.get(prop_key, default_open)) else "TRIA_RIGHT",
-                        emboss=False,
-                        toggle=False,
-                    )
-                    is_open = bool(self.scene.get(prop_key, default_open))
-                    if self.allow_writes:
-                        self.state.set(key, is_open)
-                except Exception:
-                    header.label(text=self.plain_text(title), icon=icon)
-            else:
-                header.label(text=self.plain_text(title), icon=icon)
-            if icon != "NONE":
-                header.label(text="", icon=icon)
-            content = box.column(align=True)
-            try:
-                content.enabled = bool(enabled)
-            except Exception:
-                pass
-            if not is_open:
-                return None
-            return content
-
-        def draw_button(self, layout, action, label=None, icon="NONE", tooltip=""):
-            op = layout.operator(
-                "bworkflow.module_runtime_action",
-                text=self.compact_text(label or action, max_chars=UI_BUTTON_MAX_CHARS),
-                icon=icon,
-            )
-            op.workflow_name = self.workflow_name
-            op.module_name = self.module_name
-            op.action_name = str(action)
-            op.tooltip_text = str(tooltip or "")
-            return op
-
-        def draw_icon_button(self, layout, action, icon="NONE", tooltip=""):
-            op = layout.operator(
-                "bworkflow.module_runtime_action",
-                text="",
-                icon=icon,
-                emboss=True,
-            )
-            op.workflow_name = self.workflow_name
-            op.module_name = self.module_name
-            op.action_name = str(action)
-            op.tooltip_text = str(tooltip or "")
-            return op
-
-        def draw_run_button(self, layout, label="运行模块", icon="PLAY"):
-            op = layout.operator(
-                "bworkflow.module_run",
-                text=self.compact_text(label, max_chars=UI_BUTTON_MAX_CHARS),
-                icon=icon,
-            )
-            op.module_index = self.module_index
-            return op
-
-        def get_value(self, key, default=None, kind="text"):
-            kind = str(kind or "text")
-            if kind == "bool":
-                return self.get_bool(key, bool(default))
-            if kind == "float":
-                return self.get_float(key, 0.0 if default is None else default)
-            if kind == "int":
-                return self.get_int(key, 0 if default is None else default)
-            if kind == "object":
-                return self.get_object(key, default)
-            if kind == "enum":
-                return self.get_enum(key, default)
-            return self.get_text(key, "" if default is None else default)
-
-        def set_value(self, key, value, kind="text"):
-            kind = str(kind or "text")
-            if kind == "bool":
-                return self.set_bool(key, value)
-            if kind == "float":
-                return self.set_float(key, value)
-            if kind == "int":
-                return self.set_int(key, value)
-            if kind == "object":
-                return self.set_object(key, value)
-            if kind == "enum":
-                return self.set_enum(key, value)
-            return self.set_text(key, value)
-
-        def clear_value(self, key, kind=None):
-            kinds = [kind] if kind else ["text", "bool", "float", "int", "object", "enum", "value"]
-            for item_kind in kinds:
-                prop_key = self._prop_key(key, kind=item_kind)
-                if (
-                    self.scene is not None
-                    and self.allow_writes
-                    and module_scene_prop_key_usable(prop_key)
-                    and prop_key in self.scene
-                ):
-                    try:
-                        del self.scene[prop_key]
-                    except Exception:
-                        pass
-            if self.allow_writes:
-                self.state.pop(key, None)
-            return None
-
-        def get_object(self, key, default=None):
-            scene_name = ""
-            if self.scene is not None:
-                scene_name, _scene_prop_key = module_runtime_field_scene_value(
-                    self.scene, workflow, module, key, "object", ""
-                )
-            name = scene_name or self.state.get(key, "")
-            if not name:
-                return default
-            return bpy.data.objects.get(name, default)
-
-        def set_object(self, key, obj):
-            name = getattr(obj, "name", "") if obj is not None else ""
-            self._remember_field(key, name, kind="object")
-            if self.scene is not None and self.allow_writes:
-                prop_key = self._prop_key(key, kind="object")
-                if module_scene_prop_key_usable(prop_key):
-                    try:
-                        self.scene[prop_key] = name
-                    except Exception:
-                        pass
-            if self.allow_writes:
-                self.state.set(key, name)
-            return obj
-
-        def get_text(self, key, default=""):
-            self._remember_field(key, str(default), kind="text")
-            scene_value, scene_prop_key = module_runtime_field_scene_value(
-                self.scene, workflow, module, key, "text", self.state.get(key, default)
-            )
-            if scene_prop_key:
-                return str(scene_value)
-            return str(self.state.get(key, default))
-
-        def set_text(self, key, value):
-            text_value = str(value)
-            self._remember_field(key, text_value, kind="text")
-            if self.scene is not None and self.allow_writes:
-                prop_key = self._prop_key(key, kind="text")
-                if module_scene_prop_key_usable(prop_key):
-                    try:
-                        self.scene[prop_key] = text_value
-                    except Exception:
-                        pass
-            if self.allow_writes:
-                self.state.set(key, text_value)
-            return text_value
-
-        def get_bool(self, key, default=False):
-            self._remember_field(key, bool(default), kind="bool")
-            scene_value, scene_prop_key = module_runtime_field_scene_value(
-                self.scene, workflow, module, key, "bool", self.state.get(key, default)
-            )
-            if scene_prop_key:
-                return bool(scene_value)
-            return bool(self.state.get(key, default))
-
-        def set_bool(self, key, value):
-            bool_value = bool(value)
-            self._remember_field(key, bool_value, kind="bool")
-            if self.scene is not None and self.allow_writes:
-                prop_key = self._prop_key(key, kind="bool")
-                if module_scene_prop_key_usable(prop_key):
-                    try:
-                        self.scene[prop_key] = bool_value
-                    except Exception:
-                        pass
-            if self.allow_writes:
-                self.state.set(key, bool_value)
-            return bool_value
-
-        def get_float(self, key, default=0.0):
-            try:
-                self._remember_field(key, float(default), kind="float")
-                scene_value, scene_prop_key = module_runtime_field_scene_value(
-                    self.scene, workflow, module, key, "float", self.state.get(key, default)
-                )
-                if scene_prop_key:
-                    return float(scene_value)
-                return float(self.state.get(key, default))
-            except Exception:
-                return float(default)
-
-        def set_float(self, key, value):
-            float_value = float(value)
-            self._remember_field(key, float_value, kind="float")
-            if self.scene is not None and self.allow_writes:
-                prop_key = self._prop_key(key, kind="float")
-                if module_scene_prop_key_usable(prop_key):
-                    try:
-                        self.scene[prop_key] = float_value
-                    except Exception:
-                        pass
-            if self.allow_writes:
-                self.state.set(key, float_value)
-            return float_value
-
-        def get_int(self, key, default=0):
-            try:
-                self._remember_field(key, int(default), kind="int")
-                scene_value, scene_prop_key = module_runtime_field_scene_value(
-                    self.scene, workflow, module, key, "int", self.state.get(key, default)
-                )
-                if scene_prop_key:
-                    return int(scene_value)
-                return int(self.state.get(key, default))
-            except Exception:
-                return int(default)
-
-        def set_int(self, key, value):
-            int_value = int(value)
-            self._remember_field(key, int_value, kind="int")
-            if self.scene is not None and self.allow_writes:
-                prop_key = self._prop_key(key, kind="int")
-                if module_scene_prop_key_usable(prop_key):
-                    try:
-                        self.scene[prop_key] = int_value
-                    except Exception:
-                        pass
-            if self.allow_writes:
-                self.state.set(key, int_value)
-            return int_value
-
-        def get_enum(self, key, default=""):
-            default_value = str(default or "")
-            self._remember_field(key, default_value, kind="enum")
-            scene_value, scene_prop_key = module_runtime_field_scene_value(
-                self.scene, workflow, module, key, "enum", self.state.get(key, default_value)
-            )
-            if scene_prop_key:
-                return str(scene_value)
-            return str(self.state.get(key, default_value))
-
-        def set_enum(self, key, value):
-            text_value = str(value or "")
-            self._remember_field(key, text_value, kind="enum")
-            if self.scene is not None and self.allow_writes:
-                prop_key = self._prop_key(key, kind="enum")
-                if module_scene_prop_key_usable(prop_key):
-                    try:
-                        self.scene[prop_key] = text_value
-                    except Exception:
-                        pass
-            if self.allow_writes:
-                self.state.set(key, text_value)
-            return text_value
-
-        def data_collection(self, collection_name):
-            return getattr(bpy.data, str(collection_name or ""), None)
-
-        def get_data_block(self, key, collection_name="objects", default=None):
-            kind = self._data_kind(collection_name)
-            default_name = getattr(default, "name", "") if default is not None else ""
-            self._remember_field(key, default_name, kind=kind)
-            scene_value, scene_prop_key = module_runtime_field_scene_value(
-                self.scene, workflow, module, key, kind, self.state.get(key, default_name)
-            )
-            if scene_prop_key:
-                name = str(scene_value or "")
-            else:
-                name = str(self.state.get(key, default_name) or "")
-            collection = self.data_collection(collection_name)
-            if collection is None or not name:
-                return default
-            try:
-                return collection.get(name) or default
-            except Exception:
-                return default
-
-        def set_data_block(self, key, data_block, collection_name="objects"):
-            kind = self._data_kind(collection_name)
-            name = getattr(data_block, "name", "") if data_block is not None else ""
-            self._remember_field(key, name, kind=kind)
-            if self.scene is not None and self.allow_writes:
-                self.scene[self._prop_key(key, kind=kind)] = name
-            if self.allow_writes:
-                self.state.set(key, name)
-            return data_block
-
-        def get_material(self, key, default=None):
-            return self.get_data_block(key, "materials", default=default)
-
-        def get_collection(self, key, default=None):
-            return self.get_data_block(key, "collections", default=default)
-
-        def get_text_block(self, key, default=None):
-            return self.get_data_block(key, "texts", default=default)
-
-        def set_status(self, text, level="INFO"):
-            value = self.compact_text(text, max_chars=96)
-            if self.allow_writes:
-                self.state.set("last_status", value)
-                self.state.set("last_status_level", str(level or "INFO"))
-            return value
-
-        def get_status(self, default=""):
-            return str(self.state.get("last_status", default) or "")
-
-        def draw_status(self, layout, default="", icon=None):
-            status = self.get_status(default)
-            if not status:
-                return
-            level = str(self.state.get("last_status_level", "INFO") or "INFO").upper()
-            icon_name = icon or {"ERROR": "ERROR", "WARNING": "ERROR", "OK": "CHECKMARK"}.get(level, "INFO")
-            self.draw_note(layout, status, icon=icon_name, limit=3)
-
-        def log(self, message, key="debug_log", max_items=8, print_to_console=True):
-            text = self.compact_text(message, max_chars=160)
-            if print_to_console:
-                print(f"[GoWorkflow:{self.module_name}] {text}")
-            if self.allow_writes:
-                return self.state.append_log(text, key=key, max_items=max_items)
-            return []
-
-        def draw_log(self, layout, key="debug_log", limit=6):
-            entries = self.state.get(key, [])
-            if not isinstance(entries, (list, tuple)) or not entries:
-                return
-            for entry in list(entries)[-limit:]:
-                layout.label(text=self.compact_text(entry), icon="CONSOLE")
-
-        def active_object(self):
-            return getattr(self.context, "object", None)
-
-        def selected_objects(self, type=None):
-            items = list(getattr(self.context, "selected_objects", []) or [])
-            if type:
-                items = [obj for obj in items if getattr(obj, "type", None) == type]
-            return items
-
-        def visible_objects(self, type=None):
-            items = list(getattr(self.context, "visible_objects", []) or [])
-            if type:
-                items = [obj for obj in items if getattr(obj, "type", None) == type]
-            return items
-
-        def selected_mesh_objects(self, require_shape_keys=False):
-            items = self.selected_objects(type="MESH")
-            if require_shape_keys:
-                items = [obj for obj in items if self.shape_key_blocks(obj)]
-            return items
-
-        def shape_key_data(self, obj=None):
-            obj = obj or self.active_object()
-            data = getattr(obj, "data", None)
-            return getattr(data, "shape_keys", None)
-
-        def shape_key_blocks(self, obj=None):
-            key_data = self.shape_key_data(obj)
-            return getattr(key_data, "key_blocks", None)
-
-        def active_shape_key_index(self, obj=None):
-            obj = obj or self.active_object()
-            try:
-                return int(getattr(obj, "active_shape_key_index", -1))
-            except Exception:
-                return -1
-
-        def active_shape_key(self, obj=None, include_basis=True):
-            obj = obj or self.active_object()
-            key_blocks = self.shape_key_blocks(obj)
-            index = self.active_shape_key_index(obj)
-            if not key_blocks or index < 0:
-                return None
-            if not include_basis and index <= 0:
-                return None
-            try:
-                if index < len(key_blocks):
-                    return key_blocks[index]
-            except Exception:
-                return None
-            return None
-
-        def valid_shape_key_objects(self, require_active_non_basis=False):
-            items = self.selected_mesh_objects(require_shape_keys=True)
-            if require_active_non_basis:
-                items = [obj for obj in items if self.active_shape_key(obj, include_basis=False) is not None]
-            return items
-
-        def context_summary(self):
-            active = self.active_object()
-            return {
-                "mode": getattr(self.context, "mode", ""),
-                "scene": getattr(getattr(self.context, "scene", None), "name", ""),
-                "active_object": getattr(active, "name", ""),
-                "active_type": getattr(active, "type", ""),
-                "selected_count": len(self.selected_objects()),
-                "visible_count": len(self.visible_objects()),
-            }
-
-        def draw_text_input(self, layout, key, label, default=""):
-            default_value = str(default)
-            self._ensure_scene_value(key, default_value, kind="text")
-            value = str(module_runtime_field_value(self.scene, workflow, module, key, "text", default_value) or "")
-            row = layout.row(align=True)
-            row.label(text=self.compact_text(label))
-            op = row.operator("bworkflow.module_runtime_field_write", text=self.compact_text(value, UI_BUTTON_MAX_CHARS, "编辑"), translate=False)
-            op.workflow_name = self.workflow_name
-            op.module_name = self.module_name
-            op.field_key = key
-            op.field_kind = "text"
-            op.text_value = value
-
-        def draw_text_input_inline(self, layout, key, label, default="", factor=0.34):
-            default_value = str(default)
-            prop_key = self._ensure_scene_value(key, default_value, kind="text")
-            value = str(module_runtime_field_value(self.scene, workflow, module, key, "text", default_value) or "")
-            _left, right = self.split_field(layout, label, factor=factor)
-            if self.scene is not None and module_scene_prop_key_usable(prop_key):
-                try:
-                    if prop_key not in self.scene:
-                        self.scene[prop_key] = value
-                    right.prop(self.scene, f'["{prop_key}"]', text="")
-                    if self.allow_writes:
-                        self.state.set(key, str(self.scene.get(prop_key, value) or ""))
-                    return
-                except Exception:
-                    pass
-            op = right.operator("bworkflow.module_runtime_field_write", text=self.compact_text(value, UI_BUTTON_MAX_CHARS, ""), translate=False)
-            op.workflow_name = self.workflow_name
-            op.module_name = self.module_name
-            op.field_key = key
-            op.field_kind = "text"
-            op.text_value = value
-
-        def draw_toggle(self, layout, key, label, default=False):
-            default_value = bool(default)
-            self._ensure_scene_value(key, default_value, kind="bool")
-            value = bool(module_runtime_field_value(self.scene, workflow, module, key, "bool", default_value))
-            row = layout.row(align=True)
-            row.label(text=self.compact_text(label))
-            op = row.operator("bworkflow.module_runtime_field_write", text="开" if value else "关", depress=value)
-            op.workflow_name = self.workflow_name
-            op.module_name = self.module_name
-            op.field_key = key
-            op.field_kind = "bool"
-            op.bool_value = not value
-
-        def draw_toggle_inline(self, layout, key, label, default=False, factor=0.34):
-            default_value = bool(default)
-            prop_key = self._ensure_scene_value(key, default_value, kind="bool")
-            _left, right = self.split_field(layout, label, factor=factor)
-            if self.scene is not None and module_scene_prop_key_usable(prop_key):
-                try:
-                    if prop_key not in self.scene:
-                        self.scene[prop_key] = default_value
-                    right.prop(self.scene, f'["{prop_key}"]', text="")
-                    if self.allow_writes:
-                        self.state.set(key, bool(self.scene.get(prop_key, default_value)))
-                    return
-                except Exception:
-                    pass
-            value = bool(module_runtime_field_value(self.scene, workflow, module, key, "bool", default_value))
-            op = right.operator("bworkflow.module_runtime_field_write", text="", icon="CHECKBOX_HLT" if value else "CHECKBOX_DEHLT", emboss=False)
-            op.workflow_name = self.workflow_name
-            op.module_name = self.module_name
-            op.field_key = key
-            op.field_kind = "bool"
-            op.bool_value = not value
-            return op
-
-        def draw_float_input(self, layout, key, label, default=0.0, **kwargs):
-            default_value = float(default)
-            prop_key = self._ensure_scene_value(key, default_value, kind="float")
-            value = float(module_runtime_field_value(self.scene, workflow, module, key, "float", default_value))
-            row = layout.row(align=True)
-            row.label(text=self.compact_text(label))
-            prop_kwargs = runtime_numeric_prop_kwargs(**kwargs)
-            if self.scene is not None and module_scene_prop_key_usable(prop_key):
-                try:
-                    if prop_key not in self.scene:
-                        self.scene[prop_key] = value
-                    row.prop(self.scene, f'["{prop_key}"]', text="", **prop_kwargs)
-                    if self.allow_writes:
-                        self.state.set(key, float(self.scene.get(prop_key, value)))
-                    return
-                except Exception:
-                    pass
-            op = row.operator("bworkflow.module_runtime_field_write", text=f"{value:.3f}", translate=False)
-            op.workflow_name = self.workflow_name
-            op.module_name = self.module_name
-            op.field_key = key
-            op.field_kind = "float"
-            op.float_value = value
-
-        def draw_float_input_inline(self, layout, key, label, default=0.0, factor=0.34, **kwargs):
-            default_value = float(default)
-            prop_key = self._ensure_scene_value(key, default_value, kind="float")
-            value = float(module_runtime_field_value(self.scene, workflow, module, key, "float", default_value))
-            _left, right = self.split_field(layout, label, factor=factor)
-            prop_kwargs = runtime_numeric_prop_kwargs(**kwargs)
-            if self.scene is not None and module_scene_prop_key_usable(prop_key):
-                try:
-                    if prop_key not in self.scene:
-                        self.scene[prop_key] = value
-                    right.prop(self.scene, f'["{prop_key}"]', text="", **prop_kwargs)
-                    if self.allow_writes:
-                        self.state.set(key, float(self.scene.get(prop_key, value)))
-                    return
-                except Exception:
-                    pass
-            op = right.operator("bworkflow.module_runtime_field_write", text=f"{value:.3f}", translate=False)
-            op.workflow_name = self.workflow_name
-            op.module_name = self.module_name
-            op.field_key = key
-            op.field_kind = "float"
-            op.float_value = value
-            return op
-
-        def draw_int_input(self, layout, key, label, default=0, **kwargs):
-            default_value = int(default)
-            self._ensure_scene_value(key, default_value, kind="int")
-            value = int(module_runtime_field_value(self.scene, workflow, module, key, "int", default_value))
-            prop_key = self._prop_key(key, kind="int")
-            row = layout.row(align=True)
-            row.label(text=self.compact_text(label))
-            prop_kwargs = runtime_numeric_prop_kwargs(**kwargs)
-            if self.scene is not None and module_scene_prop_key_usable(prop_key):
-                try:
-                    row.prop(self.scene, f'["{prop_key}"]', text="", **prop_kwargs)
-                    if self.allow_writes:
-                        self.state.set(key, int(self.scene.get(prop_key, value)))
-                    return
-                except Exception:
-                    pass
-            op = row.operator("bworkflow.module_runtime_field_write", text=str(value), translate=False)
-            op.workflow_name = self.workflow_name
-            op.module_name = self.module_name
-            op.field_key = key
-            op.field_kind = "int"
-            op.int_value = value
-
-        def draw_int_input_inline(self, layout, key, label, default=0, factor=0.34, **kwargs):
-            default_value = int(default)
-            prop_key = self._ensure_scene_value(key, default_value, kind="int")
-            value = int(module_runtime_field_value(self.scene, workflow, module, key, "int", default_value))
-            _left, right = self.split_field(layout, label, factor=factor)
-            prop_kwargs = runtime_numeric_prop_kwargs(**kwargs)
-            if self.scene is not None and module_scene_prop_key_usable(prop_key):
-                try:
-                    if prop_key not in self.scene:
-                        self.scene[prop_key] = value
-                    right.prop(self.scene, f'["{prop_key}"]', text="", **prop_kwargs)
-                    if self.allow_writes:
-                        self.state.set(key, int(self.scene.get(prop_key, value)))
-                    return
-                except Exception:
-                    pass
-            op = right.operator("bworkflow.module_runtime_field_write", text=str(value), translate=False)
-            op.workflow_name = self.workflow_name
-            op.module_name = self.module_name
-            op.field_key = key
-            op.field_kind = "int"
-            op.int_value = value
-            return op
-
-        def draw_enum(self, layout, key, label, items, default=None, max_items=8, disabled_items=None, display_value=None):
-            normalized = []
-            for item in items or []:
-                if isinstance(item, str):
-                    normalized.append((item, item))
-                elif isinstance(item, (list, tuple)) and item:
-                    identifier = str(item[0])
-                    item_label = str(item[1]) if len(item) > 1 else identifier
-                    normalized.append((identifier, item_label))
-            if not normalized:
-                return
-
-            default_value = str(default if default is not None else normalized[0][0])
-            identifiers = {identifier for identifier, _label in normalized}
-            disabled_identifiers = {str(identifier) for identifier in (disabled_items or [])}
-            self._ensure_scene_value(key, default_value, kind="enum")
-            value = str(module_runtime_field_value(self.scene, workflow, module, key, "enum", default_value) or default_value)
-            if value not in identifiers:
-                value = default_value
-            active_value = str(display_value or value)
-            if active_value not in identifiers:
-                active_value = value
-
-            layout.label(text=self.compact_text(label))
-            row = layout.row(align=True)
-            for identifier, item_label in normalized[:max_items]:
-                item_row = row.row(align=True)
-                item_row.enabled = identifier not in disabled_identifiers
-                op = item_row.operator(
-                    "bworkflow.module_runtime_field_write",
-                    text=self.compact_text(item_label, max_chars=16),
-                    depress=identifier == active_value,
-                    translate=False,
-                )
-                op.workflow_name = self.workflow_name
-                op.module_name = self.module_name
-                op.field_key = key
-                op.field_kind = "enum"
-                op.text_value = identifier
-            if len(normalized) > max_items:
-                layout.label(text=f"还有 {len(normalized) - max_items} 项，建议用文本输入。", icon="INFO")
-
-        def draw_object_picker(self, layout, key, label="物体", default=None):
-            default_name = getattr(default, "name", "") if default is not None else ""
-            self._ensure_scene_value(key, default_name, kind="object")
-            value = str(module_runtime_field_value(self.scene, workflow, module, key, "object", default_name) or "")
-            row = layout.row(align=True)
-            row.label(text=self.compact_text(label))
-            op = row.operator("bworkflow.module_runtime_field_write", text=self.compact_text(value, UI_BUTTON_MAX_CHARS, "选择"), translate=False)
-            op.workflow_name = self.workflow_name
-            op.module_name = self.module_name
-            op.field_key = key
-            op.field_kind = "object"
-            op.object_name = value
-
-        def draw_object_picker_inline(self, layout, key, label="物体", default=None, factor=0.34, show_active_button=False):
-            default_name = getattr(default, "name", "") if default is not None else ""
-            prop_key = self._ensure_scene_value(key, default_name, kind="object")
-            value = str(module_runtime_field_value(self.scene, workflow, module, key, "object", default_name) or "")
-            _left, right = self.split_field(layout, label, factor=factor)
-            if self.scene is not None and module_scene_prop_key_usable(prop_key):
-                try:
-                    if prop_key not in self.scene:
-                        self.scene[prop_key] = value
-                    field_row = right.row(align=True)
-                    field_row.prop(self.scene, f'["{prop_key}"]', text="")
-                    if show_active_button:
-                        self.draw_active_object_capture(field_row, key, "", icon="EYEDROPPER")
-                    if self.allow_writes:
-                        self.state.set(key, str(self.scene.get(prop_key, value) or ""))
-                    return
-                except Exception:
-                    pass
-            field_row = right.row(align=True)
-            op = field_row.operator("bworkflow.module_runtime_field_write", text=self.compact_text(value, UI_BUTTON_MAX_CHARS, ""), translate=False)
-            op.workflow_name = self.workflow_name
-            op.module_name = self.module_name
-            op.field_key = key
-            op.field_kind = "object"
-            op.object_name = value
-            if show_active_button:
-                self.draw_active_object_capture(field_row, key, "", icon="EYEDROPPER")
-            return op
-
-        def draw_file_path_input(self, layout, key, label, default="", factor=0.34, filter_glob="*.*", status_prefix="已选择文件"):
-            default_value = str(default)
-            prop_key = self._ensure_scene_value(key, default_value, kind="text")
-            value = str(module_runtime_field_value(self.scene, workflow, module, key, "text", default_value) or "")
-            _left, right = self.split_field(layout, label, factor=factor)
-            if self.scene is not None and module_scene_prop_key_usable(prop_key):
-                try:
-                    if prop_key not in self.scene:
-                        self.scene[prop_key] = value
-                    field_row = right.row(align=True)
-                    field_row.prop(self.scene, f'["{prop_key}"]', text="")
-                    op = field_row.operator("bworkflow.module_pick_file_path", text="", icon="FILE_FOLDER")
-                    op.workflow_name = self.workflow_name
-                    op.module_name = self.module_name
-                    op.target_text_key = key
-                    op.filter_glob = str(filter_glob or "*.*")
-                    op.status_prefix = str(status_prefix or "已选择文件")
-                    if self.allow_writes:
-                        self.state.set(key, str(self.scene.get(prop_key, value) or ""))
-                    return op
-                except Exception:
-                    pass
-            return self.draw_text_input_inline(layout, key, label, default=default, factor=factor)
-
-        def draw_active_object_capture(self, layout, key, label="吸取当前选中", icon="EYEDROPPER"):
-            active_name = getattr(getattr(self.context, "object", None), "name", "")
-            op = layout.operator(
-                "bworkflow.module_runtime_field_write",
-                text=self.compact_text(label, UI_BUTTON_MAX_CHARS),
-                icon=icon,
-            )
-            op.workflow_name = self.workflow_name
-            op.module_name = self.module_name
-            op.field_key = key
-            op.field_kind = "object"
-            op.object_name = active_name
-            return op
-
-        def draw_data_block_picker(self, layout, key, label, collection_name="objects", default=None):
-            kind = self._data_kind(collection_name)
-            default_name = getattr(default, "name", "") if default is not None else ""
-            self._ensure_scene_value(key, default_name, kind=kind)
-            value = str(module_runtime_field_value(self.scene, workflow, module, key, kind, default_name) or "")
-            row = layout.row(align=True)
-            row.label(text=self.compact_text(label))
-            op = row.operator(
-                "bworkflow.module_runtime_field_write",
-                text=self.compact_text(value, UI_BUTTON_MAX_CHARS, "选择"),
-                translate=False,
-            )
-            op.workflow_name = self.workflow_name
-            op.module_name = self.module_name
-            op.field_key = key
-            op.field_kind = kind
-            op.text_value = value
-            op.data_collection = str(collection_name or "")
-
-        def draw_material_picker(self, layout, key, label="材质", default=None):
-            return self.draw_data_block_picker(layout, key, label, "materials", default=default)
-
-        def draw_collection_picker(self, layout, key, label="集合", default=None):
-            return self.draw_data_block_picker(layout, key, label, "collections", default=default)
-
-        def draw_text_block_picker(self, layout, key, label="文本", default=None):
-            return self.draw_data_block_picker(layout, key, label, "texts", default=default)
-
-    proxy = ModuleStateProxy(module_store)
-    panel_api = ModulePanelAPI(context, scene, proxy)
-    return proxy, panel_api
-
 
 def build_module_namespace(context, scene, workflow, module, name, allow_writes=True, field_specs=None):
     module_state, panel_api = module_runtime_context(
@@ -10176,13 +8657,26 @@ def source_cache_signature(source, name):
     return (str(name or ""), hashlib.sha1(normalized.encode("utf-8", errors="replace")).hexdigest())
 
 
+def text_block_source_payload(text_name, text_block):
+    source = text_block.as_string().lstrip("\ufeff")
+    content_hash = hashlib.sha1(source.encode("utf-8", errors="replace")).hexdigest()
+    token = ("text", str(text_name or ""), len(source), content_hash)
+    MODULE_SOURCE_TEXT_CACHE[str(text_name or "")] = {
+        "source": source,
+        "content_hash": content_hash,
+        "token": token,
+    }
+    return source, content_hash, token
+
+
 def module_source_fast_token(module):
     text_name = str(getattr(module, "text_block_name", "") or "").strip()
     if text_name:
         text_block = bpy.data.texts.get(text_name)
         if text_block is not None:
             try:
-                return ("text", text_name, len(text_block.lines))
+                _source, _content_hash, token = text_block_source_payload(text_name, text_block)
+                return token
             except Exception:
                 return ("text", text_name, -1)
     filepath = module_script_abspath(module)
@@ -10199,31 +8693,23 @@ def module_source_fast_token(module):
 
 
 def get_cached_module_source(module, name):
-    """获取模块源代码及其签名，用行数做轻量级判断避免每次 draw 都读取大字符串。
+    """获取模块源代码及其签名，用源码哈希判断 Text Block 是否已经变更。
 
-    每次 draw（滚轮滚动等）都会调用 load_module_namespace，如果不缓存，
-    每帧都会执行 text_block.as_string() + SHA1 计算，产生大量临时字符串，
-    导致 Blender 内存持续上升且不释放。
+    每次 draw（滚轮滚动等）都会调用 load_module_namespace。哈希 token
+    可以避免 Text Block 行数不变但内容已变时继续复用旧命名空间。
     """
     text_name = str(getattr(module, "text_block_name", "") or "").strip()
     if text_name:
         text_block = bpy.data.texts.get(text_name)
         if text_block is not None:
             try:
-                current_line_count = len(text_block.lines)
+                cached = MODULE_SOURCE_TEXT_CACHE.get(text_name)
+                source, content_hash, _token = text_block_source_payload(text_name, text_block)
+                if cached is not None and cached.get("content_hash") == content_hash:
+                    return cached.get("source", source), (str(name or ""), content_hash)
+                return source, (str(name or ""), content_hash)
             except Exception:
-                current_line_count = -1
-            cached = MODULE_SOURCE_TEXT_CACHE.get(text_name)
-            if cached is not None and cached.get("line_count") == current_line_count:
-                return cached["source"], cached["signature"]
-            source = text_block.as_string().lstrip("\ufeff")
-            signature = source_cache_signature(source, name)
-            MODULE_SOURCE_TEXT_CACHE[text_name] = {
-                "line_count": current_line_count,
-                "source": source,
-                "signature": signature,
-            }
-            return source, signature
+                pass
     source = str(getattr(module, "script_source", "") or "").lstrip("\ufeff")
     if not source:
         filepath = module_script_abspath(module)
@@ -10267,6 +8753,7 @@ def clear_cached_module_namespaces(scene=None, workflow=None, module=None):
         MODULE_RUNTIME_NAMESPACE_CACHE.clear()
         MODULE_SOURCE_TEXT_CACHE.clear()
         MODULE_RUNTIME_FIELD_INIT_CACHE.clear()
+        MODULE_RUNTIME_VOLATILE_STORE.clear()
         return 0
     target_prefix = module_runtime_cleanup_cache_key(scene, workflow, module)
     removed = 0
@@ -10279,6 +8766,11 @@ def clear_cached_module_namespaces(scene=None, workflow=None, module=None):
         if tuple(key[:3]) != tuple(target_prefix):
             continue
         MODULE_RUNTIME_FIELD_INIT_CACHE.pop(key, None)
+        removed += 1
+    for key in list(MODULE_RUNTIME_VOLATILE_STORE.keys()):
+        if tuple(key[:3]) != tuple(target_prefix):
+            continue
+        MODULE_RUNTIME_VOLATILE_STORE.pop(key, None)
         removed += 1
     return removed
 
@@ -10336,6 +8828,10 @@ def reuse_cached_module_namespace(cached, context, scene, workflow, module, name
         panel_api.module = module
         panel_api.allow_writes = allow_writes
         try:
+            panel_api.space_type = current_space_type(context=context)
+        except Exception:
+            pass
+        try:
             panel_api.field_specs.clear()
         except Exception:
             panel_api.field_specs = []
@@ -10389,52 +8885,55 @@ def load_module_namespace(context, scene, workflow, module, name, allow_writes=F
     filepath = module_script_abspath(module)
     if not filepath or not os.path.isfile(filepath):
         raise FileNotFoundError("自定义模块脚本文件不存在，且当前模板里没有可执行代码。")
-    with open(filepath, "r", encoding="utf-8") as handle:
-        source = handle.read()
-        source_signature = source_cache_signature(source, filepath)
-        if not allow_writes and not persist_state:
-            cached = cached_module_namespace(scene, workflow, module, filepath, source_signature)
-            if cached is not None:
-                panel_api = cached.get("panel_api")
-                module_state = cached.get("module_state")
-                if panel_api is not None:
-                    panel_api.context = context
-                    panel_api.scene = scene
-                    panel_api.workflow = workflow
-                    panel_api.module = module
-                    panel_api.allow_writes = allow_writes
-                    try:
-                        panel_api.field_specs.clear()
-                    except Exception:
-                        panel_api.field_specs = []
-                else:
-                    module_state, panel_api = module_runtime_context(
-                        context,
-                        scene,
-                        workflow,
-                        module,
-                        allow_writes=allow_writes,
-                    )
-                cached["__name__"] = filepath
-                cached["__file__"] = filepath
-                cached["bpy"] = bpy
-                cached["context"] = context
-                cached["scene"] = scene
-                cached["workflow"] = workflow
-                cached["module"] = module
-                cached["module_state"] = module_state
-                cached["panel_api"] = panel_api
-                return cached
-        return execute_module_source(
-            source,
-            context,
-            scene,
-            workflow,
-            module,
-            filepath,
-            allow_writes=allow_writes,
-            persist_state=persist_state,
-        )
+    source = read_cached_text_file(filepath)
+    source_signature = source_cache_signature(source, filepath)
+    if not allow_writes and not persist_state:
+        cached = cached_module_namespace(scene, workflow, module, filepath, source_signature)
+        if cached is not None:
+            panel_api = cached.get("panel_api")
+            module_state = cached.get("module_state")
+            if panel_api is not None:
+                panel_api.context = context
+                panel_api.scene = scene
+                panel_api.workflow = workflow
+                panel_api.module = module
+                panel_api.allow_writes = allow_writes
+                try:
+                    panel_api.space_type = current_space_type(context=context)
+                except Exception:
+                    pass
+                try:
+                    panel_api.field_specs.clear()
+                except Exception:
+                    panel_api.field_specs = []
+            else:
+                module_state, panel_api = module_runtime_context(
+                    context,
+                    scene,
+                    workflow,
+                    module,
+                    allow_writes=allow_writes,
+                )
+            cached["__name__"] = filepath
+            cached["__file__"] = filepath
+            cached["bpy"] = bpy
+            cached["context"] = context
+            cached["scene"] = scene
+            cached["workflow"] = workflow
+            cached["module"] = module
+            cached["module_state"] = module_state
+            cached["panel_api"] = panel_api
+            return cached
+    return execute_module_source(
+        source,
+        context,
+        scene,
+        workflow,
+        module,
+        filepath,
+        allow_writes=allow_writes,
+        persist_state=persist_state,
+    )
 
 
 def drain_validation_timer_callbacks():
@@ -10573,8 +9072,7 @@ def load_module_script_text_block_from_file(workflow, module, filepath, source):
 
     desired = source
     try:
-        with open(filepath, "r", encoding="utf-8") as handle:
-            disk_source = handle.read()
+        disk_source = read_cached_text_file(filepath)
         if disk_source != desired:
             with open(filepath, "w", encoding="utf-8") as handle:
                 handle.write(desired)
@@ -10649,8 +9147,7 @@ def sync_module_source_from_file(module):
     if not filepath or not os.path.isfile(filepath):
         return False
     try:
-        with open(filepath, "r", encoding="utf-8") as handle:
-            module.script_source = handle.read()
+        module.script_source = read_cached_text_file(filepath)
         return True
     except Exception:
         return False
@@ -10738,18 +9235,9 @@ def initialize_module_runtime_fields(scene, workflow, module, context=None, sour
     cached = MODULE_RUNTIME_FIELD_INIT_CACHE.get(cache_key)
     if isinstance(cached, dict) and cached.get("source_token") == source_token:
         cached_specs = cached.get("field_specs")
-        field_specs = list(cached_specs if isinstance(cached_specs, (list, tuple)) else load_module_runtime_specs(scene, workflow, module))
-        changed = False
-        for spec in field_specs:
-            prop_key = spec.get("prop_key")
-            if not prop_key or not module_scene_prop_key_usable(prop_key) or prop_key in scene:
-                continue
-            try:
-                scene[prop_key] = normalize_module_field_default(spec.get("kind", "text"), spec.get("default"))
-                changed = True
-            except Exception:
-                continue
-        return changed
+        if not cached_specs:
+            cached_specs = load_module_runtime_specs(scene, workflow, module)
+        return sync_module_runtime_field_specs(scene, workflow, module, cached_specs)
 
     source, source_signature = get_cached_module_source(module, "__go_workflow_init__")
     source = source.strip()
@@ -10758,19 +9246,7 @@ def initialize_module_runtime_fields(scene, workflow, module, context=None, sour
 
     if isinstance(cached, dict) and cached.get("source_signature") == source_signature:
         cached["source_token"] = source_token
-        cached_specs = cached.get("field_specs")
-        field_specs = list(cached_specs if isinstance(cached_specs, (list, tuple)) else load_module_runtime_specs(scene, workflow, module))
-        changed = False
-        for spec in field_specs:
-            prop_key = spec.get("prop_key")
-            if not prop_key or not module_scene_prop_key_usable(prop_key) or prop_key in scene:
-                continue
-            try:
-                scene[prop_key] = normalize_module_field_default(spec.get("kind", "text"), spec.get("default"))
-                changed = True
-            except Exception:
-                continue
-        return changed
+        return False
 
     field_specs = []
     try:
@@ -10789,23 +9265,12 @@ def initialize_module_runtime_fields(scene, workflow, module, context=None, sour
         return False
     MODULE_RUNTIME_NAMESPACE_CACHE.pop(module_runtime_namespace_cache_key(scene, workflow, module, "__go_workflow_init__"), None)
 
-    migrate_module_runtime_scene_values(scene, workflow, module, field_specs)
-    save_module_runtime_specs(scene, workflow, module, field_specs)
+    changed = sync_module_runtime_field_specs(scene, workflow, module, field_specs)
     MODULE_RUNTIME_FIELD_INIT_CACHE[cache_key] = {
         "source_signature": source_signature,
         "source_token": source_token,
         "field_specs": list(field_specs),
     }
-    changed = False
-    for spec in field_specs:
-        prop_key = spec.get("prop_key")
-        if not prop_key or not module_scene_prop_key_usable(prop_key) or prop_key in scene:
-            continue
-        try:
-            scene[prop_key] = normalize_module_field_default(spec.get("kind", "text"), spec.get("default"))
-            changed = True
-        except Exception:
-            continue
     return changed
 
 
@@ -10858,9 +9323,11 @@ class BWFLOW_OT_module_runtime_field_write(Operator):
     bl_idname = "bworkflow.module_runtime_field_write"
     bl_label = "写入自定义字段"
     bl_description = "为自定义脚本模块写入一个运行时字段值"
+    bl_options = {"REGISTER", "UNDO"}
 
     workflow_name: StringProperty(default="")
     module_name: StringProperty(default="")
+    space_type: StringProperty(default="")
     field_key: StringProperty(default="")
     field_kind: StringProperty(default="text")
     text_value: StringProperty(default="")
@@ -10903,24 +9370,12 @@ class BWFLOW_OT_module_runtime_field_write(Operator):
         if scene is None:
             return {"CANCELLED"}
 
-        target_workflow = None
-        target_module = None
-        for space_type in iter_supported_space_types():
-            state = get_state(scene=scene, space_type=space_type)
-            if state is None:
-                continue
-            for workflow in state.workflows:
-                if workflow.name != self.workflow_name:
-                    continue
-                for module in workflow.modules:
-                    if module.name == self.module_name:
-                        target_workflow = workflow
-                        target_module = module
-                        break
-                if target_module is not None:
-                    break
-            if target_module is not None:
-                break
+        target_workflow, target_module = resolve_workflow_module(
+            scene,
+            self.workflow_name,
+            self.module_name,
+            space_type=self.space_type or current_space_type(context=context),
+        )
 
         if target_workflow is None or target_module is None:
             return {"CANCELLED"}
@@ -11000,9 +9455,11 @@ class BWFLOW_OT_module_runtime_action(Operator):
     bl_idname = "bworkflow.module_runtime_action"
     bl_label = "执行自定义面板动作"
     bl_description = "执行自定义脚本面板里的按钮动作"
+    bl_options = {"REGISTER", "UNDO"}
 
     workflow_name: StringProperty(default="")
     module_name: StringProperty(default="")
+    space_type: StringProperty(default="")
     action_name: StringProperty(default="")
     tooltip_text: StringProperty(default="")
 
@@ -11016,24 +9473,12 @@ class BWFLOW_OT_module_runtime_action(Operator):
         if scene is None:
             return {"CANCELLED"}
 
-        target_workflow = None
-        target_module = None
-        for space_type in iter_supported_space_types():
-            state = get_state(scene=scene, space_type=space_type)
-            if state is None:
-                continue
-            for workflow in state.workflows:
-                if workflow.name != self.workflow_name:
-                    continue
-                for module in workflow.modules:
-                    if module.name == self.module_name:
-                        target_workflow = workflow
-                        target_module = module
-                        break
-                if target_module is not None:
-                    break
-            if target_module is not None:
-                break
+        target_workflow, target_module = resolve_workflow_module(
+            scene,
+            self.workflow_name,
+            self.module_name,
+            space_type=self.space_type or current_space_type(context=context),
+        )
 
         if target_workflow is None or target_module is None:
             self.report({"ERROR"}, "找不到目标工作流或模块")
@@ -11135,6 +9580,8 @@ def draw_module_runtime_panel(card, context, workflow, module):
         result = load_module_namespace(context, context.scene, workflow, module, "__go_workflow_panel__", source_token=source_token)
         draw_fn = result.get("draw_panel")
         if callable(draw_fn):
+            panel_api = result.get("panel_api")
+            module_state = result.get("module_state")
             if callable_accepts_panel_api(draw_fn):
                 draw_fn(
                     card,
@@ -11142,11 +9589,18 @@ def draw_module_runtime_panel(card, context, workflow, module):
                     context.scene,
                     workflow,
                     module,
-                    result.get("panel_api"),
-                    result.get("module_state"),
+                    panel_api,
+                    module_state,
                 )
             else:
                 draw_fn(card, context, context.scene, workflow, module)
+            if panel_api is not None:
+                sync_module_runtime_field_specs(
+                    context.scene,
+                    workflow,
+                    module,
+                    getattr(panel_api, "field_specs", ()),
+                )
             return
         card.label(text="脚本里没有 draw_panel(...)，当前模块不显示自定义面板。", icon="INFO")
     except BaseException as exc:
@@ -11595,6 +10049,11 @@ class BWFLOW_PG_WorkflowModule(PropertyGroup):
         default=True,
         description="控制 Go工作流 主面板中当前模块的自定义 UI 是否展开",
         update=on_module_runtime_panel_expanded_changed,
+    )
+    runtime_description_expanded: BoolProperty(
+        name="展开模块说明",
+        default=False,
+        description="控制 Go工作流 主面板中当前模块说明是否展开",
     )
     panel_title: StringProperty(
         name="面板标题",
@@ -12231,6 +10690,7 @@ class BWFLOW_OT_workflow_duplicate(Operator):
             module.enabled = source_module.enabled
             module.use_custom_panel = source_module.use_custom_panel
             module.runtime_panel_expanded = getattr(source_module, "runtime_panel_expanded", True)
+            module.runtime_description_expanded = getattr(source_module, "runtime_description_expanded", False)
             module.panel_title = source_module.panel_title
             module.panel_description = source_module.panel_description
             module.description = source_module.description
@@ -12363,6 +10823,7 @@ class BWFLOW_OT_module_add(Operator):
         module.enabled = True
         module.use_custom_panel = False
         module.runtime_panel_expanded = True
+        module.runtime_description_expanded = False
         module.panel_title = ""
         module.panel_description = ""
         module.script_path = unique_default_module_script_path(workflow, module)
@@ -12573,11 +11034,13 @@ class BWFLOW_OT_module_import_text_file(Operator, ImportHelper):
     bl_idname = "bworkflow.module_import_text_file"
     bl_label = "导入模块文本文件"
     bl_description = "通过 Blender 原生文件浏览器为当前模块导入 csv/txt 文本内容"
+    bl_options = {"REGISTER", "UNDO"}
 
     filename_ext = ".csv"
     filter_glob: StringProperty(default="*.csv;*.txt", options={"HIDDEN"})
     workflow_name: StringProperty(default="")
     module_name: StringProperty(default="")
+    space_type: StringProperty(default="")
     target_text_key: StringProperty(default="")
     target_set: StringProperty(default="")
     mix_profile: StringProperty(default="")
@@ -12590,7 +11053,12 @@ class BWFLOW_OT_module_import_text_file(Operator, ImportHelper):
         return workflow is not None and bool(workflow.modules)
 
     def execute(self, context):
-        workflow, module = resolve_workflow_module(context.scene, self.workflow_name, self.module_name)
+        workflow, module = resolve_workflow_module(
+            context.scene,
+            self.workflow_name,
+            self.module_name,
+            space_type=self.space_type or current_space_type(context=context),
+        )
         if workflow is None or module is None:
             workflow = get_active_workflow(get_state(context=context))
             if workflow is None or not workflow.modules:
@@ -12657,11 +11125,13 @@ class BWFLOW_OT_module_export_text_file(Operator, ExportHelper):
     bl_idname = "bworkflow.module_export_text_file"
     bl_label = "导出模块文本文件"
     bl_description = "通过 Blender 原生文件浏览器为当前模块选择导出位置，并执行自定义导出动作"
+    bl_options = {"REGISTER", "UNDO"}
 
     filename_ext: StringProperty(default=".txt")
     filter_glob: StringProperty(default="*.csv;*.txt", options={"HIDDEN"})
     workflow_name: StringProperty(default="")
     module_name: StringProperty(default="")
+    space_type: StringProperty(default="")
     target_text_key: StringProperty(default="recipe_file_path")
     status_prefix: StringProperty(default="已选择导出位置")
     module_action: StringProperty(default="")
@@ -12684,7 +11154,12 @@ class BWFLOW_OT_module_export_text_file(Operator, ExportHelper):
         return {"RUNNING_MODAL"}
 
     def execute(self, context):
-        workflow, module = resolve_workflow_module(context.scene, self.workflow_name, self.module_name)
+        workflow, module = resolve_workflow_module(
+            context.scene,
+            self.workflow_name,
+            self.module_name,
+            space_type=self.space_type or current_space_type(context=context),
+        )
         if workflow is None or module is None:
             workflow = get_active_workflow(get_state(context=context))
             if workflow is None or not workflow.modules:
@@ -12750,10 +11225,12 @@ class BWFLOW_OT_module_pick_file_path(Operator, ImportHelper):
     bl_idname = "bworkflow.module_pick_file_path"
     bl_label = "选择文件路径"
     bl_description = "通过 Blender 原生文件浏览器为模块字段写入文件路径"
+    bl_options = {"REGISTER", "UNDO"}
 
     filter_glob: StringProperty(default="*.*", options={"HIDDEN"})
     workflow_name: StringProperty(default="")
     module_name: StringProperty(default="")
+    space_type: StringProperty(default="")
     target_text_key: StringProperty(default="")
     status_prefix: StringProperty(default="已选择文件")
 
@@ -12763,7 +11240,12 @@ class BWFLOW_OT_module_pick_file_path(Operator, ImportHelper):
         return workflow is not None and bool(workflow.modules)
 
     def execute(self, context):
-        workflow, module = resolve_workflow_module(context.scene, self.workflow_name, self.module_name)
+        workflow, module = resolve_workflow_module(
+            context.scene,
+            self.workflow_name,
+            self.module_name,
+            space_type=self.space_type or current_space_type(context=context),
+        )
         if workflow is None or module is None:
             self.report({"ERROR"}, "找不到发起选择的工作流模块")
             return {"CANCELLED"}
@@ -12911,7 +11393,7 @@ class BWFLOW_OT_module_load_script_file(Operator):
         module = workflow.modules[clamp_index(workflow.active_module_index, len(workflow.modules))]
         filepath = module_script_abspath(module)
         try:
-            source = read_cached_text_file(filepath, encodings=("utf-8", "utf-8-sig"))
+            source = read_cached_text_file(filepath)
         except Exception as exc:
             self.report({"ERROR"}, f"读取脚本失败: {exc}")
             return {"CANCELLED"}
@@ -12947,6 +11429,7 @@ class BWFLOW_OT_module_run(Operator):
     bl_idname = "bworkflow.module_run"
     bl_label = "运行模块"
     bl_description = "运行当前工作流模块绑定的 Python 脚本"
+    bl_options = {"REGISTER", "UNDO"}
 
     module_index: IntProperty(default=-1)
 
@@ -12982,7 +11465,7 @@ class BWFLOW_OT_module_run(Operator):
                 self.report({"ERROR"}, "当前只支持运行 .py 脚本")
                 return {"CANCELLED"}
             try:
-                source = read_cached_text_file(filepath, encodings=("utf-8", "utf-8-sig"))
+                source = read_cached_text_file(filepath)
             except Exception as exc:
                 self.report({"ERROR"}, f"脚本读取失败: {exc}")
                 return {"CANCELLED"}
@@ -13394,13 +11877,21 @@ class BWFLOW_OT_panel_add_all_to_workflow(Operator):
     def execute(self, context):
         state = get_state(context=context)
         workflow = get_active_workflow(state)
+        space_type = getattr(state, "space_type", "VIEW_3D")
+        drawer_ids = []
+        for record in state.panel_registry:
+            if not record.discovered or record.panel_id == "BWFLOW_PT_workflow":
+                continue
+            panel_ids = panel_drawer_workflow_ids(state, record.panel_id)
+            if panel_ids:
+                drawer_ids.append(panel_ids[0])
+        drawer_ids = sorted(
+            unique_panel_ids(drawer_ids),
+            key=lambda panel_id: (panel_drawer_default_order_index(state, panel_id, space_type=space_type), panel_id),
+        )
         added = append_panel_ids_to_workflow(
             workflow,
-            unique_panel_ids(
-                panel_drawer_workflow_ids(state, record.panel_id)[0]
-                for record in state.panel_registry
-                if record.discovered and record.panel_id != "BWFLOW_PT_workflow" and panel_drawer_workflow_ids(state, record.panel_id)
-            ),
+            drawer_ids,
         )
         mark_panel_visibility_pending(state, scene=context.scene, context=context)
         self.report({"INFO"}, f"已按默认 N 面板顺序加入 {added} 个面板组")
@@ -14088,32 +12579,6 @@ class BWFLOW_OT_panel_sort_children_by_default_order(Operator):
 
 class BWFLOW_OT_panel_apply_workflow_order(Operator):
     bl_idname = "bworkflow.panel_apply_workflow_order"
-    bl_label = "应用面板顺序"
-    bl_description = "把当前勾选列表里的顺序应用到 Blender N 面板；调整顺序时不会自动应用"
-
-    @classmethod
-    def poll(cls, context):
-        state = get_state(context=context)
-        workflow = get_active_workflow(state)
-        return state is not None and workflow is not None and not workflow.is_default and bool(workflow.panels)
-
-    def execute(self, context):
-        state = get_state(context=context)
-        workflow = get_active_workflow(state)
-        if state is None or workflow is None or workflow.is_default:
-            return {"CANCELLED"}
-
-        space_type = getattr(state, "space_type", "VIEW_3D")
-        PANEL_VISIBILITY_DATA_CACHE_BY_SPACE.pop(space_type, None)
-        ordered_ids = workflow_ordered_panel_ids(state, workflow)
-        apply_panel_order_overrides(ordered_ids, space_type=space_type)
-        state.panel_order_pending_apply = False
-        save_global_workflow_state(context.scene)
-        tag_redraw_all(space_type=space_type)
-        self.report({"INFO"}, "已应用当前 N 面板顺序")
-        return {"FINISHED"}
-
-
     bl_label = "应用到 N 面板"
     bl_description = "把当前勾选列表和排序一次性应用到 Blender N 面板；连续调整时不会自动应用"
 
@@ -14330,7 +12795,8 @@ class BWFLOW_OT_preset_export(Operator):
             workflow = get_active_workflow(state)
             workflows = [workflow] if workflow is not None else []
         refresh_script_library_sources_for_workflows(state, workflows)
-        payload = build_selected_workflows_preset_payload(context.scene, context=context)
+        space_type = getattr(state, "space_type", "") or current_space_type(context=context)
+        payload = build_selected_workflows_preset_payload(context.scene, context=context, space_type=space_type)
         if payload is None:
             print("[Go Workflow] No workflow selected for export.")
             return {"CANCELLED"}
@@ -14446,7 +12912,7 @@ class BWFLOW_OT_preset_export_select_all(Operator):
 class BWFLOW_OT_preset_select_all(Operator):
     bl_idname = "bworkflow.preset_select_all"
     bl_label = "选择预设工作流"
-    bl_description = "全选或清空已载入预设中的工作流"
+    bl_description = "兼容旧预设列表按钮；当前导入流程使用单选预览"
 
     select: BoolProperty(default=True)
 
@@ -14458,16 +12924,15 @@ class BWFLOW_OT_preset_select_all(Operator):
         if active_index >= 0:
             set_preset_import_selected_index(state, active_index if self.select else 0)
         selected_count, total_count = preset_workflow_selection_counts(state)
+        state.preset_status = f"当前选中 {selected_count}/{total_count} 个工作流"
         print(f"[Go Workflow] Selected {selected_count}/{total_count}.")
-        return {"FINISHED"}
-        state.preset_status = f"已勾选 {selected_count}/{total_count} 个工作流"
         return {"FINISHED"}
 
 
 class BWFLOW_OT_preset_select_current_space(Operator):
     bl_idname = "bworkflow.preset_select_current_space"
     bl_label = "只选当前编辑器"
-    bl_description = "只勾选预设中属于当前编辑器空间的非默认工作流"
+    bl_description = "在预设预览中切到当前编辑器空间的第一个非默认工作流"
 
     def execute(self, context):
         state = get_state(context=context)
@@ -14481,9 +12946,8 @@ class BWFLOW_OT_preset_select_current_space(Operator):
                 set_preset_import_selected_index(state, index)
                 break
         selected_count, total_count = preset_workflow_selection_counts(state)
+        state.preset_status = f"当前选中 {selected_count}/{total_count} 个工作流"
         print(f"[Go Workflow] Selected {selected_count}/{total_count}.")
-        return {"FINISHED"}
-        state.preset_status = f"已勾选当前编辑器 {selected_count}/{total_count} 个工作流"
         return {"FINISHED"}
 
 
@@ -14497,13 +12961,6 @@ class BWFLOW_OT_preset_clear_loaded(Operator):
         if state is None:
             return {"CANCELLED"}
         clear_preset_import_cache(state)
-        try:
-            state.preset_workflow_index = 0
-        except Exception:
-            pass
-        return {"FINISHED"}
-        state.preset_filepath = ""
-        state.preset_status = ""
         return {"FINISHED"}
 
 
@@ -14534,7 +12991,7 @@ class BWFLOW_OT_preset_select_cached(Operator):
 class BWFLOW_OT_preset_import_selected(Operator):
     bl_idname = "bworkflow.preset_import_selected"
     bl_label = "导入选中工作流"
-    bl_description = "将已勾选的预设工作流导入到当前编辑器空间"
+    bl_description = "将当前选中的预设工作流导入到当前编辑器空间"
 
     @classmethod
     def poll(cls, context):
@@ -14573,51 +13030,6 @@ class BWFLOW_OT_preset_import_selected(Operator):
             print(f"[Go Workflow] Imported {len(imported)} workflow(s){low_version_suffix}.")
         else:
             print(f"[Go Workflow] Imported {len(imported)} workflow(s).")
-        return {"FINISHED"}
-        selected_key = ""
-        for item in state.preset_workflows:
-            if item.selected and item.source_key:
-                selected_key = item.source_key
-                break
-        if not selected_key:
-            self.report({"WARNING"}, "没有勾选要导入的工作流")
-            return {"CANCELLED"}
-        try:
-            payload = read_preset_archive(state.preset_filepath, max_bytes=MAX_PRESET_FILE_BYTES)
-        except Exception as exc:
-            self.report({"ERROR"}, f"预设读取失败: {exc}")
-            return {"CANCELLED"}
-
-        entries = workflow_preset_entries_from_payload(payload, preferred_space_type=current_space_type(context=context))
-        selected_entries = [entry for entry in entries if entry.get("key", "") == selected_key][:1]
-        if not selected_entries:
-            self.report({"WARNING"}, "预设中没有找到已勾选的工作流")
-            return {"CANCELLED"}
-
-        ensure_minimum_setup(context.scene)
-        imported = []
-        imported_workflows = []
-        merge_preset_entries_shared_payloads(state, selected_entries)
-        for entry in selected_entries:
-            workflow_payload = current_workflow_preset_payload_from_entry(entry)
-            workflow = apply_current_workflow_preset_payload(state, workflow_payload, merge_shared=False)
-            if workflow is None:
-                continue
-            imported.append(workflow.name)
-            imported_workflows.append(workflow)
-
-        if not imported:
-            self.report({"ERROR"}, "没有导入任何工作流")
-            return {"CANCELLED"}
-
-        missing_count, missing_suffix, low_version_count, low_version_suffix = finish_current_space_preset_import(context, state, imported_workflows)
-        state.preset_status = f"已导入 {len(imported)} 个工作流" + (f"；缺失面板 {missing_count} 个" if missing_count else "") + (f"；低版本插件 {low_version_count} 个" if low_version_count else "")
-        if missing_count:
-            self.report({"WARNING"}, f"已导入 {len(imported)} 个工作流；缺失面板 {missing_count} 个{missing_suffix}{low_version_suffix}。未自动应用到 N 面板")
-        elif low_version_count:
-            self.report({"WARNING"}, f"已导入 {len(imported)} 个工作流{low_version_suffix}。未自动应用到 N 面板")
-        else:
-            self.report({"INFO"}, state.preset_status)
         return {"FINISHED"}
 
 
@@ -14743,7 +13155,10 @@ def draw_workflow_runtime(layout, state):
 
     for index, module in enumerate(workflow.modules):
         card = modules_box.box()
-        card.enabled = module.enabled
+        if not module.enabled:
+            card.label(text="该模块已禁用，请到脚本模板页启用。", icon="PAUSE")
+            continue
+        card.enabled = True
         header = card.row(align=True)
         needs_panel = module_needs_runtime_panel(module)
         if needs_panel:
@@ -14764,18 +13179,14 @@ def draw_workflow_runtime(layout, state):
         if module.description:
             draw_folded_text_block(
                 card,
-                state.settings,
-                "show_runtime_module_descriptions",
+                module,
+                "runtime_description_expanded",
                 "模块说明",
                 module.description,
                 icon="INFO",
                 expanded_limit=2,
                 width=64,
             )
-
-        if not module.enabled:
-            card.label(text="该模块已禁用，请到脚本模板页启用。", icon="PAUSE")
-            continue
 
         if needs_panel:
             panel_box = card.box()
@@ -15245,7 +13656,7 @@ def draw_preset_editor(layout, state):
     preset_entries = get_preset_import_entries(state)
     if preset_entries:
         selected_count, total_count = preset_workflow_selection_counts(state)
-        import_box.label(text=f"已选择 {selected_count}/{total_count}", icon="CHECKBOX_HLT" if selected_count else "CHECKBOX_DEHLT")
+        import_box.label(text=f"当前选中 {selected_count}/{total_count}", icon="RADIOBUT_ON" if selected_count else "RADIOBUT_OFF")
         selected_index = preset_import_selected_index(state)
         list_box = import_box.box()
         for index, entry in enumerate(preset_entries[:8]):
@@ -15280,44 +13691,6 @@ def draw_preset_editor(layout, state):
         "show_help_text_blocks",
         "预设说明",
         "导出会生成 .gwpreset 压缩包；脚本按 .py 文件保存。面板组只使用轻量名称匹配信息，导入时不会覆盖当前 N 面板顺序。",
-        icon="INFO",
-        expanded_limit=3,
-        width=56,
-    )
-    return
-
-    if state.preset_workflows:
-        selected_count, total_count = preset_workflow_selection_counts(state)
-        import_box.label(text=f"已勾选 {selected_count}/{total_count} 个工作流", icon="CHECKBOX_HLT" if selected_count else "CHECKBOX_DEHLT")
-        row = import_box.row()
-        row.template_list(
-            "BWFLOW_UL_preset_workflows",
-            "",
-            state,
-            "preset_workflows",
-            state,
-            "preset_workflow_index",
-            rows=6,
-        )
-        ops = row.column(align=True)
-        ops.operator("bworkflow.preset_select_current_space", text="", icon="RESTRICT_SELECT_OFF")
-        ops.operator("bworkflow.preset_select_all", text="", icon="CHECKBOX_HLT").select = True
-        ops.operator("bworkflow.preset_select_all", text="", icon="CHECKBOX_DEHLT").select = False
-        import_row = import_box.row(align=True)
-        import_row.enabled = selected_count > 0
-        import_row.operator("bworkflow.preset_import_selected", text="导入当前选中工作流", icon="IMPORT")
-    else:
-        import_box.label(text="请选择 .gwpreset 预设包以预览其中的工作流。", icon="INFO")
-
-    info = col.box()
-    draw_folded_text_block(
-        info,
-        state.settings,
-        "show_help_text_blocks",
-        "预设说明",
-        "导出会把当前编辑器空间中勾选的工作流写入一个 .gwpreset 压缩预设包。\n"
-        "脚本源码会作为独立 .py 文件放入预设包；面板组只保存插件名称和版本摘要。\n"
-        "导入时一次只导入一个工作流，不自动恢复面板排序和子抽屉。",
         icon="INFO",
         expanded_limit=3,
         width=56,
@@ -16053,6 +14426,7 @@ def unregister():
     MODULE_RUNTIME_NAMESPACE_CACHE.clear()
     MODULE_SOURCE_TEXT_CACHE.clear()
     MODULE_RUNTIME_FIELD_INIT_CACHE.clear()
+    MODULE_RUNTIME_VOLATILE_STORE.clear()
     BUILTIN_SCRIPT_LIBRARY_PAYLOAD_CACHE["signature"] = None
     BUILTIN_SCRIPT_LIBRARY_PAYLOAD_CACHE["payloads"] = []
     MODULE_RUNTIME_CLEANUP_CACHE.clear()

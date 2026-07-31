@@ -13,6 +13,7 @@ __pycache__/
 # Local IDE / OS files
 .vscode/
 .idea/
+.workbuddy/
 .DS_Store
 Thumbs.db
 
@@ -24,12 +25,25 @@ tools/
 bworkflow_modules/
 工作流保存/
 全面混合验证表情参考/
+manual_upload_go_workflow_v*/
+00_工作区/
+02_版本迭代区/
+go_workflow_extension/go_workflow/go_workflow_modules/
+
+# Local external/reference material kept outside the add-on package
+Faceit v*/
+参考资料/
 
 # Packaging and historical build outputs.
 # Put public downloadable zips in GitHub Releases instead of Git history.
 version_history/
 *.zip
 !release_packages/*.zip
+release_packages/_shape_key_capture_recorder_v*/
+release_packages/removed_local_assets/
+release_packages/shape_key_capture_recorder_v*.zip
+release_packages/go_workflow_v0.8.2.zip
+release_packages/go_workflow_v0.8.3.zip
 
 # Temporary scraped/generated ARKit reference data
 tmp_*
@@ -40,6 +54,10 @@ import_test.py
 codex重置.py
 口型生成.py
 预设*.bworkflow
+arkit形态键工作流参考_倒计时.py
+arkit形态键工作流参考_倒计时.py.bak
+arkit形态键工作流参考_形态键空键列表.py
+shape_key_capture_recorder.py
 合成键预设/111.csv
 
 # Local binary test assets

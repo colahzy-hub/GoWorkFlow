@@ -13,14 +13,14 @@ GoWorkFlow 是一个 Blender 侧边栏工作流插件，用于管理 N 面板工
 - 工作流式 N 面板管理
 - 面板组扫描、排序、隐藏/显示
 - 脚本库与脚本模板管理
-- `.goworkflow` 预设导入导出
+- `.gwpreset` 预设导入导出
 - 内置 ARKit 形态键工作流参考
 - ARKit 形态键混合验证、全面混合验证和关键帧验证
 - 口型生成、形态键鉴定、ARKit 合成形态键等内置脚本模块
 
 ## 安装
 
-1. 从 `release_packages/` 或 GitHub Releases 下载最新完整包 `go_workflow_full_v*.zip`。
+1. 从 GitHub Releases 下载最新安装包 `go_workflow_v*.zip`。
 2. 在 Blender 中打开 `编辑 > 偏好设置 > 扩展/插件`。
 3. 选择从磁盘安装 zip。
 4. 启用 `Go工作流 / Go Workflow`。
@@ -44,12 +44,8 @@ git clone https://github.com/colahzy-hub/GoWorkFlow.git
 
 ## 发布包
 
-- `go_workflow_full_v*.zip`：完整插件安装包，推荐普通用户下载。
-- `go_workflow_main_plugin_v*.zip`：主插件代码拆分包，不含特殊预设和内置脚本库。
-- `go_workflow_special_presets_v*.zip`：特殊预设拆分包。
-- `go_workflow_builtin_scripts_v*.zip`：预设脚本库拆分包。
-
-拆分包主要用于维护、对照和二次集成；完整安装优先使用完整包。
+- `go_workflow_v*.zip`：完整插件安装包，推荐普通用户下载。
+- 本地开发迭代包保存在 `02_版本迭代区/version_history/`，正式分发以 GitHub Releases 附件为准。
 
 更详细的安装预留方案见 `INSTALL.md`。
 
