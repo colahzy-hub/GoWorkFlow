@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Go工作流 / Go Workflow",
     "author": "OpenAI Codex",
-    "version": (0, 9, 43),
+    "version": (1, 0, 1),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Go工作流",
     "description": "基于工作流的 N 面板筛选与自定义脚本模块工具 / Workflow panel filter and script module manager",
@@ -9,7 +9,7 @@ bl_info = {
 }
 
 # AI定位：插件升版本时同步更新这里的 bl_info["version"]、__version__ 和 blender_manifest.toml。
-__version__ = (0, 9, 43)
+__version__ = (1, 0, 1)
 
 import json
 import csv
@@ -147,6 +147,7 @@ FILE_TEXT_CACHE = {}
 FILE_JSON_CACHE = {}
 IMAGE_PREVIEW_ICON_CACHE = {}
 PRESET_IMPORT_ENTRY_CACHE = {}
+IMPORTED_PRESET_ASSET_PATH_CACHE = {}
 IMPORTED_WORKFLOW_PANEL_MATCH_CACHE = {}
 IMPORTED_WORKFLOW_MISSING_MATCH_CACHE = {}
 BUILTIN_SCRIPT_LIBRARY_PAYLOAD_CACHE = {"signature": None, "payloads": []}
@@ -160,8 +161,10 @@ BROKEN_PANEL_POLL_IDS = {
 DEFERRED_REFRESH_INTERVALS = (0.25,)
 DEFERRED_REFRESH_TOKENS = {}
 DEFERRED_REFRESH_PENDING_KEYS = set()
+DEFERRED_WORKFLOW_SWITCH_PENDING_KEYS = set()
 DEFERRED_SAVE_INTERVAL = 0.35
 DEFERRED_SAVE_PENDING_SCENES = set()
+IMPORTED_PRESET_PRUNE_PENDING_SCENES = set()
 DOUBLE_CLICK_SECONDS = 1.0
 DOUBLE_CLICK_CLICK_COUNT = 2
 TRACKED_ONE_SHOT_TIMER_CALLBACKS = set()
@@ -2796,7 +2799,7 @@ def workflow_low_version_plugin_summary(state, workflows, limit=3):
 
 def finish_current_space_preset_import(context, state, imported_workflows):
     mark_imported_preset_data_dirty(state, scene=context.scene, context=context)
-    prune_unreferenced_imported_preset_assets(scene=context.scene, max_delete=80)
+    schedule_imported_preset_asset_prune(scene=context.scene)
     missing_count, missing_suffix = workflow_missing_panel_summary(state, imported_workflows)
     low_version_count, low_version_suffix = workflow_low_version_plugin_summary(state, imported_workflows)
     return missing_count, missing_suffix, low_version_count, low_version_suffix
@@ -3556,20 +3559,33 @@ def _camera_rig_panel_draw_error_is_safe(exc):
     if not isinstance(exc, AttributeError):
         return False
     text = str(exc or "")
-    return "'NoneType' object has no attribute 'pose'" in text or "'NoneType' object has no attribute 'data'" in text
+    return (
+        "'NoneType' object has no attribute 'pose'" in text
+        or "'NoneType' object has no attribute 'data'" in text
+        or "'NoneType' object has no attribute 'type'" in text
+    )
 
 
 def _safe_panel_draw_wrapper(panel_id, method_name, original):
     def wrapped(self, context):
+        if panel_id.startswith("ADD_CAMERA_RIGS_"):
+            active_object = getattr(context, "active_object", None)
+            if active_object is None:
+                view_layer = getattr(context, "view_layer", None)
+                layer_objects = getattr(view_layer, "objects", None)
+                active_object = getattr(layer_objects, "active", None)
+            if active_object is None:
+                return None
         try:
             return original(self, context)
         except Exception as exc:
-            if not _camera_rig_panel_draw_error_is_safe(exc):
-                raise
             key = (panel_id, method_name, type(exc).__name__, str(exc))
             if key not in PANEL_DRAW_ERROR_KEYS:
                 PANEL_DRAW_ERROR_KEYS.add(key)
-                print(f"[GoWorkflow] Suppressed panel draw error in {panel_id}.{method_name}: {exc}", file=sys.stderr)
+                print(
+                    f"[GoWorkflow] Isolated panel draw error in {panel_id}.{method_name}: {exc}",
+                    file=sys.stderr,
+                )
             return None
     wrapped.__name__ = getattr(original, "__name__", method_name)
     wrapped.__doc__ = getattr(original, "__doc__", None)
@@ -3591,9 +3607,7 @@ def repair_problematic_panel_draw_callbacks(space_type=None):
         if target_space and str(getattr(cls, "bl_space_type", "") or "") != target_space:
             continue
         module_name = str(getattr(cls, "__module__", "") or "")
-        if not module_name.endswith("add_camera_rigs.ui_panels"):
-            continue
-        if not panel_id.startswith("ADD_CAMERA_RIGS_"):
+        if not module_name or module_name == __name__ or module_name.startswith(f"{__name__}."):
             continue
         original_draw = _panel_callback_from_class_dict(cls, "draw")
         if callable(original_draw) and panel_id not in PANEL_DRAW_ORIGINALS:
@@ -4326,6 +4340,49 @@ def schedule_deferred_runtime_refresh(scene=None, intervals=None, space_type=Non
         traceback.print_exc()
 
 
+def schedule_deferred_workflow_switch_refresh(scene=None, space_type="VIEW_3D", delay=0.05):
+    target_scene = scene or safe_context_scene()
+    if target_scene is None:
+        return False
+    scene_name = getattr(target_scene, "name", "")
+    target_space = str(space_type or "VIEW_3D")
+    if not scene_name:
+        return False
+    refresh_key = f"{scene_name}:{target_space}"
+    if refresh_key in DEFERRED_WORKFLOW_SWITCH_PENDING_KEYS:
+        return True
+    DEFERRED_WORKFLOW_SWITCH_PENDING_KEYS.add(refresh_key)
+
+    def _refresh_once(scene_name=scene_name, target_space_type=target_space, pending_key=refresh_key):
+        DEFERRED_WORKFLOW_SWITCH_PENDING_KEYS.discard(pending_key)
+        scene_ref = bpy.data.scenes.get(scene_name)
+        if scene_ref is None:
+            return None
+        try:
+            state = get_state(scene=scene_ref, space_type=target_space_type)
+            workflow = get_active_workflow(state)
+            if workflow is not None and workflow.is_default:
+                restore_space_default_n_panel_state(
+                    scene=scene_ref,
+                    space_type=target_space_type,
+                    disable_filters=True,
+                    sync_registry_after_restore=False,
+                )
+            else:
+                rebuild_runtime_panels(scene=scene_ref, space_type=target_space_type)
+        except Exception:
+            traceback.print_exc()
+        return None
+
+    try:
+        _register_one_shot_timer(_refresh_once, first_interval=max(0.01, float(delay)))
+        return True
+    except Exception:
+        DEFERRED_WORKFLOW_SWITCH_PENDING_KEYS.discard(refresh_key)
+        traceback.print_exc()
+        return False
+
+
 def ensure_minimum_setup(scene, restore_global=True, save_state=True):
     created = False
     library_changed = False
@@ -4455,6 +4512,20 @@ def apply_script_library_item_to_module(module, item):
     module.ai_doc = getattr(item, "ai_doc", "")
 
 
+def script_library_storage_dir():
+    return os.path.join(default_module_scripts_dir(), "script_library")
+
+
+def write_script_library_source_file(item_name, source):
+    folder = script_library_storage_dir()
+    os.makedirs(folder, exist_ok=True)
+    filename = safe_filename_component(item_name or "script", "script") + ".py"
+    filepath = os.path.join(folder, filename)
+    with open(filepath, "w", encoding="utf-8") as handle:
+        handle.write(str(source or ""))
+    return filepath
+
+
 def copy_module_to_script_library_item(item, module):
     if item is None or module is None:
         return
@@ -4463,9 +4534,10 @@ def copy_module_to_script_library_item(item, module):
     item.panel_title = normalize_text_value(getattr(module, "panel_title", ""), "")
     item.panel_description = normalize_text_value(getattr(module, "panel_description", ""), "")
     # 脚本库存源码快照，不保留当前模块工作文件路径，避免跨工作流回写污染。
-    item.script_path = ""
+    source = getattr(module, "script_source", "") or ""
+    item.script_path = write_script_library_source_file(item.name, source)
     item.text_block_name = ""
-    item.script_source = getattr(module, "script_source", "")
+    item.script_source = source
     item.config_payload = getattr(module, "config_payload", "")
     item.ai_doc = getattr(module, "ai_doc", "")
 
@@ -5947,14 +6019,27 @@ def prepare_safe_preset_entries(entries):
 def import_single_preset_entry(context, state, entry):
     if state is None or not isinstance(entry, dict):
         return None
-    ensure_minimum_setup(context.scene)
+    # The caller initializes the scene once before importing. Re-running the
+    # setup here repeats builtin-module refreshes for every imported entry.
     workflow_payload = current_workflow_preset_payload_from_entry(entry)
     cache = get_preset_import_cache(state)
     workflow_payload = hydrate_preset_payload_scripts_from_archive(
         workflow_payload,
         cache.get("filepath", "") or entry.get("preset_archive_path", ""),
     )
-    return apply_current_workflow_preset_payload(state, workflow_payload, merge_shared=False)
+    global IS_INITIALIZING_ADDON
+    previous_initializing = IS_INITIALIZING_ADDON
+    IS_INITIALIZING_ADDON = True
+    try:
+        workflow = apply_current_workflow_preset_payload(state, workflow_payload, merge_shared=False)
+    finally:
+        IS_INITIALIZING_ADDON = previous_initializing
+    if workflow is not None:
+        rebuild_runtime_panels(
+            scene=getattr(context, "scene", None),
+            space_type=getattr(state, "space_type", "VIEW_3D"),
+        )
+    return workflow
 
 
 def preset_import_cache_key(state):
@@ -6374,18 +6459,38 @@ def write_preset_import_text_asset(workflow, module_name, suffix, content, exten
     module_part = safe_filename_component(module_name or "module", "module")
     suffix_part = safe_filename_component(suffix or "asset", "asset")
     digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
-    filepath = os.path.join(folder, f"{module_part}_{suffix_part}_{digest}.{extension.lstrip('.')}")
+    extension = extension.lstrip(".")
+    cache_key = (normalized_abs_path(folder), digest, extension)
+    cached_path = IMPORTED_PRESET_ASSET_PATH_CACHE.get(cache_key, "")
+    if cached_path and os.path.isfile(cached_path):
+        return cached_path
+
+    # The readable filename prefix is not the asset identity. Reuse an
+    # existing file with the same content even when an imported module has a
+    # different unique name.
+    try:
+        for entry in os.scandir(folder):
+            if entry.is_file() and entry.name.endswith(f"_{digest}.{extension}"):
+                IMPORTED_PRESET_ASSET_PATH_CACHE[cache_key] = entry.path
+                return entry.path
+    except OSError:
+        pass
+
+    filepath = os.path.join(folder, f"{module_part}_{suffix_part}_{digest}.{extension}")
     if os.path.exists(filepath) and _same_text_file(filepath, text):
+        IMPORTED_PRESET_ASSET_PATH_CACHE[cache_key] = filepath
         return filepath
     base, ext = os.path.splitext(filepath)
     counter = 2
     while os.path.exists(filepath):
         if _same_text_file(filepath, text):
+            IMPORTED_PRESET_ASSET_PATH_CACHE[cache_key] = filepath
             return filepath
         filepath = f"{base}_{counter}{ext}"
         counter += 1
     with open(filepath, "w", encoding="utf-8") as handle:
         handle.write(text)
+    IMPORTED_PRESET_ASSET_PATH_CACHE[cache_key] = filepath
     return filepath
 
 
@@ -6450,6 +6555,32 @@ def prune_unreferenced_imported_preset_assets(scene=None, max_delete=80):
         except Exception:
             traceback.print_exc()
     return removed
+
+
+def schedule_imported_preset_asset_prune(scene=None, delay=0.75):
+    target_scene = scene or safe_context_scene()
+    scene_name = getattr(target_scene, "name", "") if target_scene is not None else ""
+    if not scene_name or scene_name in IMPORTED_PRESET_PRUNE_PENDING_SCENES:
+        return False
+    IMPORTED_PRESET_PRUNE_PENDING_SCENES.add(scene_name)
+
+    def _prune_once(name=scene_name):
+        IMPORTED_PRESET_PRUNE_PENDING_SCENES.discard(name)
+        scene_ref = bpy.data.scenes.get(name)
+        if scene_ref is None:
+            return None
+        try:
+            prune_unreferenced_imported_preset_assets(scene=scene_ref, max_delete=80)
+        except Exception:
+            traceback.print_exc()
+        return None
+
+    try:
+        _register_one_shot_timer(_prune_once, first_interval=max(0.1, float(delay)))
+        return True
+    except Exception:
+        IMPORTED_PRESET_PRUNE_PENDING_SCENES.discard(scene_name)
+        return False
 
 
 def project_root_dir():
@@ -10139,12 +10270,11 @@ def on_workflow_changed(self, context):
         state.active_workflow_index = clamped
         return
     ensure_one_default_workflow(state)
-    workflow = get_active_workflow(state)
-    if workflow is not None and workflow.is_default:
-        restore_default_n_panel_state(scene=context.scene, disable_filters=True, sync_registry_after_restore=False)
-    else:
-        rebuild_runtime_panels(scene=context.scene)
-    schedule_deferred_runtime_refresh(scene=context.scene, intervals=(0.5,))
+    schedule_deferred_workflow_switch_refresh(
+        scene=getattr(context, "scene", None),
+        space_type=getattr(state, "space_type", current_space_type(context=context)),
+    )
+    tag_redraw_context_area(context)
 
 
 def on_workflow_name_changed(self, context):
@@ -10882,13 +11012,10 @@ class BWFLOW_OT_workflow_activate(Operator):
 
     def execute(self, context):
         state = get_state(context=context)
-        state.active_workflow_index = clamp_index(self.index, len(state.workflows))
-        workflow = get_active_workflow(state)
-        if workflow is not None and workflow.is_default:
-            restore_default_n_panel_state(scene=context.scene, disable_filters=True, sync_registry_after_restore=False)
-        else:
-            rebuild_runtime_panels(scene=context.scene)
-        schedule_deferred_runtime_refresh(scene=context.scene, intervals=(0.25,))
+        target_index = clamp_index(self.index, len(state.workflows))
+        if target_index == state.active_workflow_index:
+            return {"FINISHED"}
+        state.active_workflow_index = target_index
         save_global_workflow_state(context.scene)
         return {"FINISHED"}
 
@@ -11974,10 +12101,10 @@ class BWFLOW_OT_script_library_open_storage_folder(Operator):
                         os.makedirs(folder, exist_ok=True)
                         opened = open_path_in_file_explorer(folder)
                     else:
-                        opened = open_path_in_file_explorer(default_module_scripts_dir())
+                        opened = open_path_in_file_explorer(script_library_storage_dir())
             else:
-                os.makedirs(default_module_scripts_dir(), exist_ok=True)
-                opened = open_path_in_file_explorer(default_module_scripts_dir())
+                os.makedirs(script_library_storage_dir(), exist_ok=True)
+                opened = open_path_in_file_explorer(script_library_storage_dir())
         except Exception as exc:
             self.report({"ERROR"}, f"打开脚本文件夹失败: {exc}")
             return {"CANCELLED"}
@@ -12541,6 +12668,39 @@ class BWFLOW_OT_workflow_dismiss_missing_warning(Operator):
         save_global_workflow_state(context.scene)
         tag_redraw_all(space_type=getattr(state, "space_type", None))
         self.report({"INFO"}, "已忽略当前工作流缺失提示" if self.dismiss else "已恢复当前工作流缺失提示")
+        return {"FINISHED"}
+
+
+class BWFLOW_OT_clear_missing_panel_warnings(Operator):
+    bl_idname = "bworkflow.clear_missing_panel_warnings"
+    bl_label = "清除缺失面板提示"
+    bl_description = "清除当前场景所有编辑器空间和工作流的缺失面板提示状态"
+
+    @classmethod
+    def poll(cls, context):
+        return safe_context_scene() is not None
+
+    def execute(self, context):
+        scene = getattr(context, "scene", None) or safe_context_scene()
+        if scene is None:
+            return {"CANCELLED"}
+        changed = 0
+        for space_type in iter_supported_space_types():
+            state = get_state(scene=scene, space_type=space_type)
+            if state is None:
+                continue
+            for workflow in getattr(state, "workflows", []):
+                if workflow.is_default:
+                    continue
+                if not bool(getattr(workflow, "missing_warning_dismissed", False)):
+                    changed += 1
+                    workflow.missing_warning_dismissed = True
+            clear_space_prefixed_cache(WORKFLOW_MISSING_PANEL_IDS_CACHE_BY_SPACE, space_type)
+            clear_space_prefixed_cache(WORKFLOW_MISSING_RECORDS_CACHE_BY_SPACE, space_type)
+        if changed:
+            save_global_workflow_state(scene)
+            tag_redraw_all()
+        self.report({"INFO"}, f"已清除 {changed} 个工作流的缺失面板提示")
         return {"FINISHED"}
 
 
@@ -14081,6 +14241,7 @@ def draw_global_settings(layout, state):
     box.prop(state.settings, "auto_sync_registry")
     box.prop(state.settings, "show_missing_summary")
     box.prop(state.settings, "runtime_preview_lines")
+    box.operator("bworkflow.clear_missing_panel_warnings", text="清除缺失面板提示", icon="HIDE_ON")
 
     mem_box = box.box()
     mem_box.label(text="内存管理", icon="MEMORY")
@@ -14224,6 +14385,59 @@ def bworkflow_load_post(_dummy):
         traceback.print_exc()
 
 
+OPERATOR_TOOLTIP_OVERRIDES = {
+    "bworkflow.workflow_activate": "切换当前工作流，并按该工作流更新第三方 N 面板的显示范围。",
+    "bworkflow.workflow_add": "新建一个空的自定义工作流，不会修改现有工作流。",
+    "bworkflow.workflow_add_special_preset": "创建带预置模块和配套数据的专项工作流。",
+    "bworkflow.workflow_duplicate": "复制当前工作流的面板、模块和说明，生成独立副本。",
+    "bworkflow.workflow_remove": "删除当前工作流及其配置，不会卸载第三方插件。",
+    "bworkflow.workflow_move": "调整当前工作流在列表中的顺序，不改变工作流内容。",
+    "bworkflow.module_add": "在当前工作流末尾新增一个脚本模块。",
+    "bworkflow.module_move": "调整当前脚本模块在工作流中的顺序。",
+    "bworkflow.module_run": "执行当前模块绑定的 Python 脚本，并显示运行结果或错误。",
+    "bworkflow.script_library_save_current_module": "将当前模块源码保存为脚本库中的 .py 文件，并新增或覆盖脚本库条目。",
+    "bworkflow.script_library_apply_to_module": "将选中的脚本库 .py 内容载入当前模块，不会修改原脚本库文件。",
+    "bworkflow.script_library_refresh": "重新读取脚本库条目关联的 .py 文件，更新列表中的源码。",
+    "bworkflow.script_library_remove": "删除当前脚本库条目，不会删除当前工作流中的模块。",
+    "bworkflow.panel_library_click": "选择面板；双击时切换当前工作流是否显示该面板。",
+    "bworkflow.panel_group_click": "展开或收起面板大组；双击时整体加入或移出当前工作流。",
+    "bworkflow.panel_toggle_for_workflow": "将当前选中面板所属的组件组加入或移出当前工作流。",
+    "bworkflow.panel_toggle_group_for_workflow": "将当前大组下的全部抽屉面板加入或移出当前工作流。",
+    "bworkflow.panel_add_all_to_workflow": "按 Blender 当前扫描顺序，将发现的第三方抽屉面板加入当前工作流。",
+    "bworkflow.panel_add_tagged_to_workflow": "按当前工作流标签筛选，并加入所有命中的面板。",
+    "bworkflow.panel_clear_workflow": "清除当前工作流的面板选择，不删除第三方插件面板。",
+    "bworkflow.panel_remove_missing_from_workflow": "从当前工作流中移除当前环境无法找到的面板记录。",
+    "bworkflow.workflow_dismiss_missing_warning": "仅隐藏当前工作流的缺失面板提示，不删除缺失面板记录。",
+    "bworkflow.clear_missing_panel_warnings": "清除当前场景所有编辑器和工作流的缺失面板提示状态。",
+    "bworkflow.panel_apply_workflow_order": "将当前面板选择和排序一次性应用到 Blender N 面板。",
+    "bworkflow.panel_reset_workflow_order": "按当前扫描结果重建当前工作流的面板组顺序。",
+    "bworkflow.panel_jump_in_workflow": "将当前选中的面板组移动到列表顶部或底部。",
+    "bworkflow.panel_reverse_workflow_order": "反转当前工作流中的面板组顺序。",
+    "bworkflow.preset_export": "将选中的工作流和脚本模块保存为 .gwpreset 压缩预设包。",
+    "bworkflow.preset_import": "从 .gwpreset 文件导入工作流到当前编辑器空间。",
+    "bworkflow.preset_load": "读取 .gwpreset 并显示其中可单独导入的工作流列表。",
+    "bworkflow.preset_import_selected": "将预设列表中当前选中的工作流导入当前编辑器空间。",
+    "bworkflow.preset_clear_loaded": "清空当前预设预览列表，不删除已经导入的工作流。",
+    "bworkflow.refresh_registry": "重新扫描当前编辑器中的第三方 N 面板并刷新面板库。",
+    "bworkflow.restore_default_n_panels": "恢复 Go Workflow 修改过的 N 面板显示和排序状态。",
+    "bworkflow.reset_all_settings": "清除 Go Workflow 的工作流、脚本库、面板设置和缓存，并恢复默认状态。",
+}
+
+
+def apply_operator_tooltip_overrides():
+    for cls in CLASSES:
+        operator_id = getattr(cls, "bl_idname", "")
+        if not operator_id or not operator_id.startswith("bworkflow."):
+            continue
+        description = OPERATOR_TOOLTIP_OVERRIDES.get(operator_id)
+        if description:
+            cls.bl_description = description
+            continue
+        if not str(getattr(cls, "bl_description", "") or "").strip():
+            label = str(getattr(cls, "bl_label", "") or operator_id)
+            cls.bl_description = f"执行“{label}”操作。"
+
+
 CLASSES = [
     BWFLOW_PG_PanelRecord,
     BWFLOW_PG_ScriptLibraryItem,
@@ -14299,6 +14513,7 @@ CLASSES = [
     BWFLOW_OT_panel_clear_workflow,
     BWFLOW_OT_panel_remove_missing_from_workflow,
     BWFLOW_OT_workflow_dismiss_missing_warning,
+    BWFLOW_OT_clear_missing_panel_warnings,
     BWFLOW_OT_export_missing_plugins_csv,
     BWFLOW_OT_panel_reset_workflow_order,
     BWFLOW_OT_panel_jump_in_workflow,
@@ -14602,6 +14817,7 @@ def register():
     IS_INITIALIZING_ADDON = True
 
     try:
+        apply_operator_tooltip_overrides()
         repair_problematic_panel_draw_callbacks()
 
         for cls in CLASSES:
