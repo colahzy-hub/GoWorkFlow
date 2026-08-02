@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Go工作流 / Go Workflow",
     "author": "OpenAI Codex",
-    "version": (0, 9, 42),
+    "version": (0, 9, 43),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Go工作流",
     "description": "基于工作流的 N 面板筛选与自定义脚本模块工具 / Workflow panel filter and script module manager",
@@ -9,7 +9,7 @@ bl_info = {
 }
 
 # AI定位：插件升版本时同步更新这里的 bl_info["version"]、__version__ 和 blender_manifest.toml。
-__version__ = (0, 9, 42)
+__version__ = (0, 9, 43)
 
 import json
 import csv
@@ -835,6 +835,8 @@ def get_panel_registry_lookup(state):
     record_by_id = {}
     index_by_id = {}
     records_by_drawer = {}
+    records_by_source_module = {}
+    records_by_plugin_key = {}
 
     for index, record in enumerate(records):
         panel_id = getattr(record, "panel_id", "")
@@ -844,11 +846,19 @@ def get_panel_registry_lookup(state):
         index_by_id.setdefault(panel_id, index)
         drawer_id = panel_drawer_root_id(panel_id, space_type=space_type) or panel_id
         records_by_drawer.setdefault(drawer_id, []).append(record)
+        source_module = normalized_panel_match_text(getattr(record, "source_module", ""))
+        if source_module:
+            records_by_source_module.setdefault(source_module, []).append(record)
+        plugin_key = normalized_panel_match_text(panel_plugin_key_from_module(getattr(record, "source_module", "")) or panel_plugin_key(panel_id))
+        if plugin_key:
+            records_by_plugin_key.setdefault(plugin_key, []).append(record)
 
     lookup = {
         "record_by_id": record_by_id,
         "records_by_drawer": records_by_drawer,
         "index_by_id": index_by_id,
+        "records_by_source_module": records_by_source_module,
+        "records_by_plugin_key": records_by_plugin_key,
     }
     PANEL_REGISTRY_LOOKUP_CACHE_BY_SPACE[space_type] = {"signature": signature, "lookup": lookup}
     return lookup
@@ -1648,6 +1658,7 @@ def sanitize_module_payload(module_data):
         "description": normalize_text_value(coerce_text_value(module_data.get("description", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS), ""),
         "text_block_name": normalize_text_value(coerce_text_value(module_data.get("text_block_name", ""), max_chars=MAX_RNA_NAME_CHARS), ""),
         "script_source": coerce_text_value(module_data.get("script_source", "")),
+        "script_asset": coerce_text_value(module_data.get("script_asset", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS),
         "config_payload": coerce_text_value(module_data.get("config_payload", "")),
         "ai_doc": coerce_text_value(module_data.get("ai_doc", "")),
     }
@@ -1666,6 +1677,7 @@ def sanitize_script_library_payload(item_data):
         "script_path": coerce_text_value(item_data.get("script_path", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS),
         "text_block_name": normalize_text_value(coerce_text_value(item_data.get("text_block_name", ""), max_chars=MAX_RNA_NAME_CHARS), ""),
         "script_source": coerce_text_value(item_data.get("script_source", "")),
+        "script_asset": coerce_text_value(item_data.get("script_asset", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS),
         "config_payload": coerce_text_value(item_data.get("config_payload", "")),
         "ai_doc": coerce_text_value(item_data.get("ai_doc", "")),
     }
@@ -1839,6 +1851,7 @@ def sanitize_current_workflow_preset_payload(payload):
         "exported_at": payload.get("exported_at", ""),
         "space_type": payload.get("space_type", "VIEW_3D"),
         "space_label": payload.get("space_label", ""),
+        "preset_archive_path": coerce_text_value(payload.get("preset_archive_path", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS),
         "workflow_name": workflow_payload.get("name", ""),
         "settings": space_payload.get("settings", {}),
         "panel_registry": space_payload.get("panel_registry", []),
@@ -2783,6 +2796,7 @@ def workflow_low_version_plugin_summary(state, workflows, limit=3):
 
 def finish_current_space_preset_import(context, state, imported_workflows):
     mark_imported_preset_data_dirty(state, scene=context.scene, context=context)
+    prune_unreferenced_imported_preset_assets(scene=context.scene, max_delete=80)
     missing_count, missing_suffix = workflow_missing_panel_summary(state, imported_workflows)
     low_version_count, low_version_suffix = workflow_low_version_plugin_summary(state, imported_workflows)
     return missing_count, missing_suffix, low_version_count, low_version_suffix
@@ -5030,7 +5044,7 @@ def read_preset_archive_text_member(archive, member_name, max_bytes=None, label=
         return handle.read().decode("utf-8-sig", errors="replace")
 
 
-def read_preset_archive(filepath, max_bytes=None):
+def read_preset_archive(filepath, max_bytes=None, hydrate_scripts=True):
     target_path = bpy.path.abspath(str(filepath or "").strip())
     if not target_path:
         raise ValueError("Preset path is empty")
@@ -5053,6 +5067,7 @@ def read_preset_archive(filepath, max_bytes=None):
         )
         if isinstance(payload, dict):
             payload["preset_archive_format"] = "zip"
+            payload["preset_archive_path"] = target_path
 
         def hydrate_module(module):
             if not isinstance(module, dict):
@@ -5075,18 +5090,52 @@ def read_preset_archive(filepath, max_bytes=None):
             for module in workflow.get("modules", []) or []:
                 hydrate_module(module)
 
-        if isinstance(payload.get("workflow"), dict):
-            hydrate_workflow(payload.get("workflow"))
-        for space_payload in (payload.get("space_states") or {}).values() if isinstance(payload.get("space_states"), dict) else []:
-            if not isinstance(space_payload, dict):
-                continue
-            for workflow in space_payload.get("workflows", []) or []:
-                hydrate_workflow(workflow)
-            for item in space_payload.get("script_library", []) or []:
+        if hydrate_scripts:
+            if isinstance(payload.get("workflow"), dict):
+                hydrate_workflow(payload.get("workflow"))
+            for space_payload in (payload.get("space_states") or {}).values() if isinstance(payload.get("space_states"), dict) else []:
+                if not isinstance(space_payload, dict):
+                    continue
+                for workflow in space_payload.get("workflows", []) or []:
+                    hydrate_workflow(workflow)
+                for item in space_payload.get("script_library", []) or []:
+                    hydrate_module(item)
+            for item in payload.get("script_library", []) or []:
                 hydrate_module(item)
+        return payload
+
+
+def hydrate_preset_payload_scripts_from_archive(payload, filepath):
+    if not isinstance(payload, dict):
+        return payload
+    target_path = bpy.path.abspath(str(filepath or payload.get("preset_archive_path", "") or "").strip())
+    if not target_path or not zipfile.is_zipfile(target_path):
+        return payload
+    with zipfile.ZipFile(target_path, "r") as archive:
+        names = archive.namelist()
+
+        def hydrate_module(module):
+            if not isinstance(module, dict) or module.get("script_source"):
+                return
+            asset_name = str(module.get("script_asset", "") or "")
+            archive_asset_name = find_preset_archive_member(names, asset_name)
+            normalized_asset_name = normalize_preset_archive_member_name(archive_asset_name)
+            if not archive_asset_name or not normalized_asset_name.startswith("scripts/"):
+                return
+            module["script_source"] = read_preset_archive_text_member(
+                archive,
+                archive_asset_name,
+                max_bytes=MAX_PRESET_SCRIPT_ASSET_BYTES,
+                label="script asset",
+            )
+
+        workflow = payload.get("workflow")
+        if isinstance(workflow, dict):
+            for module in workflow.get("modules", []) or []:
+                hydrate_module(module)
         for item in payload.get("script_library", []) or []:
             hydrate_module(item)
-        return payload
+    return payload
 
 
 def build_current_workflow_preset_payload(scene, context=None, space_type=None):
@@ -5435,6 +5484,24 @@ def find_panel_by_name_match(state, source_payload):
     old_id = source_payload.get("panel_id", "")
     if old_id and old_id in runtime_ids:
         return old_id
+    drawer_id = panel_drawer_root_id(old_id, space_type=space_type) if old_id else ""
+    if drawer_id and drawer_id in runtime_ids:
+        return drawer_id
+    lookup = get_panel_registry_lookup(state)
+    source_module = normalized_panel_match_text(source_payload.get("source_module", ""))
+    if source_module:
+        candidates = lookup.get("records_by_source_module", {}).get(source_module, [])
+        for record in candidates:
+            panel_id = getattr(record, "panel_id", "")
+            if panel_id and panel_id in runtime_ids:
+                return panel_id
+    source_plugin = normalized_panel_match_text(source_payload.get("plugin_key", ""))
+    if source_plugin:
+        candidates = lookup.get("records_by_plugin_key", {}).get(source_plugin, [])
+        if len(candidates) == 1:
+            panel_id = getattr(candidates[0], "panel_id", "")
+            if panel_id and panel_id in runtime_ids:
+                return panel_id
     best_id = ""
     best_score = 0
     for record in getattr(state, "panel_registry", []):
@@ -5720,6 +5787,7 @@ def current_workflow_preset_entry(payload):
         "key": preset_entry_key(space_type, 0, workflow.get("name", "")),
         "space_type": space_type,
         "source_label": sanitized.get("space_label", "") or SPACE_LABELS.get(space_type, space_type),
+        "preset_archive_path": sanitized.get("preset_archive_path", ""),
         "workflow_index": 0,
         "workflow": workflow,
         "panel_registry": sanitized.get("panel_registry", []),
@@ -5759,6 +5827,7 @@ def workflow_preset_entries_from_payload(payload, preferred_space_type=None):
                         "key": preset_entry_key(space_type, workflow_index, workflow_name),
                         "space_type": space_type,
                         "source_label": SPACE_LABELS.get(space_type, space_type),
+                        "preset_archive_path": payload.get("preset_archive_path", ""),
                         "workflow_index": workflow_index,
                         "workflow": workflow,
                         "panel_registry": space_payload.get("panel_registry", []),
@@ -5786,6 +5855,7 @@ def workflow_preset_entries_from_payload(payload, preferred_space_type=None):
                 "key": preset_entry_key("VIEW_3D", workflow_index, workflow_name),
                 "space_type": "VIEW_3D",
                 "source_label": SPACE_LABELS.get("VIEW_3D", "VIEW_3D"),
+                "preset_archive_path": payload.get("preset_archive_path", ""),
                 "workflow_index": workflow_index,
                 "workflow": workflow,
                 "panel_registry": fallback_space.get("panel_registry", []),
@@ -5806,6 +5876,7 @@ def current_workflow_preset_payload_from_entry(entry):
             "exported_at": datetime.utcnow().isoformat() + "Z",
             "space_type": entry.get("space_type", "VIEW_3D"),
             "space_label": entry.get("source_label", ""),
+            "preset_archive_path": entry.get("preset_archive_path", ""),
             "workflow_name": (entry.get("workflow") or {}).get("name", ""),
             "settings": entry.get("settings", {}),
             "panel_registry": entry.get("panel_registry", []),
@@ -5878,6 +5949,11 @@ def import_single_preset_entry(context, state, entry):
         return None
     ensure_minimum_setup(context.scene)
     workflow_payload = current_workflow_preset_payload_from_entry(entry)
+    cache = get_preset_import_cache(state)
+    workflow_payload = hydrate_preset_payload_scripts_from_archive(
+        workflow_payload,
+        cache.get("filepath", "") or entry.get("preset_archive_path", ""),
+    )
     return apply_current_workflow_preset_payload(state, workflow_payload, merge_shared=False)
 
 
@@ -6281,19 +6357,31 @@ def preset_import_assets_dir():
     return os.path.join(default_module_scripts_dir(), "_imported_presets")
 
 
+def _same_text_file(filepath, text):
+    try:
+        with open(filepath, "r", encoding="utf-8") as handle:
+            return handle.read() == text
+    except Exception:
+        return False
+
+
 def write_preset_import_text_asset(workflow, module_name, suffix, content, extension):
     text = str(content or "").lstrip("\ufeff")
     if not text:
         return ""
     folder = preset_import_assets_dir()
     os.makedirs(folder, exist_ok=True)
-    workflow_part = safe_filename_component(getattr(workflow, "name", "") or "library", "library")
     module_part = safe_filename_component(module_name or "module", "module")
     suffix_part = safe_filename_component(suffix or "asset", "asset")
-    filepath = os.path.join(folder, f"{workflow_part}_{module_part}_{suffix_part}.{extension.lstrip('.')}")
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
+    filepath = os.path.join(folder, f"{module_part}_{suffix_part}_{digest}.{extension.lstrip('.')}")
+    if os.path.exists(filepath) and _same_text_file(filepath, text):
+        return filepath
     base, ext = os.path.splitext(filepath)
     counter = 2
     while os.path.exists(filepath):
+        if _same_text_file(filepath, text):
+            return filepath
         filepath = f"{base}_{counter}{ext}"
         counter += 1
     with open(filepath, "w", encoding="utf-8") as handle:
@@ -6307,6 +6395,61 @@ def import_asset_note(label, filepath):
     basename = os.path.basename(filepath)
     note = f"{label}: {basename}"
     return coerce_text_value(note, max_chars=MAX_PRESET_IMPORT_RNA_TEXT_CHARS)
+
+
+def _import_asset_note_basename(value):
+    text = str(value or "").strip()
+    if not text or ":" not in text:
+        return ""
+    label, basename = text.split(":", 1)
+    if not label.strip().startswith("external_"):
+        return ""
+    return os.path.basename(basename.strip())
+
+
+def referenced_imported_preset_asset_names(scene=None):
+    target_scene = scene or safe_context_scene()
+    folder = normalized_abs_path(preset_import_assets_dir())
+    names = set()
+    if target_scene is None or not folder:
+        return names
+    for space_type in iter_supported_space_types():
+        state = get_state(scene=target_scene, space_type=space_type)
+        if state is None:
+            continue
+        containers = list(getattr(state, "script_library", []))
+        for workflow in getattr(state, "workflows", []):
+            containers.extend(list(getattr(workflow, "modules", [])))
+        for item in containers:
+            script_path = str(getattr(item, "script_path", "") or "").strip()
+            if script_path and normalized_abs_path(os.path.dirname(bpy.path.abspath(script_path))) == folder:
+                names.add(os.path.basename(script_path))
+            for attr_name in ("config_payload", "ai_doc"):
+                basename = _import_asset_note_basename(getattr(item, attr_name, ""))
+                if basename:
+                    names.add(basename)
+    return names
+
+
+def prune_unreferenced_imported_preset_assets(scene=None, max_delete=80):
+    folder = preset_import_assets_dir()
+    if not os.path.isdir(folder):
+        return 0
+    referenced = referenced_imported_preset_asset_names(scene=scene)
+    removed = 0
+    for entry in sorted(os.scandir(folder), key=lambda item: getattr(item.stat(), "st_mtime", 0.0)):
+        if removed >= max(0, int(max_delete or 0)):
+            break
+        try:
+            if not entry.is_file():
+                continue
+            if entry.name in referenced:
+                continue
+            os.remove(entry.path)
+            removed += 1
+        except Exception:
+            traceback.print_exc()
+    return removed
 
 
 def project_root_dir():
@@ -10046,6 +10189,14 @@ def on_module_runtime_panel_expanded_changed(self, context):
                     for module in workflow.modules:
                         if module != self:
                             continue
+                        script_source = str(getattr(module, "script_source", "") or "").strip()
+                        script_path = str(getattr(module, "script_path", "") or "").strip()
+                        script_file_exists = bool(
+                            script_path
+                            and os.path.isfile(bpy.path.abspath(script_path))
+                        )
+                        if not script_source and not script_file_exists:
+                            break
                         namespace = load_module_namespace(
                             context,
                             scene,
@@ -10859,9 +11010,10 @@ class BWFLOW_OT_workflow_remove(Operator):
         state.workflows.remove(old_index)
         state.active_workflow_index = clamp_index(old_index - 1, len(state.workflows))
         ensure_one_default_workflow(state)
-        rebuild_runtime_panels(scene=context.scene)
-        schedule_deferred_runtime_refresh(scene=context.scene, intervals=(0.25,))
+        schedule_deferred_runtime_refresh(scene=context.scene, intervals=(0.05, 0.25))
+        tag_redraw_context_area(context)
         save_global_workflow_state(context.scene)
+        prune_unreferenced_imported_preset_assets(scene=context.scene, max_delete=80)
         return {"FINISHED"}
 
 
@@ -12868,7 +13020,7 @@ def native_windows_file_dialog_save(default_path="", title="Save preset", defaul
 
 def import_preset_file_direct(context, filepath):
     try:
-        payload = read_preset_archive(filepath, max_bytes=MAX_PRESET_FILE_BYTES)
+        payload = read_preset_archive(filepath, max_bytes=MAX_PRESET_FILE_BYTES, hydrate_scripts=False)
     except Exception as exc:
         print(f"[Go Workflow] Preset read failed: {exc}")
         return False
@@ -12967,7 +13119,7 @@ class BWFLOW_OT_preset_load(Operator):
             print("[Go Workflow] Preset load cancelled.")
             return {"CANCELLED"}
         try:
-            payload = read_preset_archive(filepath, max_bytes=MAX_PRESET_FILE_BYTES)
+            payload = read_preset_archive(filepath, max_bytes=MAX_PRESET_FILE_BYTES, hydrate_scripts=False)
         except Exception as exc:
             print(f"[Go Workflow] Preset read failed: {exc}")
             return {"CANCELLED"}
@@ -12985,7 +13137,7 @@ class BWFLOW_OT_preset_load(Operator):
 
 
 def load_preset_entries_from_filepath(context, state, filepath):
-    payload = read_preset_archive(filepath, max_bytes=MAX_PRESET_FILE_BYTES)
+    payload = read_preset_archive(filepath, max_bytes=MAX_PRESET_FILE_BYTES, hydrate_scripts=False)
     preferred_space_type = current_space_type(context=context)
     entries = prepare_safe_preset_entries(workflow_preset_entries_from_payload(payload, preferred_space_type=preferred_space_type))
     set_preset_import_cache(state, filepath, entries, selected_index=0)
