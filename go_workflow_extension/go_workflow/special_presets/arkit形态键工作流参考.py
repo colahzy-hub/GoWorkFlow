@@ -1,5 +1,6 @@
 import json
 import hashlib
+import bmesh
 import gc
 import math
 import os
@@ -23,6 +24,7 @@ _VALIDATION_TIMER_STATE = {"callback": None}
 _VALIDATION_TIMER_REGISTRY_KEY = "go_workflow.validation_timer_callbacks"
 _NODEPREVIEW_PLAYBACK_STATE = {"changed": False, "original": None}
 _UNDO_PLAYBACK_STATE = {"changed": False, "original": None}
+_REFERENCE_VIEWER_PIDS = set()
 ANIMATION_TIMER_INTERVAL = 0.04
 ANIMATION_DURATION_PER_KEY = 1.0
 ANIMATION_STATUS_INTERVAL = 0.2
@@ -1098,7 +1100,11 @@ def _selected(context):
 
 
 def _target_object(context, panel_api):
-    obj = panel_api.get_object("target_object") if panel_api is not None else None
+    context_obj = getattr(context, "object", None) if context is not None else None
+    if context_obj is not None and getattr(context_obj, "mode", "") == "EDIT":
+        obj = context_obj
+    else:
+        obj = panel_api.get_object("target_object") if panel_api is not None else None
     if obj is None:
         selected = _selected(context)
         obj = selected[0] if selected else getattr(context, "object", None)
@@ -1537,7 +1543,8 @@ def _set_step_and_focus(context, scene, workflow, module, panel_api, module_stat
     panel_api.set_int("media_index", 0)
     panel_api.set_int("detail_media_index", 0)
     item = items[target_index]
-    _focus_current_shape_key(context, panel_api, module_state, item)
+    if _runtime_bool_option(module, panel_api, "auto_focus_shape_key_on_step", True):
+        _focus_current_shape_key(context, panel_api, module_state, item)
     return item, target_index
 
 
@@ -1594,6 +1601,79 @@ def _has_validation_mix_hint(item):
         if len(set(mix_names)) >= 2:
             return True
     return False
+
+
+def _focus_shape_key_with_max_selected_influence(context, panel_api, module_state):
+    obj, key_blocks = _target_object(context, panel_api)
+    if getattr(obj, "mode", "") != "EDIT":
+        raise Exception("请先进入目标物体的编辑模式")
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.verts.ensure_lookup_table()
+    bm.verts.index_update()
+    selected_indices = [vert.index for vert in bm.verts if vert.select and vert.index >= 0]
+    if not selected_indices:
+        raise Exception("请先在编辑模式选中至少一个顶点")
+    if len(key_blocks) <= 1:
+        raise Exception("目标物体没有可用的形态键")
+
+    basis = key_blocks[0]
+    shape_layers = bm.verts.layers.shape
+
+    def edit_shape_layer(key_block):
+        name = str(getattr(key_block, "name", "") or "")
+        if not name:
+            return None
+        try:
+            return shape_layers.get(name)
+        except Exception:
+            return None
+
+    basis_layer = edit_shape_layer(basis)
+
+    def selected_delta_score(key_block, reference, factor):
+        key_layer = edit_shape_layer(key_block)
+        reference_layer = edit_shape_layer(reference) or basis_layer
+        score = 0.0
+        if key_layer is not None and reference_layer is not None:
+            for vertex_index in selected_indices:
+                vert = bm.verts[vertex_index]
+                delta = vert[key_layer] - vert[reference_layer]
+                score += delta.length_squared * factor * factor
+            return score
+        for vertex_index in selected_indices:
+            if vertex_index >= len(key_block.data) or vertex_index >= len(reference.data):
+                continue
+            delta = key_block.data[vertex_index].co - reference.data[vertex_index].co
+            score += delta.length_squared * factor * factor
+        return score
+
+    best_key = None
+    best_index = 0
+    best_score = 0.0
+    for key_index, key_block in enumerate(key_blocks):
+        if key_index == 0 or len(key_block.data) != len(basis.data):
+            continue
+        key_value = abs(float(getattr(key_block, "value", 0.0) or 0.0))
+        if key_value <= 0.000001 or bool(getattr(key_block, "mute", False)):
+            continue
+        reference = getattr(key_block, "relative_key", None) or basis
+        score = selected_delta_score(key_block, reference, key_value)
+        if best_key is None or score > best_score:
+            best_key = key_block
+            best_index = key_index
+            best_score = score
+    if best_key is None or best_score <= 0.0:
+        raise Exception("当前混合状态下，选中顶点没有受到非零形态键影响")
+
+    obj.active_shape_key_index = best_index
+    if module_state is not None:
+        module_state.set("last_result", f"已定位选中顶点影响最大的形态键: {best_key.name}")
+    if panel_api is not None:
+        panel_api.set_status(
+            f"已按编辑模式混合系数定位选中点影响最大的形态键: {best_key.name} (影响 {math.sqrt(best_score):.6g})",
+            level="OK",
+        )
+    return best_key
 
 
 def _validation_shape_keys(item, items):
@@ -5372,11 +5452,17 @@ def _persist_runtime_settings(module, panel_api):
         max(0.1, float(panel_api.get_float("validation_duration_seconds", ANIMATION_DURATION_PER_KEY))),
     )
     for key, default in (
-        ("auto_zero_others", True),
-        ("auto_edit_mode", True),
-        ("auto_open_reference", True),
+        ("auto_focus_shape_key_on_step", True),
+        ("auto_step_validation_sequence", False),
+        ("replace_reference_on_step", False),
     ):
         _set_setting(module, key, bool(panel_api.get_bool(key, default)))
+
+
+def _runtime_bool_option(module, panel_api, key, default=False):
+    if panel_api is None:
+        return bool(_get_setting(module, key, default))
+    return bool(panel_api.get_bool(key, _get_setting(module, key, default)))
 
 
 def _draw_drawer_header(layout, panel_api, key, title, default=False, module_state=None):
@@ -5394,6 +5480,46 @@ def _draw_full_text_block(layout, text, icon="INFO", width=54):
     first = True
     for line in lines:
         col.label(text=line, icon=icon if first else "NONE")
+        first = False
+
+
+def _detail_shape_key_mentions(text, limit=8):
+    known_map = _known_shape_key_map()
+    if not known_map:
+        return []
+    mentions = []
+    seen = set()
+    for raw in re.findall(r"\b[A-Za-z][A-Za-z0-9_/-]*\b", str(text or "")):
+        normalized = _normalize_shape_key_name(raw)
+        name = known_map.get(normalized)
+        if not name or name in seen:
+            continue
+        mentions.append(name)
+        seen.add(name)
+        if len(mentions) >= int(limit):
+            break
+    return mentions
+
+
+def _detail_text_icon(text, default_icon="INFO"):
+    value = str(text or "")
+    if "+" in value or "＋" in value or "混合" in value or "叠加" in value:
+        return "MOD_MESHDEFORM"
+    if _detail_shape_key_mentions(value, limit=1):
+        return "SHAPEKEY_DATA"
+    if any(token in value for token in ("注意", "不要", "不能", "不应", "避免", "破坏", "穿插", "埋住", "消失")):
+        return "LIGHT"
+    return default_icon
+
+
+def _draw_detail_text_block(layout, text, width=54):
+    lines = _cached_wrap_lines(text, width)
+    if not lines:
+        return
+    col = layout.column(align=True)
+    first = True
+    for line in lines:
+        col.label(text=line, icon=_detail_text_icon(line) if first else "NONE")
         first = False
 
 
@@ -5419,12 +5545,51 @@ def _detail_lines(item):
         if text and text not in lines:
             lines.append(text)
     detail_text = str(item.get("detail_ja_zh") or item.get("detail_ja") or "").strip()
-    if detail_text and detail_text not in lines:
-        lines.append(detail_text)
+    for text in _split_detail_text_lines(detail_text):
+        if text and text not in lines:
+            lines.append(text)
     if key:
         cache[key] = tuple(lines)
         _trim_small_cache(cache, 256)
     return lines
+
+
+def _split_detail_text_lines(text):
+    text = re.sub(r"\s+", " ", str(text or "").strip())
+    if not text:
+        return []
+    if len(text) <= 58:
+        return [text]
+    replacements = {}
+    protected = text
+    for index, match in enumerate(re.finditer(r"（([^）]{1,48})）", text)):
+        token = f"@@PAREN{index}@@"
+        replacements[token] = match.group(0)
+        protected = protected.replace(match.group(0), token, 1)
+    parts = []
+    current = ""
+    for chunk in re.split(r"(?<=[。；;])", protected):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        candidate = (current + chunk).strip()
+        if current and len(candidate) > 72:
+            parts.append(current)
+            current = chunk
+        else:
+            current = candidate
+    if current:
+        parts.append(current)
+    if len(parts) <= 1:
+        parts = [part.strip() for part in re.split(r"(?<=[，,])", protected) if part.strip()]
+    restored = []
+    for part in parts:
+        for token, original in replacements.items():
+            part = part.replace(token, original)
+        part = part.strip()
+        if part:
+            restored.append(part)
+    return restored or [text]
 
 
 def _has_detail_hint(item):
@@ -5462,6 +5627,51 @@ def _open_reference_window(item, panel_api, module_state, step_index, total_step
     if module_state is not None and payload["media_files"]:
         module_state.set("last_reference_image", payload["media_files"][payload["media_index"]])
     return payload
+
+
+def _close_all_reference_windows():
+    closed = 0
+    pids = set(_REFERENCE_VIEWER_PIDS)
+    for viewer_kind in ("main", "detail"):
+        try:
+            base_file = _viewer_files(viewer_kind)["viewer_state_file"]
+            folder = os.path.dirname(base_file)
+            stem = os.path.splitext(os.path.basename(base_file))[0]
+            for name in os.listdir(folder):
+                if not name.startswith(stem + ".") or not name.endswith(".pid"):
+                    continue
+                try:
+                    with open(os.path.join(folder, name), "r", encoding="utf-8") as handle:
+                        value = int((handle.read() or "").strip() or "0")
+                    if value > 0:
+                        pids.add(value)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    for pid in pids:
+        try:
+            if int(pid) > 0 and os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                closed += 1
+        except Exception:
+            pass
+        finally:
+            _REFERENCE_VIEWER_PIDS.discard(pid)
+    return closed
+
+
+def _replace_reference_window_for_step(item, panel_api, module_state, step_index, total_steps, module):
+    if not _runtime_bool_option(module, panel_api, "replace_reference_on_step", False):
+        return False
+    _close_all_reference_windows()
+    _open_reference_window(item, panel_api, module_state, step_index, total_steps)
+    return True
 
 
 def _open_detail_reference_window(item, panel_api, module_state, step_index, total_steps):
@@ -6379,9 +6589,9 @@ def draw_panel(layout, context, scene, workflow, module, panel_api, module_state
         if _draw_drawer_header(box, panel_api, "detail", "\u8865\u5145\u8bf4\u660e", default=False, module_state=module_state):
             detail_lines = _detail_lines(item)
             detail_media_files = _detail_media_files(item)
-            detail_box = panel_api.section(box, "\u8865\u5145\u8bf4\u660e", icon="BOOKMARKS")
+            detail_box = panel_api.section(box, "\u8865\u5145\u5236\u4f5c\u8981\u70b9", icon="BOOKMARKS")
             for detail_line in detail_lines:
-                _draw_full_text_block(detail_box, detail_line, icon="INFO", width=wrap_width)
+                _draw_detail_text_block(detail_box, detail_line, width=wrap_width)
             if detail_media_files:
                 preview_path = _draw_detail_preview(detail_box, item, panel_api)
                 if preview_path:
@@ -6393,7 +6603,17 @@ def draw_panel(layout, context, scene, workflow, module, panel_api, module_state
             for line in mix_lines:
                 _draw_full_text_block(mix_box, line, icon="INFO", width=wrap_width)
     actions = panel_api.row(box, align=True)
-    panel_api.draw_button(actions, "FOCUS_SHAPE_KEY", "\u5b9a\u4f4d\u540c\u540d\u5f62\u6001\u952e", icon="RESTRICT_SELECT_OFF")
+    locate_row = actions.row(align=True)
+    try:
+        current_obj = getattr(context, "object", None)
+        locate_row.enabled = bool(
+            current_obj is not None
+            and getattr(current_obj, "type", "") == "MESH"
+            and getattr(current_obj, "mode", "") == "EDIT"
+        )
+    except Exception:
+        locate_row.enabled = False
+    panel_api.draw_button(locate_row, "FOCUS_SELECTED_INFLUENCE", "定位混合最大影响键", icon="RESTRICT_SELECT_OFF")
     panel_api.draw_button(actions, "APPLY_VALIDATION_ONE", "\u9a8c\u8bc1\u952e\u8bbe\u4e3a1", icon="PLAY")
     panel_api.draw_button(actions, "APPLY_VALIDATION_SEQUENCE", "\u9a8c\u8bc1\u952e\u9012\u589e", icon="IPO_EASE_IN_OUT")
     panel_api.draw_button(actions, "RESET_ALL", "\u91cd\u7f6e\u5168\u90e8\u5f62\u6001\u952e", icon="LOOP_BACK")
@@ -6405,16 +6625,17 @@ def draw_panel(layout, context, scene, workflow, module, panel_api, module_state
         source_row = panel_api.row(settings, align=True)
         source_op = source_row.operator("wm.url_open", text="\u53c2\u8003\u6e90", icon="URL")
         source_op.url = "https://hinzka.hatenablog.com/entry/2020/06/15/072929"
-        panel_api.draw_float_input(settings, "validation_duration_seconds", "\u9a8c\u8bc1\u952e\u9012\u589e\u79d2\u6570", default=_get_setting(module, "validation_duration_seconds", ANIMATION_DURATION_PER_KEY))
-        panel_api.draw_toggle(settings, "auto_zero_others", "\u5207\u6362\u6b65\u9aa4\u65f6\u6e05\u96f6\u5176\u4ed6\u53c2\u8003\u952e", default=True)
-        panel_api.draw_toggle(settings, "auto_edit_mode", "\u5e94\u7528\u540e\u81ea\u52a8\u8fdb\u5165\u7f16\u8f91\u6a21\u5f0f", default=True)
-        panel_api.draw_toggle(settings, "auto_open_reference", "\u5e94\u7528\u540e\u81ea\u52a8\u6253\u5f00\u7f6e\u9876\u53c2\u8003\u56fe", default=True)
+        panel_api.draw_float_input(settings, "validation_duration_seconds", "\u9012\u589e\u9a8c\u8bc1\u6bcf\u6b65\u65f6\u957f(\u79d2)", default=_get_setting(module, "validation_duration_seconds", ANIMATION_DURATION_PER_KEY))
+        panel_api.draw_toggle(settings, "auto_focus_shape_key_on_step", "\u70b9\u4e0a/\u4e0b\u4e00\u6b65\u65f6\u81ea\u52a8\u5b9a\u4f4d\u5bf9\u5e94\u5f62\u6001\u952e", default=True)
+        panel_api.draw_toggle(settings, "auto_step_validation_sequence", "\u70b9\u4e0a/\u4e0b\u4e00\u6b65\u65f6\u81ea\u52a8\u64ad\u653e\u9012\u589e\u9a8c\u8bc1", default=False)
+        panel_api.draw_toggle(settings, "replace_reference_on_step", "\u5207\u6362\u6b65\u9aa4\u65f6\u66ff\u6362\u7f6e\u9876\u53c2\u8003\u56fe", default=False)
         panel_api.label(settings, "\u5f53\u524d\u5de5\u4f5c\u6d41\u53ea\u4f7f\u7528\u72ec\u7acb\u7f6e\u9876\u53c2\u8003\u7a97\uff0c\u4e0d\u518d\u56de\u9000\u5230 Blender \u5185\u90e8\u53c2\u8003\u7a97\u3002", icon="INFO")
+        panel_api.label(settings, "\u7ef4\u62a4\u5de5\u5177", icon="TOOL_SETTINGS")
         tools = panel_api.row(settings, align=True)
-        panel_api.draw_button(tools, "CLEAR_REFERENCE_CACHE", "\u6e05\u7406GIF\u53c2\u8003\u7f13\u5b58", icon="TRASH")
-        panel_api.draw_button(tools, "CLEAR_PANEL_PREVIEW_CACHE", "\u6e05\u7406\u9762\u677f\u9884\u89c8\u7f13\u5b58", icon="TRASH")
-        panel_api.draw_button(tools, "EXPORT_PERF_LOG", "\u5bfc\u51fa\u6027\u80fd\u65e5\u5fd7", icon="EXPORT")
-        panel_api.draw_button(tools, "RESET_PERF_LOG", "\u6e05\u7a7a\u6027\u80fd\u7edf\u8ba1", icon="LOOP_BACK")
+        panel_api.draw_button(tools, "CLEAR_REFERENCE_CACHE", "\u6e05\u7406\u7f6e\u9876\u53c2\u8003\u7f13\u5b58", icon="TRASH")
+        panel_api.draw_button(tools, "CLEAR_PANEL_PREVIEW_CACHE", "\u6e05\u7406\u9762\u677f\u56fe\u7247\u7f13\u5b58", icon="TRASH")
+        panel_api.draw_button(tools, "EXPORT_PERF_LOG", "\u5bfc\u51fa\u8bca\u65ad\u65e5\u5fd7", icon="EXPORT")
+        panel_api.draw_button(tools, "RESET_PERF_LOG", "\u91cd\u7f6e\u8bca\u65ad\u7edf\u8ba1", icon="LOOP_BACK")
         perf_open = _draw_drawer_header(settings, panel_api, "perf", "\u6027\u80fd\u8bca\u65ad", default=False, module_state=module_state)
         if perf_open:
             perf_box = panel_api.section(settings, "\u6027\u80fd\u8bca\u65ad", icon="TIME")
@@ -6464,47 +6685,11 @@ def _launch_reference_viewer(payload, viewer_kind="main"):
     viewer_files = _unique_viewer_files(viewer_kind)
     viewer_script_file = viewer_files["viewer_script_file"]
     viewer_state_file = viewer_files["viewer_state_file"]
-    viewer_pid_file = viewer_files["viewer_pid_file"]
     viewer_log_file = viewer_files["viewer_log_file"]
     if not os.path.isfile(viewer_script_file):
         raise Exception("\u7f3a\u5c11 ARKit \u53c2\u8003\u7a97\u811a\u672c")
     with open(viewer_state_file, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
-
-    def _viewer_pid_alive(pid):
-        if int(pid or 0) <= 0:
-            return False
-        if os.name == "nt":
-            try:
-                import ctypes
-                process_handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))
-                if process_handle:
-                    ctypes.windll.kernel32.CloseHandle(process_handle)
-                    return True
-            except Exception:
-                return False
-            return False
-        try:
-            os.kill(int(pid), 0)
-            return True
-        except Exception:
-            return False
-
-    def _read_viewer_pid():
-        if not os.path.isfile(viewer_pid_file):
-            return 0
-        try:
-            with open(viewer_pid_file, "r", encoding="utf-8") as handle:
-                return int((handle.read() or "").strip() or "0")
-        except Exception:
-            return 0
-
-    stale_pid = _read_viewer_pid()
-    if stale_pid and not _viewer_pid_alive(stale_pid):
-        try:
-            os.remove(viewer_pid_file)
-        except Exception:
-            pass
 
     command = ["powershell.exe", "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File", viewer_script_file, viewer_state_file]
     try:
@@ -6515,26 +6700,8 @@ def _launch_reference_viewer(payload, viewer_kind="main"):
             process = subprocess.Popen(command, **kwargs)
     except Exception as exc:
         raise Exception(f"\u542f\u52a8\u7f6e\u9876\u53c2\u8003\u7a97\u5931\u8d25: {exc}")
-    deadline = time.time() + 2.0
-    while time.time() < deadline:
-        ready_pid = _read_viewer_pid()
-        if ready_pid and _viewer_pid_alive(ready_pid):
-            return
-        if process.poll() is not None:
-            break
-        time.sleep(0.05)
-    if process.poll() is None:
-        return
-    message = "\u542f\u52a8\u7f6e\u9876\u53c2\u8003\u7a97\u5931\u8d25"
-    try:
-        if os.path.isfile(viewer_log_file):
-            with open(viewer_log_file, "r", encoding="utf-8", errors="replace") as handle:
-                lines = [line.strip() for line in handle.readlines() if line.strip()]
-            if lines:
-                message = f"{message}: {lines[-1]}"
-    except Exception:
-        pass
-    raise Exception(message)
+    _REFERENCE_VIEWER_PIDS.add(int(process.pid))
+    return process
 
 
 
@@ -6554,13 +6721,22 @@ def on_panel_action(action, context, scene, workflow, module, panel_api, module_
 
     _payload, items, item, index, _media_index_value = _current_item(panel_api, module_state)
     if action == "PREV":
-        _set_step_and_focus(context, scene, workflow, module, panel_api, module_state, items, index - 1)
+        item, index = _set_step_and_focus(context, scene, workflow, module, panel_api, module_state, items, index - 1)
+        _replace_reference_window_for_step(item, panel_api, module_state, index, len(items), module)
+        if _runtime_bool_option(module, panel_api, "auto_step_validation_sequence", False):
+            _start_validation_animation(context, scene, workflow, module, panel_api, module_state, item, items)
         return {"FINISHED"}
     if action == "NEXT":
-        _set_step_and_focus(context, scene, workflow, module, panel_api, module_state, items, index + 1)
+        item, index = _set_step_and_focus(context, scene, workflow, module, panel_api, module_state, items, index + 1)
+        _replace_reference_window_for_step(item, panel_api, module_state, index, len(items), module)
+        if _runtime_bool_option(module, panel_api, "auto_step_validation_sequence", False):
+            _start_validation_animation(context, scene, workflow, module, panel_api, module_state, item, items)
         return {"FINISHED"}
     if action == "FOCUS_SHAPE_KEY":
         _focus_current_shape_key(context, panel_api, module_state, item)
+        return {"FINISHED"}
+    if action == "FOCUS_SELECTED_INFLUENCE":
+        _focus_shape_key_with_max_selected_influence(context, panel_api, module_state)
         return {"FINISHED"}
     if action == "PREV_MEDIA":
         current_index, total = _change_media_index(panel_api, item, -1)

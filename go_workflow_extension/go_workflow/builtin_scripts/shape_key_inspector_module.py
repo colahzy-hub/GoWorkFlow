@@ -476,7 +476,7 @@ def draw_panel(layout, context, scene, workflow, module, panel_api, module_state
         panel_api.label(current_box, "请选择目标物体", icon="INFO")
     current_actions = panel_api.row(current_box, align=True)
     panel_api.draw_button(current_actions, "SELECT_DIFF_ACTIVE", "显示差异顶点", icon="VERTEXSEL")
-    panel_api.draw_toggle_inline(current_box, "realtime_diff_enabled", "实时检查差异点", default=False, factor=0.24)
+    panel_api.draw_toggle(current_box, "realtime_diff_enabled", "实时检查差异点", default=False)
     if _realtime_enabled(panel_api, module_state):
         panel_api.label(current_box, "实时模式已开启：在编辑模式切换活动形态键时会自动刷新差异顶点。", icon="CHECKMARK")
     active_summary = str(module_state.get("active_summary", "") or "") if module_state is not None else ""

@@ -23,7 +23,7 @@
       "__TARGET_SET__": "VRM_BASIC",
       "__PROFILE__": "CONSERVATIVE"
     },
-    "ai_doc": "Go Workflow 模块。用途：把 ARKit / Perfect Sync 源形态键按预设混合规则合成为目标形态键。输入要求：目标网格需要已经存在可用的 ARKit 源键；目标输出可选择 VRM 基础集或 MMD 局部集。面板能力：切换目标集、切换混合策略、导入或导出 csv/txt 混合表、把混合表存进模块配置并随 .goworkflow 一起保存。运行结果：根据当前混合表对目标键进行创建或覆盖。适用场景：从一套 ARKit 形态快速推导出 VRM/MMD 目标键，或维护项目自己的混合系数表。"
+    "ai_doc": "Go Workflow 模块。用途：把 ARKit / Perfect Sync 源形态键按预设混合规则合成为目标形态键。输入要求：目标网格需要已经存在可用的 ARKit 源键；目标输出可选择 VRM 基础集或 MMD 扩展常用集。面板能力：切换目标集、切换混合策略、导入或导出 csv/txt 混合表、把混合表存进模块配置并随 .goworkflow 一起保存。运行结果：根据当前混合表对目标键进行创建或覆盖。适用场景：从一套 ARKit 形态快速推导出 VRM/MMD 目标键，或维护项目自己的混合系数表。"
   },
   {
     "name": "形态键鉴定",

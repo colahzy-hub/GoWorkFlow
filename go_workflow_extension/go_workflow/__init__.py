@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Go工作流 / Go Workflow",
     "author": "OpenAI Codex",
-    "version": (0, 9, 20),
+    "version": (0, 9, 41),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Go工作流",
     "description": "基于工作流的 N 面板筛选与自定义脚本模块工具 / Workflow panel filter and script module manager",
@@ -9,7 +9,7 @@ bl_info = {
 }
 
 # AI定位：插件升版本时同步更新这里的 bl_info["version"]、__version__ 和 blender_manifest.toml。
-__version__ = (0, 9, 20)
+__version__ = (0, 9, 41)
 
 import json
 import csv
@@ -170,6 +170,8 @@ MODULE_RUNTIME_NAMESPACE_CACHE = {}
 MODULE_SOURCE_TEXT_CACHE = {}
 MODULE_RUNTIME_FIELD_INIT_CACHE = {}
 MODULE_RUNTIME_VOLATILE_STORE = {}
+MODULE_RUNTIME_FIELD_SYNC_QUEUE = {}
+MODULE_RUNTIME_FIELD_SYNC_TIMER_ACTIVE = False
 CACHED_MODULE_STATE_PROXY_CLASS = None
 CACHED_MODULE_PANEL_API_CLASS = None
 BUILTIN_DEFAULT_PANEL_PREFIXES = (
@@ -7080,6 +7082,10 @@ def module_runtime_specs_key(workflow, module):
     )
 
 
+def is_blender_id_write_context_error(exc):
+    return "Writing to ID classes in this context is not allowed" in str(exc or "")
+
+
 def normalize_module_field_default(kind, default):
     kind = str(kind or "text")
     if kind == "bool":
@@ -7132,7 +7138,7 @@ def save_module_runtime_store(scene, workflow, module, module_store):
 
 def save_module_runtime_specs(scene, workflow, module, field_specs):
     if scene is None:
-        return
+        return False
     specs_key = module_runtime_specs_key(workflow, module)
     saved = []
     seen = set()
@@ -7154,7 +7160,13 @@ def save_module_runtime_specs(scene, workflow, module, field_specs):
                 "legacy_prop_key": module_scene_prop_key_legacy(workflow, module, key, kind=kind),
             }
         )
-    scene[specs_key] = saved
+    try:
+        scene[specs_key] = saved
+    except RuntimeError as exc:
+        if is_blender_id_write_context_error(exc):
+            return False
+        raise
+    return True
 
 
 def ensure_module_runtime_scene_defaults(scene, workflow, module, field_specs):
@@ -7242,10 +7254,110 @@ def sync_module_runtime_field_specs(scene, workflow, module, field_specs):
     field_specs = list(field_specs or [])
     if scene is None or workflow is None or module is None or not field_specs:
         return False
-    save_module_runtime_specs(scene, workflow, module, field_specs)
+    if not save_module_runtime_specs(scene, workflow, module, field_specs):
+        queue_module_runtime_field_specs_sync(scene, workflow, module, field_specs)
+        return False
     changed = migrate_module_runtime_scene_values(scene, workflow, module, field_specs)
     changed = ensure_module_runtime_scene_defaults(scene, workflow, module, field_specs) or changed
     return changed
+
+
+def queue_module_runtime_field_specs_sync(scene, workflow, module, field_specs):
+    field_specs = list(field_specs or [])
+    if scene is None or workflow is None or module is None or not field_specs:
+        return False
+    cache_key = module_runtime_cleanup_cache_key(scene, workflow, module)
+    queued = MODULE_RUNTIME_FIELD_SYNC_QUEUE.get(cache_key)
+    if not isinstance(queued, dict):
+        queued = {
+            "scene_pointer": cache_key[0],
+            "workflow_name": getattr(workflow, "name", ""),
+            "module_name": getattr(module, "name", ""),
+            "field_specs": [],
+        }
+        MODULE_RUNTIME_FIELD_SYNC_QUEUE[cache_key] = queued
+    queued_specs = queued.setdefault("field_specs", [])
+    seen = {
+        (str(spec.get("key", "")).strip(), str(spec.get("kind", "text")).strip() or "text")
+        for spec in queued_specs
+        if isinstance(spec, dict)
+    }
+    for spec in field_specs:
+        if not isinstance(spec, dict):
+            continue
+        key = str(spec.get("key", "")).strip()
+        kind = str(spec.get("kind", "text")).strip() or "text"
+        if not key or (key, kind) in seen:
+            continue
+        seen.add((key, kind))
+        queued_specs.append(dict(spec))
+    schedule_module_runtime_field_specs_sync()
+    return True
+
+
+def resolve_module_runtime_sync_target(payload):
+    scene_pointer = str((payload or {}).get("scene_pointer", ""))
+    workflow_name = str((payload or {}).get("workflow_name", ""))
+    module_name = str((payload or {}).get("module_name", ""))
+    for scene in iter_available_scenes():
+        try:
+            if str(scene.as_pointer()) != scene_pointer:
+                continue
+        except Exception:
+            continue
+        for space_type in iter_supported_space_types():
+            state = get_state(scene=scene, space_type=space_type)
+            if state is None:
+                continue
+            for workflow in getattr(state, "workflows", ()):
+                if getattr(workflow, "name", "") != workflow_name:
+                    continue
+                for module in getattr(workflow, "modules", ()):
+                    if getattr(module, "name", "") == module_name:
+                        return scene, workflow, module
+    return None, None, None
+
+
+def drain_module_runtime_field_specs_sync_queue():
+    global MODULE_RUNTIME_FIELD_SYNC_TIMER_ACTIVE
+    MODULE_RUNTIME_FIELD_SYNC_TIMER_ACTIVE = False
+    pending = list(MODULE_RUNTIME_FIELD_SYNC_QUEUE.items())
+    MODULE_RUNTIME_FIELD_SYNC_QUEUE.clear()
+    changed = False
+    retry = False
+    for cache_key, payload in pending:
+        scene, workflow, module = resolve_module_runtime_sync_target(payload)
+        field_specs = payload.get("field_specs", []) if isinstance(payload, dict) else []
+        if scene is None or workflow is None or module is None:
+            continue
+        try:
+            changed = sync_module_runtime_field_specs(scene, workflow, module, field_specs) or changed
+        except RuntimeError as exc:
+            if "Writing to ID classes in this context is not allowed" in str(exc):
+                MODULE_RUNTIME_FIELD_SYNC_QUEUE[cache_key] = payload
+                retry = True
+                continue
+            traceback.print_exc()
+        except Exception:
+            traceback.print_exc()
+    if changed:
+        tag_redraw_all()
+    if retry or MODULE_RUNTIME_FIELD_SYNC_QUEUE:
+        schedule_module_runtime_field_specs_sync(first_interval=0.25)
+    return None
+
+
+def schedule_module_runtime_field_specs_sync(first_interval=0.1):
+    global MODULE_RUNTIME_FIELD_SYNC_TIMER_ACTIVE
+    if MODULE_RUNTIME_FIELD_SYNC_TIMER_ACTIVE:
+        return False
+    MODULE_RUNTIME_FIELD_SYNC_TIMER_ACTIVE = True
+    try:
+        _register_one_shot_timer(drain_module_runtime_field_specs_sync_queue, first_interval=first_interval)
+        return True
+    except Exception:
+        MODULE_RUNTIME_FIELD_SYNC_TIMER_ACTIVE = False
+        return False
 
 
 def module_runtime_field_scene_value(scene, workflow, module, key, kind, default=None):
@@ -8749,11 +8861,14 @@ def store_module_namespace(scene, workflow, module, name, source_signature, name
 
 
 def clear_cached_module_namespaces(scene=None, workflow=None, module=None):
+    global MODULE_RUNTIME_FIELD_SYNC_TIMER_ACTIVE
     if scene is None and workflow is None and module is None:
         MODULE_RUNTIME_NAMESPACE_CACHE.clear()
         MODULE_SOURCE_TEXT_CACHE.clear()
         MODULE_RUNTIME_FIELD_INIT_CACHE.clear()
         MODULE_RUNTIME_VOLATILE_STORE.clear()
+        MODULE_RUNTIME_FIELD_SYNC_QUEUE.clear()
+        MODULE_RUNTIME_FIELD_SYNC_TIMER_ACTIVE = False
         return 0
     target_prefix = module_runtime_cleanup_cache_key(scene, workflow, module)
     removed = 0
@@ -8771,6 +8886,11 @@ def clear_cached_module_namespaces(scene=None, workflow=None, module=None):
         if tuple(key[:3]) != tuple(target_prefix):
             continue
         MODULE_RUNTIME_VOLATILE_STORE.pop(key, None)
+        removed += 1
+    for key in list(MODULE_RUNTIME_FIELD_SYNC_QUEUE.keys()):
+        if tuple(key[:3]) != tuple(target_prefix):
+            continue
+        MODULE_RUNTIME_FIELD_SYNC_QUEUE.pop(key, None)
         removed += 1
     return removed
 
@@ -9225,7 +9345,7 @@ def module_needs_runtime_panel(module):
     return bool(module.use_custom_panel)
 
 
-def initialize_module_runtime_fields(scene, workflow, module, context=None, source_token=None):
+def initialize_module_runtime_fields(scene, workflow, module, context=None, source_token=None, defer_sync=False):
     if scene is None or workflow is None or module is None:
         return False
 
@@ -9237,6 +9357,8 @@ def initialize_module_runtime_fields(scene, workflow, module, context=None, sour
         cached_specs = cached.get("field_specs")
         if not cached_specs:
             cached_specs = load_module_runtime_specs(scene, workflow, module)
+        if defer_sync:
+            return queue_module_runtime_field_specs_sync(scene, workflow, module, cached_specs)
         return sync_module_runtime_field_specs(scene, workflow, module, cached_specs)
 
     source, source_signature = get_cached_module_source(module, "__go_workflow_init__")
@@ -9265,7 +9387,10 @@ def initialize_module_runtime_fields(scene, workflow, module, context=None, sour
         return False
     MODULE_RUNTIME_NAMESPACE_CACHE.pop(module_runtime_namespace_cache_key(scene, workflow, module, "__go_workflow_init__"), None)
 
-    changed = sync_module_runtime_field_specs(scene, workflow, module, field_specs)
+    if defer_sync:
+        changed = queue_module_runtime_field_specs_sync(scene, workflow, module, field_specs)
+    else:
+        changed = sync_module_runtime_field_specs(scene, workflow, module, field_specs)
     MODULE_RUNTIME_FIELD_INIT_CACHE[cache_key] = {
         "source_signature": source_signature,
         "source_token": source_token,
@@ -9574,7 +9699,14 @@ def draw_module_runtime_panel(card, context, workflow, module):
         # 原生 layout.prop(...) 依赖 scene 上已经存在对应的运行时字段。
         # 面板绘制阶段仍保持模块自身 allow_writes=False，但先由宿主补齐字段初始化。
         try:
-            initialize_module_runtime_fields(context.scene, workflow, module, context=context, source_token=source_token)
+            initialize_module_runtime_fields(
+                context.scene,
+                workflow,
+                module,
+                context=context,
+                source_token=source_token,
+                defer_sync=True,
+            )
         except Exception:
             pass
         result = load_module_namespace(context, context.scene, workflow, module, "__go_workflow_panel__", source_token=source_token)
@@ -9595,7 +9727,7 @@ def draw_module_runtime_panel(card, context, workflow, module):
             else:
                 draw_fn(card, context, context.scene, workflow, module)
             if panel_api is not None:
-                sync_module_runtime_field_specs(
+                queue_module_runtime_field_specs_sync(
                     context.scene,
                     workflow,
                     module,
@@ -14348,7 +14480,7 @@ def register():
 
 
 def unregister():
-    global LOAD_HANDLER_REGISTERED
+    global LOAD_HANDLER_REGISTERED, MODULE_RUNTIME_FIELD_SYNC_TIMER_ACTIVE
 
     try:
         quarantine_broken_panel_polls()
@@ -14427,6 +14559,8 @@ def unregister():
     MODULE_SOURCE_TEXT_CACHE.clear()
     MODULE_RUNTIME_FIELD_INIT_CACHE.clear()
     MODULE_RUNTIME_VOLATILE_STORE.clear()
+    MODULE_RUNTIME_FIELD_SYNC_QUEUE.clear()
+    MODULE_RUNTIME_FIELD_SYNC_TIMER_ACTIVE = False
     BUILTIN_SCRIPT_LIBRARY_PAYLOAD_CACHE["signature"] = None
     BUILTIN_SCRIPT_LIBRARY_PAYLOAD_CACHE["payloads"] = []
     MODULE_RUNTIME_CLEANUP_CACHE.clear()

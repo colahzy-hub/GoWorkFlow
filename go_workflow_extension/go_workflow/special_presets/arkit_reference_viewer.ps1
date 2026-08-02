@@ -508,9 +508,10 @@ $form.Add_Shown({
     try {
         [System.IO.File]::WriteAllText($PidFile, [System.Diagnostics.Process]::GetCurrentProcess().Id.ToString(), [System.Text.Encoding]::UTF8)
     } catch {}
-    Invoke-ViewerUpdate -Force $true
     $timer.Start()
-    $preloadTimer.Start()
+    $form.BeginInvoke([System.Windows.Forms.MethodInvoker]{
+        Invoke-ViewerUpdate -Force $true
+    }) | Out-Null
 })
 
 $form.Add_FormClosed({
