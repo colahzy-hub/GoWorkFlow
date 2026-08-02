@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Go工作流 / Go Workflow",
     "author": "OpenAI Codex",
-    "version": (1, 0, 1),
+    "version": (1, 0, 2),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Go工作流",
     "description": "基于工作流的 N 面板筛选与自定义脚本模块工具 / Workflow panel filter and script module manager",
@@ -9,7 +9,7 @@ bl_info = {
 }
 
 # AI定位：插件升版本时同步更新这里的 bl_info["version"]、__version__ 和 blender_manifest.toml。
-__version__ = (1, 0, 1)
+__version__ = (1, 0, 2)
 
 import json
 import csv
@@ -12674,7 +12674,7 @@ class BWFLOW_OT_workflow_dismiss_missing_warning(Operator):
 class BWFLOW_OT_clear_missing_panel_warnings(Operator):
     bl_idname = "bworkflow.clear_missing_panel_warnings"
     bl_label = "清除缺失面板提示"
-    bl_description = "清除当前场景所有编辑器空间和工作流的缺失面板提示状态"
+    bl_description = "从当前场景所有工作流中移除当前环境找不到的面板记录"
 
     @classmethod
     def poll(cls, context):
@@ -12684,7 +12684,8 @@ class BWFLOW_OT_clear_missing_panel_warnings(Operator):
         scene = getattr(context, "scene", None) or safe_context_scene()
         if scene is None:
             return {"CANCELLED"}
-        changed = 0
+        removed = 0
+        changed_states = set()
         for space_type in iter_supported_space_types():
             state = get_state(scene=scene, space_type=space_type)
             if state is None:
@@ -12692,15 +12693,35 @@ class BWFLOW_OT_clear_missing_panel_warnings(Operator):
             for workflow in getattr(state, "workflows", []):
                 if workflow.is_default:
                     continue
-                if not bool(getattr(workflow, "missing_warning_dismissed", False)):
-                    changed += 1
-                    workflow.missing_warning_dismissed = True
+                missing_ids = set(workflow_missing_panel_ids(state, workflow))
+                if missing_ids:
+                    kept_ids = [
+                        item.panel_id
+                        for item in workflow.panels
+                        if item.panel_id not in missing_ids
+                    ]
+                    removed += len(workflow.panels) - len(kept_ids)
+                    replace_workflow_panels(workflow, kept_ids)
+                    changed_states.add(space_type)
+                workflow.missing_warning_dismissed = False
+                cache_key = imported_workflow_match_cache_key(state, workflow)
+                matches = IMPORTED_WORKFLOW_PANEL_MATCH_CACHE.get(cache_key)
+                if isinstance(matches, list):
+                    IMPORTED_WORKFLOW_PANEL_MATCH_CACHE[cache_key] = [
+                        payload
+                        for payload in matches
+                        if payload.get("panel_id", "") not in missing_ids
+                    ]
+                IMPORTED_WORKFLOW_MISSING_MATCH_CACHE.pop(cache_key, None)
             clear_space_prefixed_cache(WORKFLOW_MISSING_PANEL_IDS_CACHE_BY_SPACE, space_type)
             clear_space_prefixed_cache(WORKFLOW_MISSING_RECORDS_CACHE_BY_SPACE, space_type)
-        if changed:
+        for space_type in changed_states:
+            state = get_state(scene=scene, space_type=space_type)
+            mark_panel_visibility_pending(state, scene=scene)
+        if removed or changed_states:
             save_global_workflow_state(scene)
             tag_redraw_all()
-        self.report({"INFO"}, f"已清除 {changed} 个工作流的缺失面板提示")
+        self.report({"INFO"}, f"已移除 {removed} 条缺失面板记录")
         return {"FINISHED"}
 
 
@@ -14408,7 +14429,7 @@ OPERATOR_TOOLTIP_OVERRIDES = {
     "bworkflow.panel_clear_workflow": "清除当前工作流的面板选择，不删除第三方插件面板。",
     "bworkflow.panel_remove_missing_from_workflow": "从当前工作流中移除当前环境无法找到的面板记录。",
     "bworkflow.workflow_dismiss_missing_warning": "仅隐藏当前工作流的缺失面板提示，不删除缺失面板记录。",
-    "bworkflow.clear_missing_panel_warnings": "清除当前场景所有编辑器和工作流的缺失面板提示状态。",
+    "bworkflow.clear_missing_panel_warnings": "从当前场景所有工作流中移除当前环境找不到的面板记录，不只是隐藏提示。",
     "bworkflow.panel_apply_workflow_order": "将当前面板选择和排序一次性应用到 Blender N 面板。",
     "bworkflow.panel_reset_workflow_order": "按当前扫描结果重建当前工作流的面板组顺序。",
     "bworkflow.panel_jump_in_workflow": "将当前选中的面板组移动到列表顶部或底部。",
