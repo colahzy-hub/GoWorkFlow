@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 使用与安装文档
+    url: https://github.com/colahzy-hub/GoWorkFlow/blob/main/INSTALL.md
+    about: 提交问题前先确认安装方式、升级步骤和预设迁移要求
+  - name: 排错指南
+    url: https://github.com/colahzy-hub/GoWorkFlow/blob/main/docs/TROUBLESHOOTING.md
+    about: 先按日志、预设导入和 Blender 兼容性章节排查
