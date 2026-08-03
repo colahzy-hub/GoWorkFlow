@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Go工作流 / Go Workflow",
     "author": "OpenAI Codex",
-    "version": (1, 0, 2),
+    "version": (1, 0, 8),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Go工作流",
     "description": "基于工作流的 N 面板筛选与自定义脚本模块工具 / Workflow panel filter and script module manager",
@@ -9,7 +9,7 @@ bl_info = {
 }
 
 # AI定位：插件升版本时同步更新这里的 bl_info["version"]、__version__ 和 blender_manifest.toml。
-__version__ = (1, 0, 2)
+__version__ = (1, 0, 8)
 
 import json
 import csv
@@ -76,8 +76,10 @@ WORKFLOW_SWITCHER_COLUMNS = 4
 AI_DOC_LEGACY_MAX_CHARS = 6200
 AI_DOC_DESCRIPTION_MAX_CHARS = 900
 MAX_RNA_TEXT_CHARS = 256 * 1024
+MAX_RNA_SCRIPT_CHARS = 1024 * 1024
 MAX_RNA_SHORT_TEXT_CHARS = 4096
 MAX_RNA_NAME_CHARS = 512
+MAX_RESTORED_PANEL_TEXT_CHARS = 255
 MAX_PRESET_IMPORT_RNA_TEXT_CHARS = 2048
 UI_LABEL_MAX_CHARS = 56
 UI_BUTTON_MAX_CHARS = 24
@@ -147,6 +149,7 @@ FILE_TEXT_CACHE = {}
 FILE_JSON_CACHE = {}
 IMAGE_PREVIEW_ICON_CACHE = {}
 PRESET_IMPORT_ENTRY_CACHE = {}
+PRESET_IMPORT_ACTIVE_KEYS = set()
 IMPORTED_PRESET_ASSET_PATH_CACHE = {}
 IMPORTED_WORKFLOW_PANEL_MATCH_CACHE = {}
 IMPORTED_WORKFLOW_MISSING_MATCH_CACHE = {}
@@ -646,7 +649,7 @@ def panel_family_title(state, record_or_panel_id):
         record = find_registry_record(state, record_or_panel_id) if state is not None else None
     panel_id = getattr(record, "panel_id", record_or_panel_id if isinstance(record_or_panel_id, str) else "")
     plugin_title = panel_plugin_title(state, panel_id)
-    plugin_key_title = panel_plugin_label_from_key(panel_plugin_key_for_record(record) or panel_plugin_key(panel_id))
+    plugin_key_title = panel_plugin_label_from_key(panel_plugin_key_for_record(record) or infer_plugin_key_from_panel_id(panel_id))
     return panel_family_title_from_candidates([plugin_title, plugin_key_title, getattr(record, "category", ""), getattr(record, "title", ""), panel_id])
 
 
@@ -852,7 +855,7 @@ def get_panel_registry_lookup(state):
         source_module = normalized_panel_match_text(getattr(record, "source_module", ""))
         if source_module:
             records_by_source_module.setdefault(source_module, []).append(record)
-        plugin_key = normalized_panel_match_text(panel_plugin_key_from_module(getattr(record, "source_module", "")) or panel_plugin_key(panel_id))
+        plugin_key = normalized_panel_match_text(panel_plugin_key_for_record(record) or infer_plugin_key_from_panel_id(panel_id))
         if plugin_key:
             records_by_plugin_key.setdefault(plugin_key, []).append(record)
 
@@ -904,14 +907,14 @@ def panel_count_label(count):
 def panel_plugin_title(state, panel_id):
     record = find_registry_record(state, panel_id) if state is not None else None
     source_module = getattr(record, "source_module", "") if record is not None else ""
-    plugin_key = panel_plugin_key_from_module(source_module) or panel_plugin_key(panel_id)
+    plugin_key = panel_plugin_key_from_module(source_module) or infer_plugin_key_from_panel_id(panel_id)
     return panel_plugin_label_from_key(plugin_key)
 
 
 def panel_plugin_key_for_record(record):
     if record is None:
         return ""
-    return panel_plugin_key_from_module(getattr(record, "source_module", "")) or panel_plugin_key(record.panel_id)
+    return panel_plugin_key_from_module(getattr(record, "source_module", "")) or infer_plugin_key_from_panel_id(getattr(record, "panel_id", ""))
 
 
 def panel_parent_id(panel_id, space_type=None):
@@ -1248,12 +1251,12 @@ def dedupe_panel_registry(state):
     clear_collection(state.panel_registry)
     for payload in records:
         item = state.panel_registry.add()
-        item.panel_id = payload["panel_id"]
-        item.title = payload["title"]
-        item.category = payload["category"]
-        item.tags = payload["tags"]
-        item.source_module = payload["source_module"]
-        item.addon_version = payload.get("addon_version", "")
+        safe_set_rna_text(item, "panel_id", payload["panel_id"], max_chars=MAX_RESTORED_PANEL_TEXT_CHARS)
+        safe_set_rna_text(item, "title", payload["title"], max_chars=MAX_RESTORED_PANEL_TEXT_CHARS)
+        safe_set_rna_text(item, "category", payload["category"], max_chars=MAX_RESTORED_PANEL_TEXT_CHARS)
+        safe_set_rna_text(item, "tags", payload["tags"], max_chars=MAX_RESTORED_PANEL_TEXT_CHARS)
+        safe_set_rna_text(item, "source_module", payload["source_module"], max_chars=MAX_RESTORED_PANEL_TEXT_CHARS)
+        safe_set_rna_text(item, "addon_version", payload.get("addon_version", ""), max_chars=32)
         item.discovered = payload["discovered"]
 
     state.panel_registry_index = 0
@@ -1337,29 +1340,35 @@ def dedupe_workflows(state):
     clear_collection(state.workflows)
     for workflow_data in snapshot:
         workflow = state.workflows.add()
-        workflow.name = workflow_data["name"]
+        safe_set_rna_text(
+            workflow,
+            "name",
+            workflow_data["name"],
+            fallback="Imported Workflow",
+            max_chars=MAX_RESTORED_PANEL_TEXT_CHARS,
+        )
         workflow.is_default = workflow_data["is_default"]
-        workflow.description = workflow_data["description"]
-        workflow.tag_filter = workflow_data["tag_filter"]
+        safe_set_rna_text(workflow, "description", workflow_data["description"], max_chars=MAX_RNA_SHORT_TEXT_CHARS)
+        safe_set_rna_text(workflow, "tag_filter", workflow_data["tag_filter"], max_chars=MAX_RNA_SHORT_TEXT_CHARS)
         workflow.missing_warning_dismissed = bool(workflow_data.get("missing_warning_dismissed", False))
         for panel_id in workflow_data["panels"]:
             item = workflow.panels.add()
-            item.panel_id = panel_id
+            safe_set_rna_text(item, "panel_id", panel_id, max_chars=MAX_RESTORED_PANEL_TEXT_CHARS)
         for module_data in workflow_data["modules"]:
             module = workflow.modules.add()
-            module.name = module_data["name"]
+            safe_set_rna_text(module, "name", module_data["name"], fallback="Imported Module", max_chars=MAX_RESTORED_PANEL_TEXT_CHARS)
             module.enabled = module_data["enabled"]
             module.use_custom_panel = module_data["use_custom_panel"]
             module.runtime_panel_expanded = module_data.get("runtime_panel_expanded", not module_prefers_collapsed_runtime_panel(module_data))
             module.runtime_description_expanded = module_data.get("runtime_description_expanded", False)
-            module.panel_title = module_data["panel_title"]
-            module.panel_description = module_data["panel_description"]
-            module.script_path = module_data["script_path"]
-            module.description = module_data["description"]
-            module.text_block_name = module_data["text_block_name"]
-            module.script_source = module_data["script_source"]
-            module.config_payload = module_data.get("config_payload", "")
-            module.ai_doc = module_data["ai_doc"]
+            safe_set_rna_text(module, "panel_title", module_data["panel_title"], max_chars=MAX_RESTORED_PANEL_TEXT_CHARS)
+            safe_set_rna_text(module, "panel_description", module_data["panel_description"], max_chars=MAX_RNA_SHORT_TEXT_CHARS)
+            safe_set_rna_text(module, "script_path", module_data["script_path"], max_chars=MAX_RNA_SHORT_TEXT_CHARS)
+            safe_set_rna_text(module, "description", module_data["description"], max_chars=MAX_RNA_SHORT_TEXT_CHARS)
+            safe_set_rna_text(module, "text_block_name", module_data["text_block_name"], max_chars=MAX_RESTORED_PANEL_TEXT_CHARS)
+            safe_set_rna_text(module, "script_source", module_data["script_source"], max_chars=MAX_RNA_SCRIPT_CHARS)
+            safe_set_rna_text(module, "config_payload", module_data.get("config_payload", ""), max_chars=MAX_RNA_TEXT_CHARS)
+            safe_set_rna_text(module, "ai_doc", module_data["ai_doc"], max_chars=MAX_RNA_TEXT_CHARS)
 
     state.active_workflow_index = 0
     if active_signature:
@@ -1545,6 +1554,30 @@ def coerce_text_value(value, fallback="", max_chars=None):
     return text
 
 
+def coerce_rna_restore_text(value, fallback="", max_chars=MAX_RESTORED_PANEL_TEXT_CHARS):
+    text = coerce_text_value(value, fallback=fallback, max_chars=max_chars)
+    if not text:
+        return text
+    text = "".join(ch for ch in text if ord(ch) <= 0xFFFF and not 0xD800 <= ord(ch) <= 0xDFFF)
+    if max_chars is not None and max_chars >= 0 and len(text) > max_chars:
+        text = text[:max_chars]
+    return text
+
+
+def safe_set_rna_text(item, attr, value, fallback="", max_chars=MAX_RESTORED_PANEL_TEXT_CHARS):
+    text = coerce_rna_restore_text(value, fallback=fallback, max_chars=max_chars)
+    try:
+        setattr(item, attr, text)
+        return True
+    except Exception:
+        traceback.print_exc()
+        try:
+            setattr(item, attr, coerce_rna_restore_text(fallback, max_chars=max_chars))
+        except Exception:
+            traceback.print_exc()
+        return False
+
+
 def coerce_bool_value(value, fallback=False):
     if isinstance(value, bool):
         return value
@@ -1695,7 +1728,10 @@ def sanitize_workflow_payload(workflow_data):
         "description": normalize_workflow_description(coerce_text_value(workflow_data.get("description", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS), ""),
         "tag_filter": coerce_text_value(workflow_data.get("tag_filter", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS),
         "missing_warning_dismissed": coerce_bool_value(workflow_data.get("missing_warning_dismissed", False), False),
-        "panels": unique_panel_ids(coerce_text_value(panel_id, max_chars=MAX_RNA_NAME_CHARS) for panel_id in coerce_list_value(workflow_data.get("panels", []))),
+        "panels": unique_panel_ids(
+            coerce_rna_restore_text(panel_id, max_chars=MAX_RESTORED_PANEL_TEXT_CHARS)
+            for panel_id in coerce_list_value(workflow_data.get("panels", []))
+        ),
         "panel_matches": [
             match_payload
             for match_payload in (sanitize_panel_match_payload(item) for item in coerce_list_value(workflow_data.get("panel_matches", [])))
@@ -1718,16 +1754,16 @@ def sanitize_space_payload(space_payload):
     for record_data in coerce_list_value(space_payload.get("panel_registry", [])):
         if not isinstance(record_data, dict):
             continue
-        panel_id = coerce_text_value(record_data.get("panel_id", ""), max_chars=MAX_RNA_NAME_CHARS).strip()
+        panel_id = coerce_rna_restore_text(record_data.get("panel_id", ""), max_chars=MAX_RESTORED_PANEL_TEXT_CHARS).strip()
         if not panel_id:
             continue
         payload = {
             "panel_id": panel_id,
-            "title": clean_panel_title(coerce_text_value(record_data.get("title", ""), max_chars=MAX_RNA_NAME_CHARS), panel_id),
-            "category": normalize_text_value(coerce_text_value(record_data.get("category", ""), max_chars=MAX_RNA_NAME_CHARS), ""),
-            "tags": coerce_text_value(record_data.get("tags", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS),
-            "source_module": normalize_text_value(coerce_text_value(record_data.get("source_module", ""), max_chars=MAX_RNA_NAME_CHARS), ""),
-            "addon_version": version_tuple_to_text(record_data.get("addon_version", "")),
+            "title": clean_panel_title(coerce_rna_restore_text(record_data.get("title", ""), max_chars=MAX_RESTORED_PANEL_TEXT_CHARS), panel_id),
+            "category": normalize_text_value(coerce_rna_restore_text(record_data.get("category", ""), max_chars=MAX_RESTORED_PANEL_TEXT_CHARS), ""),
+            "tags": coerce_rna_restore_text(record_data.get("tags", ""), max_chars=MAX_RESTORED_PANEL_TEXT_CHARS),
+            "source_module": normalize_text_value(coerce_rna_restore_text(record_data.get("source_module", ""), max_chars=MAX_RESTORED_PANEL_TEXT_CHARS), ""),
+            "addon_version": coerce_rna_restore_text(version_tuple_to_text(record_data.get("addon_version", "")), max_chars=32),
         }
         if panel_id not in record_map:
             record_map[panel_id] = payload
@@ -2044,13 +2080,18 @@ def build_panel_library_groups(state, workflow):
     panel_cache = get_panel_cache(space_type)
     groups = {}
     for index, record in enumerate(registry):
-        if record.panel_id == "BWFLOW_PT_workflow":
+        try:
+            panel_id = getattr(record, "panel_id", "")
+            if panel_id == "BWFLOW_PT_workflow":
+                continue
+            if is_builtin_default_panel_record(record):
+                continue
+            family_title = panel_family_title(state, record)
+            family_key = panel_family_key(family_title)
+            drawer_id = cached_drawer_root(panel_id)
+        except Exception:
+            traceback.print_exc()
             continue
-        if is_builtin_default_panel_record(record):
-            continue
-        family_title = panel_family_title(state, record)
-        family_key = panel_family_key(family_title)
-        drawer_id = cached_drawer_root(record.panel_id)
         group_key = f"family:{family_key}"
         group = groups.setdefault(
             group_key,
@@ -2816,7 +2857,7 @@ def append_panel_ids_to_workflow(workflow, panel_ids):
         if not panel_id or panel_id in current_ids:
             continue
         item = workflow.panels.add()
-        item.panel_id = panel_id
+        safe_set_rna_text(item, "panel_id", panel_id, max_chars=MAX_RESTORED_PANEL_TEXT_CHARS)
         current_ids.add(panel_id)
         added += 1
     if workflow.panels:
@@ -4862,7 +4903,7 @@ def panel_match_payload_for_export(state, panel_id):
         "category": getattr(record, "category", ""),
         "source_module": source_module,
         "addon_version": getattr(record, "addon_version", ""),
-        "plugin_key": panel_plugin_key_from_module(source_module) or panel_plugin_key(panel_id),
+        "plugin_key": panel_plugin_key_from_module(source_module) or infer_plugin_key_from_panel_id(panel_id),
         "plugin_title": panel_plugin_title(state, panel_id),
     }
 
@@ -5320,12 +5361,20 @@ def apply_space_state_payload(state, space_payload):
 
     for record_data in cleaned_payload.get("panel_registry", []):
         record = state.panel_registry.add()
-        record.panel_id = record_data.get("panel_id", "")
-        record.title = record_data.get("title", "")
-        record.category = record_data.get("category", "")
-        record.tags = record_data.get("tags", "")
-        record.source_module = record_data.get("source_module", "")
-        record.addon_version = record_data.get("addon_version", "")
+        ok = (
+            safe_set_rna_text(record, "panel_id", record_data.get("panel_id", ""), max_chars=MAX_RESTORED_PANEL_TEXT_CHARS)
+            and safe_set_rna_text(record, "title", record_data.get("title", ""), max_chars=MAX_RESTORED_PANEL_TEXT_CHARS)
+            and safe_set_rna_text(record, "category", record_data.get("category", ""), max_chars=MAX_RESTORED_PANEL_TEXT_CHARS)
+            and safe_set_rna_text(record, "tags", record_data.get("tags", ""), max_chars=MAX_RESTORED_PANEL_TEXT_CHARS)
+            and safe_set_rna_text(record, "source_module", record_data.get("source_module", ""), max_chars=MAX_RESTORED_PANEL_TEXT_CHARS)
+            and safe_set_rna_text(record, "addon_version", record_data.get("addon_version", ""), max_chars=32)
+        )
+        if not ok or not getattr(record, "panel_id", ""):
+            try:
+                state.panel_registry.remove(len(state.panel_registry) - 1)
+            except Exception:
+                traceback.print_exc()
+            continue
         record.discovered = False
 
     for script_data in cleaned_payload.get("script_library", []):
@@ -5335,18 +5384,34 @@ def apply_space_state_payload(state, space_payload):
     for workflow_data in cleaned_payload.get("workflows", []):
         workflow = state.workflows.add()
         workflow.is_default = workflow_data.get("is_default", False)
-        workflow.name = unique_workflow_name(
+        safe_set_rna_text(
+            workflow,
+            "name",
+            unique_workflow_name(
             state,
             workflow_data.get("name", ""),
             DEFAULT_WORKFLOW_NAME if workflow.is_default else "自定义工作流",
-            exclude_index=len(state.workflows) - 1,
+                exclude_index=len(state.workflows) - 1,
+            ),
+            fallback=DEFAULT_WORKFLOW_NAME if workflow.is_default else "Imported Workflow",
+            max_chars=MAX_RESTORED_PANEL_TEXT_CHARS,
         )
-        workflow.description = normalize_workflow_description(workflow_data.get("description", ""), "")
-        workflow.tag_filter = workflow_data.get("tag_filter", "")
+        safe_set_rna_text(
+            workflow,
+            "description",
+            normalize_workflow_description(workflow_data.get("description", ""), ""),
+            max_chars=MAX_RNA_SHORT_TEXT_CHARS,
+        )
+        safe_set_rna_text(
+            workflow,
+            "tag_filter",
+            workflow_data.get("tag_filter", ""),
+            max_chars=MAX_RNA_SHORT_TEXT_CHARS,
+        )
         workflow.missing_warning_dismissed = bool(workflow_data.get("missing_warning_dismissed", False))
         for panel_id in remap_imported_workflow_panel_ids(state, workflow_data):
             item = workflow.panels.add()
-            item.panel_id = panel_id
+            safe_set_rna_text(item, "panel_id", panel_id, max_chars=MAX_RESTORED_PANEL_TEXT_CHARS)
         for module_data in workflow_data.get("modules", []):
             module = workflow.modules.add()
             apply_safe_imported_module_payload(workflow, module, module_data)
@@ -5371,14 +5436,24 @@ def merge_panel_registry_payload(state, panel_records):
         record = existing.get(panel_id)
         if record is None:
             record = state.panel_registry.add()
-            record.panel_id = panel_id
+            safe_set_rna_text(record, "panel_id", panel_id, max_chars=MAX_RESTORED_PANEL_TEXT_CHARS)
             record.discovered = False
             existing[panel_id] = record
             added += 1
         if not record.title:
-            record.title = clean_panel_title(record_data.get("title", ""), panel_id)
+            safe_set_rna_text(
+                record,
+                "title",
+                clean_panel_title(record_data.get("title", ""), panel_id),
+                max_chars=MAX_RESTORED_PANEL_TEXT_CHARS,
+            )
         if not record.category:
-            record.category = normalize_text_value(record_data.get("category", ""), "")
+            safe_set_rna_text(
+                record,
+                "category",
+                normalize_text_value(record_data.get("category", ""), ""),
+                max_chars=MAX_RESTORED_PANEL_TEXT_CHARS,
+            )
     return added
 
 
@@ -5397,7 +5472,7 @@ def panel_match_payload_from_record(state, record):
         "category": getattr(record, "category", ""),
         "source_module": source_module,
         "addon_version": getattr(record, "addon_version", ""),
-        "plugin_key": panel_plugin_key_from_module(source_module) or panel_plugin_key(panel_id),
+        "plugin_key": panel_plugin_key_from_module(source_module) or infer_plugin_key_from_panel_id(panel_id),
         "plugin_title": panel_plugin_title(state, panel_id) if state is not None else "",
     }
 
@@ -5694,16 +5769,17 @@ def apply_safe_imported_script_library_payload(state, item, item_data):
     if payload is None:
         return False
 
-    item.name = unique_script_library_name(state, payload.get("name", ""), exclude_index=None) if state is not None else payload.get("name", "")
-    item.description = payload.get("description", "")
-    item.tags = payload.get("tags", "")
+    item_name = unique_script_library_name(state, payload.get("name", ""), exclude_index=None) if state is not None else payload.get("name", "")
+    safe_set_rna_text(item, "name", item_name, fallback="Imported Script", max_chars=MAX_RESTORED_PANEL_TEXT_CHARS)
+    safe_set_rna_text(item, "description", payload.get("description", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS)
+    safe_set_rna_text(item, "tags", payload.get("tags", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS)
     item.use_custom_panel = bool(payload.get("use_custom_panel", False))
-    item.panel_title = payload.get("panel_title", "")
-    item.panel_description = payload.get("panel_description", "")
-    item.text_block_name = ""
-    item.script_source = ""
-    item.config_payload = ""
-    item.ai_doc = ""
+    safe_set_rna_text(item, "panel_title", payload.get("panel_title", ""), max_chars=MAX_RESTORED_PANEL_TEXT_CHARS)
+    safe_set_rna_text(item, "panel_description", payload.get("panel_description", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS)
+    safe_set_rna_text(item, "text_block_name", "", max_chars=MAX_RESTORED_PANEL_TEXT_CHARS)
+    safe_set_rna_text(item, "script_source", "", max_chars=MAX_RNA_SCRIPT_CHARS)
+    safe_set_rna_text(item, "config_payload", "", max_chars=MAX_RNA_TEXT_CHARS)
+    safe_set_rna_text(item, "ai_doc", "", max_chars=MAX_RNA_TEXT_CHARS)
 
     source = payload.get("script_source", "")
     source_path = ""
@@ -5712,13 +5788,18 @@ def apply_safe_imported_script_library_payload(state, item, item_data):
             source_path = write_preset_import_text_asset(None, item.name, "library_script", source, "py")
         except Exception:
             traceback.print_exc()
-    item.script_path = source_path or payload.get("script_path", "")
+    safe_set_rna_text(item, "script_path", source_path or payload.get("script_path", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS)
 
     config_payload = payload.get("config_payload", "")
     if config_payload:
         try:
             config_path = write_preset_import_text_asset(None, item.name, "library_config", config_payload, "json")
-            item.config_payload = import_asset_note("external_config", config_path)
+            safe_set_rna_text(
+                item,
+                "config_payload",
+                import_asset_note("external_config", config_path),
+                max_chars=MAX_RNA_TEXT_CHARS,
+            )
         except Exception:
             traceback.print_exc()
 
@@ -5726,7 +5807,12 @@ def apply_safe_imported_script_library_payload(state, item, item_data):
     if ai_doc:
         try:
             ai_doc_path = write_preset_import_text_asset(None, item.name, "library_ai_doc", ai_doc, "md")
-            item.ai_doc = import_asset_note("external_ai_doc", ai_doc_path)
+            safe_set_rna_text(
+                item,
+                "ai_doc",
+                import_asset_note("external_ai_doc", ai_doc_path),
+                max_chars=MAX_RNA_TEXT_CHARS,
+            )
         except Exception:
             traceback.print_exc()
 
@@ -5737,7 +5823,13 @@ def apply_safe_imported_module_payload(workflow, module, module_data):
     if workflow is None or module is None or not isinstance(module_data, dict):
         return False
 
-    module.name = normalize_workflow_name(coerce_text_value(module_data.get("name", ""), max_chars=MAX_RNA_NAME_CHARS), "Imported Module")
+    safe_set_rna_text(
+        module,
+        "name",
+        normalize_workflow_name(coerce_text_value(module_data.get("name", ""), max_chars=MAX_RNA_NAME_CHARS), "Imported Module"),
+        fallback="Imported Module",
+        max_chars=MAX_RESTORED_PANEL_TEXT_CHARS,
+    )
     module.enabled = coerce_bool_value(module_data.get("enabled", True), True)
     module.use_custom_panel = coerce_bool_value(module_data.get("use_custom_panel", False), False)
     module.runtime_panel_expanded = coerce_bool_value(
@@ -5745,13 +5837,28 @@ def apply_safe_imported_module_payload(workflow, module, module_data):
         not module_prefers_collapsed_runtime_panel(module_data),
     )
     module.runtime_description_expanded = coerce_bool_value(module_data.get("runtime_description_expanded", False), False)
-    module.panel_title = normalize_text_value(coerce_text_value(module_data.get("panel_title", ""), max_chars=MAX_RNA_NAME_CHARS), "")
-    module.panel_description = normalize_text_value(coerce_text_value(module_data.get("panel_description", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS), "")
-    module.description = normalize_text_value(coerce_text_value(module_data.get("description", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS), "")
-    module.text_block_name = ""
-    module.script_source = ""
-    module.config_payload = ""
-    module.ai_doc = ""
+    safe_set_rna_text(
+        module,
+        "panel_title",
+        normalize_text_value(coerce_text_value(module_data.get("panel_title", ""), max_chars=MAX_RNA_NAME_CHARS), ""),
+        max_chars=MAX_RESTORED_PANEL_TEXT_CHARS,
+    )
+    safe_set_rna_text(
+        module,
+        "panel_description",
+        normalize_text_value(coerce_text_value(module_data.get("panel_description", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS), ""),
+        max_chars=MAX_RNA_SHORT_TEXT_CHARS,
+    )
+    safe_set_rna_text(
+        module,
+        "description",
+        normalize_text_value(coerce_text_value(module_data.get("description", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS), ""),
+        max_chars=MAX_RNA_SHORT_TEXT_CHARS,
+    )
+    safe_set_rna_text(module, "text_block_name", "", max_chars=MAX_RESTORED_PANEL_TEXT_CHARS)
+    safe_set_rna_text(module, "script_source", "", max_chars=MAX_RNA_SCRIPT_CHARS)
+    safe_set_rna_text(module, "config_payload", "", max_chars=MAX_RNA_TEXT_CHARS)
+    safe_set_rna_text(module, "ai_doc", "", max_chars=MAX_RNA_TEXT_CHARS)
 
     source = coerce_text_value(module_data.get("script_source", ""))
     source_path = ""
@@ -5762,17 +5869,32 @@ def apply_safe_imported_module_payload(workflow, module, module_data):
             traceback.print_exc()
 
     if source_path:
-        module.script_path = source_path
+        safe_set_rna_text(module, "script_path", source_path, max_chars=MAX_RNA_SHORT_TEXT_CHARS)
     else:
-        module.script_path = coerce_text_value(module_data.get("script_path", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS)
+        safe_set_rna_text(
+            module,
+            "script_path",
+            coerce_text_value(module_data.get("script_path", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS),
+            max_chars=MAX_RNA_SHORT_TEXT_CHARS,
+        )
         if not module.script_path:
-            module.script_path = unique_default_module_script_path(workflow, module)
+            safe_set_rna_text(
+                module,
+                "script_path",
+                unique_default_module_script_path(workflow, module),
+                max_chars=MAX_RNA_SHORT_TEXT_CHARS,
+            )
 
     config_payload = coerce_text_value(module_data.get("config_payload", ""))
     if config_payload:
         try:
             config_path = write_preset_import_text_asset(workflow, module.name, "config", config_payload, "json")
-            module.config_payload = import_asset_note("external_config", config_path)
+            safe_set_rna_text(
+                module,
+                "config_payload",
+                import_asset_note("external_config", config_path),
+                max_chars=MAX_RNA_TEXT_CHARS,
+            )
         except Exception:
             traceback.print_exc()
 
@@ -5780,7 +5902,12 @@ def apply_safe_imported_module_payload(workflow, module, module_data):
     if ai_doc:
         try:
             ai_doc_path = write_preset_import_text_asset(workflow, module.name, "ai_doc", ai_doc, "md")
-            module.ai_doc = import_asset_note("external_ai_doc", ai_doc_path)
+            safe_set_rna_text(
+                module,
+                "ai_doc",
+                import_asset_note("external_ai_doc", ai_doc_path),
+                max_chars=MAX_RNA_TEXT_CHARS,
+            )
         except Exception:
             traceback.print_exc()
 
@@ -5792,7 +5919,7 @@ def apply_module_payload_to_workflow(workflow, module_data):
     return apply_safe_imported_module_payload(workflow, module, module_data)
 
 
-def apply_current_workflow_preset_payload(state, preset_payload, merge_shared=True):
+def _apply_current_workflow_preset_payload_impl(state, preset_payload, merge_shared=True):
     sanitized = sanitize_current_workflow_preset_payload(preset_payload)
     if state is None or sanitized is None:
         return None
@@ -5804,10 +5931,21 @@ def apply_current_workflow_preset_payload(state, preset_payload, merge_shared=Tr
 
     workflow = state.workflows.add()
     target_index = len(state.workflows) - 1
-    workflow.name = unique_workflow_name_for_import(state, imported_name, exclude_index=target_index)
+    safe_set_rna_text(
+        workflow,
+        "name",
+        unique_workflow_name_for_import(state, imported_name, exclude_index=target_index),
+        fallback="Imported Workflow",
+        max_chars=MAX_RESTORED_PANEL_TEXT_CHARS,
+    )
     workflow.is_default = False
-    workflow.description = normalize_workflow_description(workflow_data.get("description", ""), "")
-    workflow.tag_filter = workflow_data.get("tag_filter", "")
+    safe_set_rna_text(
+        workflow,
+        "description",
+        normalize_workflow_description(workflow_data.get("description", ""), ""),
+        max_chars=MAX_RNA_SHORT_TEXT_CHARS,
+    )
+    safe_set_rna_text(workflow, "tag_filter", workflow_data.get("tag_filter", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS)
     workflow.missing_warning_dismissed = bool(workflow_data.get("missing_warning_dismissed", False))
     replace_workflow_panels(workflow, remap_imported_workflow_panel_ids(state, workflow_data))
     clear_collection(workflow.modules)
@@ -5820,6 +5958,38 @@ def apply_current_workflow_preset_payload(state, preset_payload, merge_shared=Tr
     ensure_go_workflow_panel_entry(state)
     normalize_workflow_active_panel_index(workflow)
     return workflow
+
+
+def apply_current_workflow_preset_payload(state, preset_payload, merge_shared=True):
+    if state is None:
+        return None
+    workflow_count = len(getattr(state, "workflows", []))
+    existing_panel_ids = {
+        getattr(record, "panel_id", "")
+        for record in getattr(state, "panel_registry", [])
+        if getattr(record, "panel_id", "")
+    }
+    try:
+        return _apply_current_workflow_preset_payload_impl(
+            state,
+            preset_payload,
+            merge_shared=merge_shared,
+        )
+    except Exception:
+        traceback.print_exc()
+        try:
+            while len(state.workflows) > workflow_count:
+                state.workflows.remove(len(state.workflows) - 1)
+        except Exception:
+            traceback.print_exc()
+        try:
+            for index in range(len(state.panel_registry) - 1, -1, -1):
+                record = state.panel_registry[index]
+                if getattr(record, "panel_id", "") not in existing_panel_ids:
+                    state.panel_registry.remove(index)
+        except Exception:
+            traceback.print_exc()
+        return None
 
 
 def workflow_entry_is_default(entry):
@@ -6019,21 +6189,34 @@ def prepare_safe_preset_entries(entries):
 def import_single_preset_entry(context, state, entry):
     if state is None or not isinstance(entry, dict):
         return None
+    import_key = (
+        id(state),
+        entry.get("key", ""),
+        entry.get("workflow_index", -1),
+        entry.get("workflow", {}).get("name", "") if isinstance(entry.get("workflow"), dict) else "",
+    )
+    if import_key in PRESET_IMPORT_ACTIVE_KEYS:
+        print("[Go Workflow] Preset import already in progress; ignored duplicate request.")
+        return None
+    PRESET_IMPORT_ACTIVE_KEYS.add(import_key)
     # The caller initializes the scene once before importing. Re-running the
     # setup here repeats builtin-module refreshes for every imported entry.
-    workflow_payload = current_workflow_preset_payload_from_entry(entry)
-    cache = get_preset_import_cache(state)
-    workflow_payload = hydrate_preset_payload_scripts_from_archive(
-        workflow_payload,
-        cache.get("filepath", "") or entry.get("preset_archive_path", ""),
-    )
-    global IS_INITIALIZING_ADDON
-    previous_initializing = IS_INITIALIZING_ADDON
-    IS_INITIALIZING_ADDON = True
     try:
-        workflow = apply_current_workflow_preset_payload(state, workflow_payload, merge_shared=False)
+        workflow_payload = current_workflow_preset_payload_from_entry(entry)
+        cache = get_preset_import_cache(state)
+        workflow_payload = hydrate_preset_payload_scripts_from_archive(
+            workflow_payload,
+            cache.get("filepath", "") or entry.get("preset_archive_path", ""),
+        )
+        global IS_INITIALIZING_ADDON
+        previous_initializing = IS_INITIALIZING_ADDON
+        IS_INITIALIZING_ADDON = True
+        try:
+            workflow = apply_current_workflow_preset_payload(state, workflow_payload, merge_shared=False)
+        finally:
+            IS_INITIALIZING_ADDON = previous_initializing
     finally:
-        IS_INITIALIZING_ADDON = previous_initializing
+        PRESET_IMPORT_ACTIVE_KEYS.discard(import_key)
     if workflow is not None:
         rebuild_runtime_panels(
             scene=getattr(context, "scene", None),
@@ -6167,13 +6350,21 @@ def save_global_workflow_state_now(scene=None):
     payload = build_full_state_payload(target_scene)
     tmp_filepath = filepath + ".tmp"
     backup_filepath = filepath + ".bak"
-    with open(tmp_filepath, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+    serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    with open(tmp_filepath, "w", encoding="utf-8", newline="") as handle:
+        handle.write(serialized)
+        handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
     if os.path.isfile(filepath):
         try:
+            load_json_payload_file(filepath, max_bytes=MAX_GLOBAL_STATE_FILE_BYTES)
             shutil.copy2(filepath, backup_filepath)
         except Exception:
-            traceback.print_exc()
+            # Never replace a valid backup with a truncated or malformed file.
+            pass
     os.replace(tmp_filepath, filepath)
     return True
 
@@ -6792,7 +6983,13 @@ def ensure_builtin_script_library(state):
                 break
         if item is None:
             item = state.script_library.add()
-            item.name = unique_script_library_name(state, payload_name, exclude_index=len(state.script_library) - 1)
+            safe_set_rna_text(
+                item,
+                "name",
+                unique_script_library_name(state, payload_name, exclude_index=len(state.script_library) - 1),
+                fallback="Builtin Script",
+                max_chars=MAX_RESTORED_PANEL_TEXT_CHARS,
+            )
             changed = True
 
         for attr in (
@@ -6811,7 +7008,15 @@ def ensure_builtin_script_library(state):
             if attr == "use_custom_panel":
                 value = bool(value)
             if getattr(item, attr) != value:
-                setattr(item, attr, value)
+                if isinstance(value, str):
+                    safe_set_rna_text(
+                        item,
+                        attr,
+                        value,
+                        max_chars=MAX_RNA_SCRIPT_CHARS if attr == "script_source" else MAX_RNA_TEXT_CHARS if attr in {"config_payload", "ai_doc"} else MAX_RNA_SHORT_TEXT_CHARS,
+                    )
+                else:
+                    setattr(item, attr, value)
                 changed = True
     return changed
 
@@ -6837,6 +7042,11 @@ def special_preset_spec(preset_type):
 def apply_special_preset_to_module(workflow, module, spec):
     if workflow is None or module is None or not isinstance(spec, dict):
         return False
+    spec = dict(spec)
+    for key in ("module_name", "preset_name"):
+        spec[key] = coerce_rna_restore_text(spec.get(key, ""), max_chars=MAX_RESTORED_PANEL_TEXT_CHARS)
+    for key in ("workflow_description", "module_description"):
+        spec[key] = coerce_rna_restore_text(spec.get(key, ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS)
     module.name = spec.get("module_name", module.name or "特殊预设模块")
     module.enabled = True
     module.use_custom_panel = True
@@ -6847,10 +7057,14 @@ def apply_special_preset_to_module(workflow, module, spec):
     module.description = spec.get("module_description", "")
     script_file = spec.get("script_file", "")
     if script_file:
+        script_file = coerce_rna_restore_text(script_file, max_chars=MAX_RNA_SHORT_TEXT_CHARS)
         module.script_path = script_file
         try:
             if os.path.isfile(script_file):
-                module.script_source = read_cached_text_file(script_file)
+                module.script_source = coerce_rna_restore_text(
+                    read_cached_text_file(script_file),
+                    max_chars=MAX_RNA_SCRIPT_CHARS,
+                )
         except Exception:
             traceback.print_exc()
     return True
@@ -6877,7 +7091,15 @@ def apply_module_payload_to_existing_module(module, module_data):
     )
     for attr, value in updates:
         if getattr(module, attr) != value:
-            setattr(module, attr, value)
+            if isinstance(value, str):
+                safe_set_rna_text(
+                    module,
+                    attr,
+                    value,
+                    max_chars=MAX_RNA_SCRIPT_CHARS if attr == "script_source" else MAX_RNA_TEXT_CHARS if attr in {"config_payload", "ai_doc"} else MAX_RNA_SHORT_TEXT_CHARS,
+                )
+            else:
+                setattr(module, attr, value)
             changed = True
     return changed
 
@@ -12760,7 +12982,7 @@ class BWFLOW_OT_export_missing_plugins_csv(Operator, ExportHelper):
                 continue
             panel_id = getattr(record, "panel_id", "")
             source_module = getattr(record, "source_module", "")
-            plugin_key = panel_plugin_key_from_module(source_module) or panel_plugin_key(panel_id) or source_module
+            plugin_key = panel_plugin_key_from_module(source_module) or infer_plugin_key_from_panel_id(panel_id) or source_module
             required_version = version_tuple_to_text(getattr(record, "addon_version", ""))
             current_version = addon_version_from_module_name(source_module)
             key = (plugin_key, required_version, panel_id)
@@ -13212,7 +13434,7 @@ def import_preset_file_direct(context, filepath):
     if state is None:
         print("[Go Workflow] No available state.")
         return False
-    ensure_minimum_setup(context.scene)
+    ensure_minimum_setup(context.scene, restore_global=False, save_state=False)
     preferred_space_type = current_space_type(context=context)
     entries = prepare_safe_preset_entries(workflow_preset_entries_from_payload(payload, preferred_space_type=preferred_space_type))
     entries = direct_import_workflow_entries(entries, preferred_space_type=preferred_space_type)[:1]
@@ -13474,7 +13696,7 @@ class BWFLOW_OT_preset_import_selected(Operator):
             print("[Go Workflow] No selected workflow to import.")
             return {"CANCELLED"}
 
-        ensure_minimum_setup(context.scene)
+        ensure_minimum_setup(context.scene, restore_global=False, save_state=False)
         imported = []
         imported_workflows = []
         for entry in selected_entries:
@@ -13683,7 +13905,15 @@ def draw_settings_embedded(layout, state):
         draw_global_settings(body, state)
 
 
+def begin_settings_module(layout, title, icon):
+    frame = layout.box()
+    header = frame.row(align=True)
+    header.label(text=title, icon=icon)
+    return frame.column(align=True)
+
+
 def draw_workflow_settings(layout, state):
+    layout = begin_settings_module(layout, "工作流管理", "FILE_FOLDER")
     list_box = layout.box()
     list_box.label(text="Go工作流列表", icon="FILE_FOLDER")
     row = list_box.row()
@@ -13736,6 +13966,7 @@ def draw_workflow_settings(layout, state):
 
 
 def draw_panel_library_editor(layout, state):
+    layout = begin_settings_module(layout, "面板库", "MENU_PANEL")
     workflow = get_active_workflow(state)
     if workflow is None:
         layout.label(text="请先创建 Go工作流", icon="INFO")
@@ -13989,6 +14220,7 @@ def draw_panel_library_editor(layout, state):
 
 
 def draw_module_template_editor(layout, state):
+    layout = begin_settings_module(layout, "脚本模块", "CONSOLE")
     workflow = get_active_workflow(state)
     if workflow is None:
         layout.label(text="请先创建 Go工作流", icon="INFO")
@@ -14080,6 +14312,7 @@ def draw_module_template_editor(layout, state):
 
 
 def draw_preset_editor(layout, state):
+    layout = begin_settings_module(layout, "预设管理", "PRESET")
     col = layout.column(align=True)
 
     special_box = col.box()
@@ -14163,6 +14396,7 @@ def draw_preset_editor(layout, state):
 
 
 def draw_script_library_editor(layout, state):
+    layout = layout.box().column(align=True)
     workflow = get_active_workflow(state)
     box = layout.column(align=True)
     header = box.row(align=True)
@@ -14257,8 +14491,8 @@ def draw_script_library_editor(layout, state):
             op.workflow_index = workflow_index
 
 def draw_global_settings(layout, state):
+    layout = begin_settings_module(layout, "全局设置", "PREFERENCES")
     box = layout.column(align=True)
-    box.label(text="全局设置", icon="PREFERENCES")
     box.prop(state.settings, "auto_sync_registry")
     box.prop(state.settings, "show_missing_summary")
     box.prop(state.settings, "runtime_preview_lines")
