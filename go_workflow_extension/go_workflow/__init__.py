@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Go工作流 / Go Workflow",
     "author": "OpenAI Codex",
-    "version": (1, 0, 8),
+    "version": (1, 1, 1),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Go工作流",
     "description": "基于工作流的 N 面板筛选与自定义脚本模块工具 / Workflow panel filter and script module manager",
@@ -9,7 +9,7 @@ bl_info = {
 }
 
 # AI定位：插件升版本时同步更新这里的 bl_info["version"]、__version__ 和 blender_manifest.toml。
-__version__ = (1, 0, 8)
+__version__ = (1, 1, 1)
 
 import json
 import csv
@@ -29,6 +29,7 @@ import zipfile
 from datetime import datetime
 
 import bpy
+import bpy.utils.previews
 from bpy.app.handlers import persistent
 from bpy.props import (
     BoolProperty,
@@ -66,7 +67,7 @@ from .native_reference import BWFLOW_OT_native_reference_cleanup, BWFLOW_OT_nati
 
 
 WORKFLOW_CATEGORY = "Go工作流"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 CURRENT_WORKFLOW_PRESET_KIND = "active_workflow"
 PRESET_FILE_EXTENSION = ".gwpreset"
 PRESET_FILE_FILTER = "*.gwpreset"
@@ -156,6 +157,11 @@ IMPORTED_WORKFLOW_MISSING_MATCH_CACHE = {}
 BUILTIN_SCRIPT_LIBRARY_PAYLOAD_CACHE = {"signature": None, "payloads": []}
 LOAD_HANDLER_REGISTERED = False
 IS_INITIALIZING_ADDON = False
+PRE_GO_WORKFLOW_STATE = None
+PANEL_CUSTOM_ICON_PREVIEWS = None
+PANEL_CUSTOM_ICON_CACHE = {}
+PANEL_GROUP_ICON_CACHE_BY_SPACE = {}
+WORKSPACE_TOOL_CLASSES_CACHE = None
 PANEL_POLL_MISSING = object()
 PANEL_BL_ORDER_MISSING = object()
 BROKEN_PANEL_POLL_IDS = {
@@ -277,6 +283,107 @@ def _cancel_tracked_one_shot_timers():
             pass
         removed += 1
     return removed
+
+
+def capture_pre_go_workflow_state():
+    global PRE_GO_WORKFLOW_STATE
+    if PRE_GO_WORKFLOW_STATE is not None:
+        return PRE_GO_WORKFLOW_STATE
+
+    system = getattr(getattr(bpy.context, "preferences", None), "system", None)
+    compact_tabs = None
+    if system is not None and hasattr(system, "show_panel_tabs_compact"):
+        try:
+            compact_tabs = bool(system.show_panel_tabs_compact)
+        except Exception:
+            compact_tabs = None
+
+    panel_orders = {}
+    panel_order_indices = {}
+    panel_bl_orders = {}
+    panel_registration_orders = {}
+    for space_type in iter_supported_space_types():
+        try:
+            panels = discover_sidebar_panels(space_type)
+            order = tuple(panels.keys())
+            panel_orders[space_type] = order
+            panel_order_indices[space_type] = {
+                panel_id: index for index, panel_id in enumerate(order)
+            }
+            panel_bl_orders[space_type] = {
+                panel_id: int(getattr(cls, "bl_order", 0) or 0)
+                for panel_id, cls in panels.items()
+            }
+            panel_registration_orders[space_type] = panel_registration_order_map(
+                space_type=space_type
+            )
+        except Exception:
+            panel_orders[space_type] = ()
+            panel_order_indices[space_type] = {}
+            panel_bl_orders[space_type] = {}
+            panel_registration_orders[space_type] = {}
+
+    PRE_GO_WORKFLOW_STATE = {
+        "captured": True,
+        "compact_tabs": compact_tabs,
+        "panel_orders": panel_orders,
+        "panel_order_indices": panel_order_indices,
+        "panel_bl_orders": panel_bl_orders,
+        "panel_registration_orders": panel_registration_orders,
+    }
+    return PRE_GO_WORKFLOW_STATE
+
+
+def extend_pre_go_workflow_order_snapshot(space_type=None):
+    """Add panels registered after GoWorkflow without replacing old positions."""
+    state = capture_pre_go_workflow_state()
+    target_spaces = (space_type,) if space_type else iter_supported_space_types()
+    panel_orders = state.setdefault("panel_orders", {})
+    panel_order_indices = state.setdefault("panel_order_indices", {})
+    panel_bl_orders = state.setdefault("panel_bl_orders", {})
+    panel_registration_orders = state.setdefault("panel_registration_orders", {})
+    for target_space in target_spaces:
+        try:
+            current_panels = discover_sidebar_panels(target_space)
+            current_order = tuple(current_panels.keys())
+        except Exception:
+            continue
+        baseline = list(panel_orders.get(target_space, ()))
+        known = set(baseline)
+        for panel_id in current_order:
+            if panel_id not in known:
+                baseline.append(panel_id)
+                known.add(panel_id)
+        panel_orders[target_space] = tuple(baseline)
+        panel_order_indices[target_space] = {
+            panel_id: index for index, panel_id in enumerate(baseline)
+        }
+        panel_bl_orders.setdefault(target_space, {}).update(
+            {
+                panel_id: int(getattr(cls, "bl_order", 0) or 0)
+                for panel_id, cls in current_panels.items()
+                if panel_id not in panel_bl_orders.get(target_space, {})
+            }
+        )
+        panel_registration_orders[target_space] = panel_registration_order_map(
+            space_type=target_space
+        )
+    return state
+
+
+def pre_go_workflow_compact_tabs_state():
+    state = PRE_GO_WORKFLOW_STATE or {}
+    return state.get("compact_tabs")
+
+
+def workflow_runtime_initialized(state):
+    settings = getattr(state, "settings", None) if state is not None else None
+    return bool(settings is not None and getattr(settings, "runtime_initialized", False))
+
+
+def clear_pre_go_workflow_state():
+    global PRE_GO_WORKFLOW_STATE
+    PRE_GO_WORKFLOW_STATE = None
 
 
 def module_runtime_cleanup_cache_key(scene, workflow, module):
@@ -570,6 +677,262 @@ def panel_plugin_label_from_key(plugin_key):
     return tail.replace("_", " ").strip().title() or plugin_key
 
 
+def addon_name_from_module_name(module_name):
+    module_name = str(module_name or "").strip()
+    if not module_name:
+        return ""
+    plugin_key = panel_plugin_key_from_module(module_name)
+    candidates = [module_name]
+    if plugin_key:
+        candidates.append(plugin_key)
+    try:
+        addon_keys = list(bpy.context.preferences.addons.keys())
+    except Exception:
+        addon_keys = []
+    candidates.extend(
+        key
+        for key in addon_keys
+        if key == plugin_key or (plugin_key and key.endswith("." + plugin_key))
+    )
+
+    seen = set()
+    for candidate in candidates:
+        candidate = str(candidate or "").strip()
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        module = sys.modules.get(candidate)
+        if module is None:
+            try:
+                module = getattr(bpy.context.preferences.addons.get(candidate), "module", None)
+            except Exception:
+                module = None
+        bl_info = getattr(module, "bl_info", None)
+        if not isinstance(bl_info, dict):
+            continue
+        name = normalize_panel_family_text(blender_iface_text(bl_info.get("name", "")))
+        if name and is_usable_family_label(name):
+            return name
+    return ""
+
+
+def blender_iface_text(text):
+    value = str(text or "")
+    try:
+        return str(bpy.app.translations.pgettext_iface(value) or value)
+    except Exception:
+        return value
+
+
+def panel_group_compact_icon_text(category):
+    """Match Blender's compact panel-tab text selection."""
+    text = blender_iface_text(category).strip()
+    if not text:
+        return "??"
+
+    chars = [char for char in text if not char.isspace()]
+    cjk_chars = [
+        char
+        for char in chars
+        if ("\u3400" <= char <= "\u4dbf")
+        or ("\u4e00" <= char <= "\u9fff")
+        or ("\uf900" <= char <= "\ufaff")
+    ]
+    if cjk_chars:
+        # Blender's compact tabs reserve one cell for CJK labels.
+        return cjk_chars[0]
+
+    words = [word for word in re.findall(r"[A-Za-z]+", text) if word]
+    if words and len(words[0]) >= 2:
+        return words[0][:2]
+    if len(words) >= 2:
+        return words[0][0] + words[1][0]
+
+    letters = [char for char in chars if char.isalpha()]
+    if len(letters) == 1:
+        return letters[0]
+    if len(letters) >= 2:
+        return "".join(letters[:2])
+    return "".join(chars[:2])
+
+
+def panel_icon_identifiers():
+    try:
+        prop = bpy.types.Panel.bl_rna.properties.get("bl_icon")
+        if prop is not None:
+            return {item.identifier for item in prop.enum_items}
+    except Exception:
+        pass
+    return {
+        "NONE",
+        "WORKSPACE",
+        "PREFERENCES",
+        "TOOL_SETTINGS",
+        "VIEW3D",
+        "OBJECT_DATA",
+        "MESH_DATA",
+        "SHAPEKEY_DATA",
+        "ARMATURE_DATA",
+        "MODIFIER",
+        "CONSTRAINT",
+        "IMAGE_DATA",
+        "OUTLINER",
+        "PLUGIN",
+        "MENU_PANEL",
+    }
+
+
+def workspace_tool_icon_value(path):
+    global PANEL_CUSTOM_ICON_PREVIEWS
+    path = os.path.abspath(os.path.expanduser(str(path or "").strip()))
+    if not path:
+        return 0
+    cached = PANEL_CUSTOM_ICON_CACHE.get(path)
+    if cached is not None:
+        return int(cached or 0)
+    if not os.path.isfile(path):
+        return 0
+    try:
+        if PANEL_CUSTOM_ICON_PREVIEWS is None:
+            PANEL_CUSTOM_ICON_PREVIEWS = bpy.utils.previews.new()
+        preview = PANEL_CUSTOM_ICON_PREVIEWS.load(
+            f"go_workflow_{len(PANEL_CUSTOM_ICON_CACHE)}",
+            path,
+            "IMAGE",
+            force_reload=False,
+        )
+        icon_value = int(getattr(preview, "icon_id", 0) or 0)
+    except Exception:
+        icon_value = 0
+    PANEL_CUSTOM_ICON_CACHE[path] = icon_value
+    return icon_value
+
+
+def workspace_tool_classes():
+    global WORKSPACE_TOOL_CLASSES_CACHE
+    if WORKSPACE_TOOL_CLASSES_CACHE is not None:
+        return WORKSPACE_TOOL_CLASSES_CACHE
+    base = getattr(bpy.types, "WorkSpaceTool", None)
+    if base is None:
+        WORKSPACE_TOOL_CLASSES_CACHE = ()
+        return WORKSPACE_TOOL_CLASSES_CACHE
+    try:
+        WORKSPACE_TOOL_CLASSES_CACHE = tuple(iter_panel_subclasses(base))
+    except Exception:
+        WORKSPACE_TOOL_CLASSES_CACHE = ()
+    return WORKSPACE_TOOL_CLASSES_CACHE
+
+
+def workspace_tool_icon_for_group(state, group):
+    if state is None or not isinstance(group, dict):
+        return 0
+    group_key = str(group.get("key", "") or "")
+    family_keys = set()
+    family_titles = set()
+    record_ids = list(group.get("record_ids", ()) or ())
+    if not record_ids:
+        record_ids = list(group.get("panel_ids", ()) or ())
+        record_ids.extend(group.get("drawer_ids", ()) or ())
+    record_lookup = get_panel_registry_lookup(state).get("record_by_id", {})
+    for panel_id in unique_panel_ids(record_ids):
+        record = record_lookup.get(panel_id)
+        if record is None:
+            continue
+        if not panel_id:
+            continue
+        if group_key and workflow_group_key_for_panel(state, panel_id) != group_key:
+            continue
+        family_keys.add(panel_plugin_key_for_record(record))
+        family_titles.add(normalize_panel_family_text(panel_plugin_title(state, panel_id)).casefold())
+        family_titles.add(normalize_panel_family_text(panel_group_original_title(state, panel_id)).casefold())
+
+    for cls in workspace_tool_classes():
+        icon_path = getattr(cls, "bl_icon", "")
+        if not isinstance(icon_path, str) or not icon_path.strip():
+            continue
+        tool_key = panel_plugin_key_from_module(getattr(cls, "__module__", ""))
+        tool_label = normalize_panel_family_text(
+            blender_iface_text(getattr(cls, "bl_label", ""))
+        ).casefold()
+        if tool_key not in family_keys and tool_label not in family_titles:
+            continue
+        icon_value = workspace_tool_icon_value(icon_path)
+        if icon_value:
+            return icon_value
+    return 0
+
+
+def panel_drawer_category_label(state, drawer_id, space_type=None):
+    """Return the exact Panel.bl_category used by Blender's sidebar tab."""
+    target_space = space_type or (
+        getattr(state, "space_type", "VIEW_3D") if state is not None else "VIEW_3D"
+    )
+    root_id = panel_drawer_root_id(drawer_id, space_type=target_space) or drawer_id
+    cls = get_panel_registry(target_space).get(root_id) or get_panel_cache(target_space).get(root_id)
+    if cls is None:
+        cls = resolve_panel_class_anywhere(root_id, space_type=target_space)
+    if cls is not None:
+        category = str(getattr(cls, "bl_category", "") or "").strip()
+        if category:
+            return blender_iface_text(category).strip()
+        category = panel_display_category(root_id, cls, space_type=target_space)
+        if category:
+            return blender_iface_text(category).strip()
+    record = find_registry_record(state, root_id) if state is not None else None
+    return str(getattr(record, "category", "") or "").strip()
+
+
+def _panel_group_icon_data_uncached(state, group):
+    space_type = getattr(state, "space_type", "VIEW_3D") if state is not None else "VIEW_3D"
+    panel_ids = []
+    if isinstance(group, dict):
+        panel_ids.extend(group.get("drawer_ids", ()) or ())
+        panel_ids.append(group.get("panel_id", ""))
+
+    seen = set()
+    category_label = ""
+    for panel_id in panel_ids:
+        panel_id = str(panel_id or "").strip()
+        if not panel_id or panel_id in seen:
+            continue
+        seen.add(panel_id)
+        panel_id = panel_drawer_root_id(panel_id, space_type=space_type) or panel_id
+        category_label = category_label or panel_drawer_category_label(
+            state, panel_id, space_type=space_type
+        )
+
+    return {
+        "icon_value": 0,
+        "icon": "NONE",
+        "text": panel_group_compact_icon_text(
+            category_label
+            or (group.get("title", "") if isinstance(group, dict) else "")
+        ),
+    }
+
+
+def panel_group_icon_data(state, group):
+    if state is None or not isinstance(group, dict):
+        return _panel_group_icon_data_uncached(state, group)
+    space_type = getattr(state, "space_type", "VIEW_3D") or "VIEW_3D"
+    group_key = str(group.get("key", "") or "")
+    cache_key = (
+        group_key,
+        str(group.get("title", "") or ""),
+        str(group.get("original_title", "") or ""),
+        tuple(group.get("drawer_ids", ()) or ()),
+        tuple(group.get("panel_ids", ()) or ()),
+        len(getattr(state, "panel_registry", [])),
+    )
+    cache = PANEL_GROUP_ICON_CACHE_BY_SPACE.setdefault(space_type, {})
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+    result = _panel_group_icon_data_uncached(state, group)
+    cache[cache_key] = dict(result)
+    return result
+
+
 def is_usable_family_label(text):
     normalized = normalize_panel_family_text(text)
     if not normalized:
@@ -582,6 +945,16 @@ def is_usable_family_label(text):
     if "\ufffd" in normalized:
         return False
     return True
+
+
+def panel_text_has_cjk(text):
+    value = str(text or "")
+    return any(
+        ("\u3400" <= char <= "\u4dbf")
+        or ("\u4e00" <= char <= "\u9fff")
+        or ("\uf900" <= char <= "\ufaff")
+        for char in value
+    )
 
 
 def normalize_panel_family_text(text):
@@ -908,7 +1281,16 @@ def panel_plugin_title(state, panel_id):
     record = find_registry_record(state, panel_id) if state is not None else None
     source_module = getattr(record, "source_module", "") if record is not None else ""
     plugin_key = panel_plugin_key_from_module(source_module) or infer_plugin_key_from_panel_id(panel_id)
-    return panel_plugin_label_from_key(plugin_key)
+    return addon_name_from_module_name(source_module) or panel_plugin_label_from_key(plugin_key)
+
+
+def panel_group_original_title(state, panel_id, fallback=""):
+    original = panel_plugin_title(state, panel_id)
+    return str(original or fallback or panel_id or "").strip()
+
+
+def panel_group_display_title(state, records, fallback=""):
+    return str(fallback or "").strip()
 
 
 def panel_plugin_key_for_record(record):
@@ -1855,6 +2237,7 @@ def sanitize_full_payload(payload):
         "schema_version": payload.get("schema_version", SCHEMA_VERSION),
         "exported_at": payload.get("exported_at", ""),
         "space_states": {},
+        "window_layouts": sanitize_window_layouts(payload.get("window_layouts", [])),
     }
     for space_type, space_payload in space_payloads.items():
         space_type = coerce_text_value(space_type, "").strip()
@@ -1864,6 +2247,46 @@ def sanitize_full_payload(payload):
         if cleaned_payload is not None:
             cleaned["space_states"][space_type] = cleaned_payload
     return cleaned
+
+
+def sanitize_window_layouts(value):
+    if not isinstance(value, list):
+        return []
+    layouts = []
+    for layout in value[:64]:
+        if not isinstance(layout, dict):
+            continue
+        areas = []
+        for area in layout.get("areas", [])[:64]:
+            if not isinstance(area, dict):
+                continue
+            area_type = coerce_text_value(area.get("type", ""), "").strip()
+            if area_type not in SUPPORTED_SPACE_TYPES:
+                continue
+            areas.append(
+                {
+                    "index": max(0, coerce_int_value(area.get("index", 0), 0)),
+                    "type": area_type,
+                    "ui_type": coerce_text_value(area.get("ui_type", ""), ""),
+                    "x": coerce_int_value(area.get("x", 0), 0),
+                    "y": coerce_int_value(area.get("y", 0), 0),
+                    "width": max(0, coerce_int_value(area.get("width", 0), 0)),
+                    "height": max(0, coerce_int_value(area.get("height", 0), 0)),
+                }
+            )
+        if not areas:
+            continue
+        layouts.append(
+            {
+                "window_index": max(
+                    0, coerce_int_value(layout.get("window_index", 0), 0)
+                ),
+                "workspace": coerce_text_value(layout.get("workspace", ""), ""),
+                "screen": coerce_text_value(layout.get("screen", ""), ""),
+                "areas": areas,
+            }
+        )
+    return layouts
 
 
 def sanitize_current_workflow_preset_payload(payload):
@@ -1888,6 +2311,7 @@ def sanitize_current_workflow_preset_payload(payload):
         "schema_version": payload.get("schema_version", SCHEMA_VERSION),
         "preset_kind": CURRENT_WORKFLOW_PRESET_KIND,
         "exported_at": payload.get("exported_at", ""),
+        "window_layouts": sanitize_window_layouts(payload.get("window_layouts", [])),
         "space_type": payload.get("space_type", "VIEW_3D"),
         "space_label": payload.get("space_label", ""),
         "preset_archive_path": coerce_text_value(payload.get("preset_archive_path", ""), max_chars=MAX_RNA_SHORT_TEXT_CHARS),
@@ -1951,13 +2375,45 @@ def panel_tree_root_id(panel_id, space_type=None):
     return current_id or panel_id
 
 
+def dynamic_multi_panel_root_id(panel_id, space_type=None):
+    """Return the real host drawer for add-ons that generate panel classes."""
+    if not panel_id:
+        return ""
+    target_space = space_type or "VIEW_3D"
+    registry = get_panel_registry(target_space)
+    cache = get_panel_cache(target_space)
+    cls = registry.get(panel_id) or cache.get(panel_id)
+    if cls is None:
+        return ""
+
+    module_name = str(getattr(cls, "__module__", "") or "").casefold()
+    class_name = str(getattr(cls, "__name__", "") or "")
+    parent_marker = str(getattr(cls, "PARENT_M_PANEL_ID", "") or "")
+    if "uvpackmaster4" not in module_name:
+        return ""
+    if panel_id == "UVPM4_PT_MultiPanels":
+        return panel_id
+    if not parent_marker and not class_name.startswith("UVPM4_PT_MultiPanel"):
+        return ""
+
+    # UVPackmaster's marker is used to identify generated classes, but it is
+    # not consistently the visible drawer ID.  All MultiPanel variants belong
+    # to the single public UVPM4 host drawer.
+    host_id = "UVPM4_PT_MultiPanels"
+    if host_id in registry or host_id in cache:
+        return host_id
+    return ""
+
+
 def panel_drawer_root_id(panel_id, space_type=None):
     target_space = space_type or "VIEW_3D"
     cache = PANEL_DRAWER_ROOT_CACHE_BY_SPACE.setdefault(target_space, {})
     cached = cache.get(panel_id)
     if cached is not None:
         return cached
-    root_id = panel_tree_root_id(panel_id, space_type=target_space)
+    root_id = dynamic_multi_panel_root_id(panel_id, space_type=target_space)
+    if not root_id:
+        root_id = panel_tree_root_id(panel_id, space_type=target_space)
     cache[panel_id] = root_id
     return root_id
 
@@ -2086,17 +2542,17 @@ def build_panel_library_groups(state, workflow):
                 continue
             if is_builtin_default_panel_record(record):
                 continue
-            family_title = panel_family_title(state, record)
-            family_key = panel_family_key(family_title)
             drawer_id = cached_drawer_root(panel_id)
+            family_title = workflow_family_group_title(state, drawer_id)
         except Exception:
             traceback.print_exc()
             continue
-        group_key = f"family:{family_key}"
+        group_key = panel_library_group_key_for_panel(state, drawer_id)
         group = groups.setdefault(
             group_key,
             {
                 "key": group_key,
+                "original_title": panel_group_original_title(state, panel_id, family_title),
                 "title": family_title or "未分类插件",
                 "records": [],
                 "drawer_ids": [],
@@ -2130,16 +2586,40 @@ def build_panel_library_groups(state, workflow):
                     "discovered": discovered,
                 }
             )
-        header_items.sort(key=lambda entry: (entry["title"].casefold(), entry["panel_id"]))
+        header_items.sort(
+            key=lambda entry: (
+                panel_drawer_default_order_index(
+                    state,
+                    entry["panel_id"],
+                    space_type=space_type,
+                ),
+                entry["index"],
+                entry["title"].casefold(),
+                entry["panel_id"],
+            )
+        )
         if not header_items:
             continue
 
+        group["title"] = panel_group_display_title(
+            state,
+            group.get("records", ()),
+            group.get("title", ""),
+        ) or group.get("title", "")
         ordered_groups.append(
             {
                 "key": group["key"],
+                "original_title": group.get("original_title", group["title"]),
                 "title": group["title"] or "未分类插件",
                 "drawer_ids": [entry["panel_id"] for entry in header_items],
-                "first_panel_index": header_items[0]["index"],
+                "record_ids": unique_panel_ids(
+                    getattr(record, "panel_id", "")
+                    for record in group.get("records", ())
+                ),
+                "first_panel_index": min(
+                    (entry["index"] for entry in header_items),
+                    default=-1,
+                ),
                 "selected_count": sum(1 for entry in header_items if entry["selected"]),
                 "panel_count": len(header_items),
                 "tree_selected": any(entry["selected"] for entry in header_items),
@@ -2358,6 +2838,7 @@ def build_selected_panel_groups(state, workflow):
             {
                 "key": group_key,
                 "title": family_title or "未分类插件",
+                "original_title": panel_group_original_title(state, panel_id, family_title),
                 "panel_id": panel_id,
                 "drawer_ids": [],
                 "panel_ids": [],
@@ -2384,6 +2865,7 @@ def build_selected_panel_groups(state, workflow):
             {
                 "key": group["key"],
                 "title": group["title"] or "未分类插件",
+                "original_title": group.get("original_title", group["title"]),
                 "panel_id": group["panel_id"],
                 "panel_count": panel_count,
                 "plugin_title": panel_count_label(panel_count),
@@ -2520,7 +3002,18 @@ def panel_library_group_entries(state, workflow, group):
             }
         )
 
-    entries.sort(key=lambda entry: (entry["title"].casefold(), entry["panel_id"]))
+    entries.sort(
+        key=lambda entry: (
+            panel_drawer_default_order_index(
+                state,
+                entry["panel_id"],
+                space_type=space_type,
+            ),
+            entry["index"],
+            entry["title"].casefold(),
+            entry["panel_id"],
+        )
+    )
     group_cache[group.get("key", "")] = {
         "signature": signature,
         "entries": [dict(entry) for entry in entries],
@@ -2582,7 +3075,7 @@ def workflow_family_order_groups(state, workflow):
         if is_builtin_default_panel_id(panel_id, space_type=space_type):
             continue
         family_title = workflow_family_group_title(state, panel_id)
-        group_key = f"family:{panel_family_key(family_title)}"
+        group_key = workflow_group_key_for_panel(state, panel_id)
         group = group_map.get(group_key)
         if group is None:
             group = {
@@ -2615,21 +3108,65 @@ def panel_drawer_default_order_index(state, drawer_id, space_type=None):
         return 999999
 
     target_space = space_type or (getattr(state, "space_type", "VIEW_3D") if state is not None else "VIEW_3D")
+    baseline_state = PRE_GO_WORKFLOW_STATE or {}
+    baseline_orders = baseline_state.get("panel_orders", {})
+    baseline_order_indices = baseline_state.get("panel_order_indices", {})
+    baseline_bl_orders = baseline_state.get("panel_bl_orders", {})
+    baseline_registration_orders = baseline_state.get("panel_registration_orders", {})
+    baseline_order = baseline_orders.get(target_space, ())
+    baseline_index = baseline_order_indices.get(target_space, {})
+
+    # The drawer itself must win over one of its child panels.  Blender and
+    # several add-ons register child classes before their parent, so matching
+    # only by root can otherwise move the whole drawer to the wrong position.
+    exact_index = baseline_index.get(drawer_id)
+    if exact_index is not None:
+        # Keep the original Blender ordering key intact.  The compact sidebar
+        # uses the same class order, while the registry index can be affected
+        # by GoWorkflow's later unregister/register pass.
+        return (
+            int(baseline_bl_orders.get(target_space, {}).get(drawer_id, 0) or 0) * 1000000
+            + int(baseline_registration_orders.get(target_space, {}).get(drawer_id, exact_index))
+        )
+
+    # A workflow may contain a root ID that was not directly discoverable at
+    # startup (dynamic panels are the common case).  Use the first original
+    # registration position of its descendants only as a fallback.
+    if baseline_order:
+        descendant_indices = [
+            baseline_index.get(panel_id)
+            for panel_id in baseline_order
+            if panel_drawer_root_id(panel_id, space_type=target_space) == drawer_id
+        ]
+        descendant_indices = [index for index in descendant_indices if index is not None]
+        if descendant_indices:
+            return min(descendant_indices)
+
     for index, panel_id in enumerate(get_panel_cache(target_space).keys()):
-        if panel_id == drawer_id or panel_drawer_root_id(panel_id, space_type=target_space) == drawer_id:
+        if panel_id == drawer_id:
+            return index
+    for index, panel_id in enumerate(get_panel_cache(target_space).keys()):
+        if panel_drawer_root_id(panel_id, space_type=target_space) == drawer_id:
             return index
 
     registration_order = panel_registration_order_map(space_type=target_space)
     registry = get_panel_registry(target_space)
     for index, panel_id in enumerate(registry.keys()):
-        if panel_id == drawer_id or panel_drawer_root_id(panel_id, space_type=target_space) == drawer_id:
+        if panel_id == drawer_id:
+            return 100000 + registration_order.get(panel_id, index)
+    for index, panel_id in enumerate(registry.keys()):
+        if panel_drawer_root_id(panel_id, space_type=target_space) == drawer_id:
             return 100000 + registration_order.get(panel_id, index)
 
     for index, record in enumerate(getattr(state, "panel_registry", [])):
         record_id = getattr(record, "panel_id", "")
         if not record_id:
             continue
-        if record_id == drawer_id or panel_drawer_root_id(record_id, space_type=target_space) == drawer_id:
+        if record_id == drawer_id:
+            return 200000 + index
+    for index, record in enumerate(getattr(state, "panel_registry", [])):
+        record_id = getattr(record, "panel_id", "")
+        if record_id and panel_drawer_root_id(record_id, space_type=target_space) == drawer_id:
             return 200000 + index
     return 999999
 
@@ -2639,16 +3176,49 @@ def workflow_family_group_title(state, panel_id):
         return "Go工作流"
     space_type = getattr(state, "space_type", "VIEW_3D") if state is not None else "VIEW_3D"
     drawer_id = panel_drawer_root_id(panel_id, space_type=space_type) or panel_id
-    record = None
-    if state is not None:
-        record = panel_drawer_record(state, drawer_id) or find_registry_record(state, drawer_id) or find_registry_record(state, panel_id)
-    return panel_family_title(state, record or drawer_id) if state is not None else drawer_id
+    title = panel_drawer_title(state, drawer_id) if state is not None else drawer_id
+    record = panel_drawer_record(state, drawer_id) if state is not None else None
+    source_family = panel_source_module_family(record)
+    if source_family == "addon" and record is not None:
+        plugin_title = panel_plugin_title(state, drawer_id)
+        if is_usable_family_label(plugin_title):
+            return plugin_title
+    normalized_title = normalized_panel_match_text(title)
+    normalized_id = normalized_panel_match_text(drawer_id)
+    looks_like_internal_id = (
+        not title
+        or normalized_title == normalized_id
+        or "_pt_" in normalized_title
+        or normalized_title.startswith("bc_")
+        or normalized_title.startswith("uvpm")
+    )
+    if looks_like_internal_id and record is not None:
+        family_title = panel_family_title(state, record)
+        if is_usable_family_label(family_title):
+            return family_title
+    return title or drawer_id
 
 
 def workflow_group_key_for_panel(state, panel_id):
+    return panel_library_group_key_for_panel(state, panel_id)
+
+
+def panel_library_group_key_for_panel(state, panel_id):
     if not panel_id or panel_id == "BWFLOW_PT_workflow":
         return ""
-    return f"family:{panel_family_key(workflow_family_group_title(state, panel_id))}"
+    space_type = getattr(state, "space_type", "VIEW_3D") if state is not None else "VIEW_3D"
+    drawer_id = panel_drawer_root_id(panel_id, space_type=space_type) or panel_id
+    record = panel_drawer_record(state, drawer_id) if state is not None else None
+    plugin_key = panel_plugin_key_for_record(record) or infer_plugin_key_from_panel_id(drawer_id)
+    source_family = panel_source_module_family(record)
+    return f"plugin_group:{panel_family_key(plugin_key)}:{panel_component_key(source_family)}"
+
+
+def panel_source_module_family(record):
+    source_module = str(getattr(record, "source_module", "") or "").strip()
+    if re.search(r"(?:^|\.)module_[a-z0-9_]+$", source_module, flags=re.IGNORECASE):
+        return panel_component_key(source_module.rsplit(".", 1)[-1])
+    return "addon"
 
 
 def workflow_family_member_indices(state, workflow, group_key=""):
@@ -3082,6 +3652,8 @@ def replace_workflow_groups(workflow, groups, active_panel_id=""):
 def mark_panel_order_pending(state, scene=None, context=None):
     if state is None:
         return
+    if not workflow_runtime_initialized(state):
+        return
     space_type = getattr(state, "space_type", "VIEW_3D")
     PANEL_VISIBILITY_DATA_CACHE_BY_SPACE.pop(space_type, None)
     PANEL_LIBRARY_GROUPS_CACHE_BY_SPACE.pop(space_type, None)
@@ -3107,6 +3679,8 @@ def mark_panel_order_pending(state, scene=None, context=None):
 def mark_panel_visibility_pending(state, scene=None, context=None):
     if state is None:
         return
+    if not workflow_runtime_initialized(state):
+        return
     space_type = getattr(state, "space_type", "VIEW_3D")
     state.panel_visibility_pending_apply = False
     state.panel_order_pending_apply = False
@@ -3128,6 +3702,33 @@ def mark_panel_visibility_pending(state, scene=None, context=None):
     )
     if scene is not None:
         save_global_workflow_state(scene)
+    if not tag_redraw_context_area(context):
+        tag_redraw_all(space_type=space_type)
+
+
+def queue_panel_visibility_pending(state, scene=None, context=None):
+    """Apply panel visibility after the current UI event has returned."""
+    if state is None or not workflow_runtime_initialized(state):
+        return
+    space_type = getattr(state, "space_type", "VIEW_3D")
+    state.panel_visibility_pending_apply = False
+    state.panel_order_pending_apply = False
+    PANEL_LIBRARY_GROUPS_CACHE_BY_SPACE.pop(space_type, None)
+    PANEL_GROUP_FILTER_CACHE_BY_SPACE.pop(f"{space_type}:library", None)
+    PANEL_GROUP_FILTER_CACHE_BY_SPACE.pop(f"{space_type}:selected", None)
+    PANEL_LIBRARY_GROUP_ENTRY_CACHE_BY_SPACE.pop(space_type, None)
+    SELECTED_PANEL_GROUPS_CACHE_BY_SPACE.pop(space_type, None)
+    SELECTED_PANEL_GROUP_SUMMARY_CACHE_BY_SPACE.pop(space_type, None)
+    PANEL_VISIBILITY_DATA_CACHE_BY_SPACE.pop(space_type, None)
+    clear_space_prefixed_cache(WORKFLOW_MISSING_PANEL_IDS_CACHE_BY_SPACE, space_type)
+    clear_space_prefixed_cache(WORKFLOW_MISSING_RECORDS_CACHE_BY_SPACE, space_type)
+    clear_space_prefixed_cache(WORKFLOW_FAMILY_ORDER_GROUPS_CACHE_BY_SPACE, space_type)
+    schedule_deferred_runtime_refresh(
+        scene=scene or safe_context_scene(),
+        intervals=(0.05,),
+        space_type=space_type,
+    )
+    schedule_global_workflow_state_save(scene=scene or safe_context_scene())
     if not tag_redraw_context_area(context):
         tag_redraw_all(space_type=space_type)
 
@@ -3459,6 +4060,21 @@ def sorted_panel_ids_for_unregister(panel_ids, space_type=None):
 
 def sorted_panel_ids_for_register(panel_ids, space_type=None):
     return sorted(panel_ids, key=lambda panel_id: panel_depth(panel_id, space_type=space_type))
+
+
+def is_dynamic_multi_panel_class(cls):
+    if cls is None:
+        return False
+    module_name = str(getattr(cls, "__module__", "") or "").casefold()
+    class_name = str(getattr(cls, "__name__", "") or "")
+    if "uvpackmaster4" in module_name:
+        return True
+    return bool(getattr(cls, "PARENT_M_PANEL_ID", ""))
+
+
+def is_dynamic_multi_panel_id(panel_id, space_type=None):
+    cls = resolve_panel_class_anywhere(panel_id, space_type=space_type)
+    return is_dynamic_multi_panel_class(cls)
 
 
 def _safe_unregister_panel_class(cls):
@@ -3831,7 +4447,11 @@ def apply_panel_order_overrides(ordered_panel_ids, space_type=None):
         ordered_signature = tuple(
             panel_id
             for panel_id in ordered_panel_ids
-            if panel_id in registry and panel_id not in BROKEN_PANEL_POLL_IDS
+            if (
+                panel_id in registry
+                and panel_id not in BROKEN_PANEL_POLL_IDS
+                and not is_dynamic_multi_panel_class(registry.get(panel_id))
+            )
         )
         previous_signature = PANEL_ORDER_SIGNATURE_BY_SPACE.get(target_space)
         ordered_map = {panel_id: index for index, panel_id in enumerate(ordered_signature)}
@@ -4051,19 +4671,6 @@ def restore_default_n_panel_state(scene=None, disable_filters=True, switch_workf
 def restore_unregistered_panels(panel_ids=None, space_type=None):
     if panel_ids is None:
         ids_to_restore = set(UNREGISTERED_PANEL_IDS)
-        for cls in iter_panel_subclasses(bpy.types.Panel):
-            panel_id = getattr(cls, "bl_idname", "") or getattr(cls, "__name__", "")
-            if not panel_id or panel_id.startswith("BWFLOW_"):
-                continue
-            if is_builtin_default_panel_class(cls):
-                continue
-            if space_type and getattr(cls, "bl_space_type", None) != space_type:
-                continue
-            if getattr(cls, "bl_region_type", None) != "UI":
-                continue
-            if not hasattr(cls, "draw"):
-                continue
-            ids_to_restore.add(panel_id)
     else:
         ids_to_restore = set(panel_ids)
     unresolved_ids = set()
@@ -4132,7 +4739,11 @@ def reorder_registered_panels(panel_ids, space_type=None):
     ids_to_reorder = [
         panel_id
         for panel_id in ordered_panel_ids_for_register(panel_ids, space_type=space_type)
-        if panel_id not in UNREGISTERED_PANEL_IDS and panel_id not in BROKEN_PANEL_POLL_IDS
+        if (
+            panel_id not in UNREGISTERED_PANEL_IDS
+            and panel_id not in BROKEN_PANEL_POLL_IDS
+            and not is_dynamic_multi_panel_id(panel_id, space_type=space_type)
+        )
     ]
     for panel_id in reversed(ids_to_reorder):
         cls = resolve_panel_class(panel_id, space_type=space_type)
@@ -4167,11 +4778,6 @@ def reorder_registered_panels(panel_ids, space_type=None):
 
 
 def apply_panel_visibility_overrides(scene=None, space_type=None, restore_first=True, install_poll=True, repair_callbacks=True):
-    if repair_callbacks:
-        repair_missing_panel_poll_callbacks(space_type=space_type)
-        repair_problematic_panel_draw_callbacks(space_type=space_type)
-    if install_poll:
-        ensure_panel_poll_overrides(space_type=space_type)
     if restore_first:
         restore_unregistered_panels(space_type=space_type)
 
@@ -4181,6 +4787,14 @@ def apply_panel_visibility_overrides(scene=None, space_type=None, restore_first=
         state = get_state(scene=scene, space_type=target_space)
         if state is None:
             continue
+        if not workflow_runtime_initialized(state):
+            ACTIVE_ALLOWED_PANEL_IDS_BY_SPACE.pop(target_space, None)
+            continue
+        if repair_callbacks:
+            repair_missing_panel_poll_callbacks(space_type=target_space)
+            repair_problematic_panel_draw_callbacks(space_type=target_space)
+        if install_poll:
+            ensure_panel_poll_overrides(space_type=target_space)
         workflow = get_active_workflow(state)
         visibility_data = workflow_visibility_data(state, workflow)
         allowed_ids = visibility_data["allowed_ids"]
@@ -4250,6 +4864,7 @@ def sync_registry(scene, space_type="VIEW_3D"):
     state = get_state(scene=scene, space_type=space_type)
     if state is None:
         return
+    PANEL_GROUP_ICON_CACHE_BY_SPACE.pop(space_type, None)
     PANEL_GROUP_INDEX_CACHE_BY_SPACE.pop(space_type, None)
     PANEL_DRAWER_ROOT_CACHE_BY_SPACE.pop(space_type, None)
     PANEL_LIBRARY_GROUP_ENTRY_CACHE_BY_SPACE.pop(space_type, None)
@@ -4271,15 +4886,51 @@ def sync_registry(scene, space_type="VIEW_3D"):
         record.addon_version = max_version_text(getattr(record, "addon_version", ""), addon_version_from_module_name(record.source_module))
         record.discovered = True
 
+
+def canonicalize_workflow_drawer_ids(state, space_type=None):
+    """Collapse generated multi-panel IDs into their host drawer."""
+    if state is None:
+        return False
+    target_space = space_type or getattr(state, "space_type", "VIEW_3D")
+    changed = False
+    for workflow in getattr(state, "workflows", []):
+        old_ids = [getattr(item, "panel_id", "") for item in getattr(workflow, "panels", [])]
+        if not old_ids:
+            continue
+        new_ids = unique_panel_ids(
+            panel_drawer_root_id(panel_id, space_type=target_space)
+            if panel_id and panel_id != "BWFLOW_PT_workflow"
+            else panel_id
+            for panel_id in old_ids
+        )
+        if new_ids == old_ids:
+            continue
+        active_index = clamp_index(getattr(workflow, "active_panel_index", 0), len(old_ids))
+        active_id = old_ids[active_index] if old_ids else ""
+        active_id = (
+            panel_drawer_root_id(active_id, space_type=target_space)
+            if active_id and active_id != "BWFLOW_PT_workflow"
+            else active_id
+        )
+        replace_workflow_panels(workflow, new_ids)
+        set_active_workflow_panel_by_id(workflow, active_id)
+        changed = True
+    return changed
+
+
 def rebuild_panel_cache(scene=None, space_type=None, restore_first=True, install_poll=True):
     target_scene = scene or safe_context_scene()
     target_spaces = (space_type,) if space_type else iter_supported_space_types()
-    repair_missing_panel_poll_callbacks(space_type=space_type)
-    repair_problematic_panel_draw_callbacks(space_type=space_type)
     for target_space in target_spaces:
+        state = get_state(scene=target_scene, space_type=target_space)
+        runtime_enabled = workflow_runtime_initialized(state)
+        if runtime_enabled:
+            repair_missing_panel_poll_callbacks(space_type=target_space)
+            repair_problematic_panel_draw_callbacks(space_type=target_space)
         if restore_first and has_runtime_unregistered_panels(space_type=target_space):
             restore_unregistered_panels(space_type=target_space)
         PANEL_GROUP_INDEX_CACHE_BY_SPACE.pop(target_space, None)
+        PANEL_GROUP_ICON_CACHE_BY_SPACE.pop(target_space, None)
         PANEL_DRAWER_ROOT_CACHE_BY_SPACE.pop(target_space, None)
         PANEL_LIBRARY_GROUPS_CACHE_BY_SPACE.pop(target_space, None)
         PANEL_GROUP_FILTER_CACHE_BY_SPACE.pop(f"{target_space}:library", None)
@@ -4298,11 +4949,26 @@ def rebuild_panel_cache(scene=None, space_type=None, restore_first=True, install
         PANEL_CLASS_CACHE_BY_SPACE[target_space] = discover_sidebar_panels(target_space)
         if target_scene is not None:
             sync_registry(target_scene, space_type=target_space)
+            if runtime_enabled:
+                canonicalize_workflow_drawer_ids(
+                    get_state(scene=target_scene, space_type=target_space),
+                    space_type=target_space,
+                )
     if install_poll:
-        ensure_panel_poll_overrides(space_type=space_type)
+        for target_space in target_spaces:
+            state = get_state(scene=target_scene, space_type=target_space)
+            if workflow_runtime_initialized(state):
+                ensure_panel_poll_overrides(space_type=target_space)
 
 
 def rebuild_runtime_panels(scene=None, space_type=None, rebuild_cache=True):
+    target_scene = scene or safe_context_scene()
+    target_spaces = (space_type,) if space_type else iter_supported_space_types()
+    if not any(
+        workflow_runtime_initialized(get_state(scene=target_scene, space_type=target_space))
+        for target_space in target_spaces
+    ):
+        return False
     changed = False
     if rebuild_cache and has_runtime_unregistered_panels(space_type=space_type):
         restore_unregistered_panels(space_type=space_type)
@@ -4334,6 +5000,8 @@ def refresh_runtime(scene=None):
     for target_space in iter_supported_space_types():
         state = get_state(scene=target_scene, space_type=target_space)
         if state is None:
+            continue
+        if not workflow_runtime_initialized(state):
             continue
 
         if state.settings.auto_sync_registry:
@@ -4401,6 +5069,8 @@ def schedule_deferred_workflow_switch_refresh(scene=None, space_type="VIEW_3D", 
             return None
         try:
             state = get_state(scene=scene_ref, space_type=target_space_type)
+            if not workflow_runtime_initialized(state):
+                return None
             workflow = get_active_workflow(state)
             if workflow is not None and workflow.is_default:
                 restore_space_default_n_panel_state(
@@ -4489,6 +5159,7 @@ def reset_space_state(state):
     state.selected_group_expanded_keys = ""
     state.module_editor_text = ""
     if state.settings is not None:
+        state.settings.runtime_initialized = False
         state.settings.auto_sync_registry = True
         state.settings.show_missing_summary = True
         state.settings.runtime_preview_lines = 3
@@ -4984,6 +5655,7 @@ def serialize_workflow(workflow, state=None):
 
 def serialize_space_settings(space_state):
     return {
+        "runtime_initialized": bool(getattr(space_state.settings, "runtime_initialized", False)),
         "auto_sync_registry": space_state.settings.auto_sync_registry,
         "show_missing_summary": space_state.settings.show_missing_summary,
         "runtime_preview_lines": space_state.settings.runtime_preview_lines,
@@ -5251,6 +5923,45 @@ def hydrate_preset_payload_scripts_from_archive(payload, filepath):
     return payload
 
 
+def collect_window_layouts(scene=None):
+    """Capture lightweight window/screen/area routing metadata for presets."""
+    layouts = []
+    window_manager = getattr(bpy.context, "window_manager", None)
+    if window_manager is None:
+        return layouts
+    for window_index, window in enumerate(getattr(window_manager, "windows", [])):
+        screen = getattr(window, "screen", None)
+        if screen is None:
+            continue
+        areas = []
+        for area_index, area in enumerate(getattr(screen, "areas", [])):
+            area_type = str(getattr(area, "type", "") or "")
+            if area_type not in SUPPORTED_SPACE_TYPES:
+                continue
+            areas.append(
+                {
+                    "index": area_index,
+                    "type": area_type,
+                    "ui_type": str(getattr(area, "ui_type", "") or ""),
+                    "x": int(getattr(area, "x", 0) or 0),
+                    "y": int(getattr(area, "y", 0) or 0),
+                    "width": int(getattr(area, "width", 0) or 0),
+                    "height": int(getattr(area, "height", 0) or 0),
+                }
+            )
+        if not areas:
+            continue
+        layouts.append(
+            {
+                "window_index": window_index,
+                "workspace": str(getattr(getattr(window, "workspace", None), "name", "") or ""),
+                "screen": str(getattr(screen, "name", "") or ""),
+                "areas": areas,
+            }
+        )
+    return layouts
+
+
 def build_current_workflow_preset_payload(scene, context=None, space_type=None):
     space_type = space_type or current_space_type(context=context)
     state = get_state(context=context, scene=scene, space_type=space_type)
@@ -5270,6 +5981,7 @@ def build_current_workflow_preset_payload(scene, context=None, space_type=None):
         "panel_registry": collect_workflow_panel_registry_records(state, [workflow]),
         "script_library": serialize_script_library_items(related_scripts),
         "workflow": workflow_payload,
+        "window_layouts": collect_window_layouts(scene),
     }
     return sanitize_current_workflow_preset_payload(payload)
 
@@ -5311,14 +6023,59 @@ def build_selected_workflows_preset_payload(scene, context=None, space_type=None
     if space_payload is None:
         return None
 
+    space_states = {space_type: space_payload}
+    selected_names = {
+        workflow_payload.get("name", "")
+        for workflow_payload in workflow_payloads
+        if workflow_payload.get("name", "")
+    }
+    for target_space in iter_supported_space_types():
+        if target_space == space_type:
+            continue
+        target_state = get_state(scene=scene, space_type=target_space)
+        if target_state is None:
+            continue
+        matching_workflows = [
+            workflow
+            for workflow in getattr(target_state, "workflows", [])
+            if getattr(workflow, "name", "") in selected_names
+        ]
+        if not matching_workflows:
+            continue
+        target_payloads = [
+            workflow_payload
+            for workflow_payload in (
+                serialize_workflow(workflow, state=target_state)
+                for workflow in matching_workflows
+            )
+            if workflow_payload is not None
+        ]
+        if not target_payloads:
+            continue
+        target_space_payload = sanitize_space_payload(
+            {
+                "label": SPACE_LABELS.get(target_space, target_space),
+                "active_workflow_index": 0,
+                "settings": serialize_space_settings(target_state),
+                "panel_registry": collect_workflow_panel_registry_records(
+                    target_state, matching_workflows
+                ),
+                "script_library": serialize_script_library_items(
+                    workflow_related_script_library_items(target_state, matching_workflows)
+                ),
+                "workflows": target_payloads,
+            }
+        )
+        if target_space_payload is not None:
+            space_states[target_space] = target_space_payload
+
     return sanitize_full_payload(
         {
             "schema_version": SCHEMA_VERSION,
             "preset_kind": "workflow_collection",
             "exported_at": datetime.utcnow().isoformat() + "Z",
-            "space_states": {
-                space_type: space_payload,
-            },
+            "space_states": space_states,
+            "window_layouts": collect_window_layouts(scene),
         }
     )
 
@@ -5334,6 +6091,7 @@ def build_full_state_payload(scene):
         if space_state is None:
             continue
         payload["space_states"][space_type] = serialize_space_state(space_state)
+    payload["window_layouts"] = collect_window_layouts(scene)
     return sanitize_full_payload(payload)
 
 
@@ -5349,6 +6107,7 @@ def apply_space_state_payload(state, space_payload):
     clear_collection(state.script_library)
 
     settings = cleaned_payload.get("settings", {})
+    state.settings.runtime_initialized = coerce_bool_value(settings.get("runtime_initialized", False), False)
     state.settings.auto_sync_registry = coerce_bool_value(settings.get("auto_sync_registry", True), True)
     state.settings.show_missing_summary = coerce_bool_value(settings.get("show_missing_summary", True), True)
     state.settings.runtime_preview_lines = coerce_int_value(settings.get("runtime_preview_lines", 3), 3)
@@ -6028,6 +6787,7 @@ def current_workflow_preset_entry(payload):
     return {
         "key": preset_entry_key(space_type, 0, workflow.get("name", "")),
         "space_type": space_type,
+        "window_layouts": sanitized.get("window_layouts", []),
         "source_label": sanitized.get("space_label", "") or SPACE_LABELS.get(space_type, space_type),
         "preset_archive_path": sanitized.get("preset_archive_path", ""),
         "workflow_index": 0,
@@ -6068,6 +6828,7 @@ def workflow_preset_entries_from_payload(payload, preferred_space_type=None):
                     {
                         "key": preset_entry_key(space_type, workflow_index, workflow_name),
                         "space_type": space_type,
+                        "window_layouts": sanitized_payload.get("window_layouts", []),
                         "source_label": SPACE_LABELS.get(space_type, space_type),
                         "preset_archive_path": payload.get("preset_archive_path", ""),
                         "workflow_index": workflow_index,
@@ -6096,6 +6857,7 @@ def workflow_preset_entries_from_payload(payload, preferred_space_type=None):
             {
                 "key": preset_entry_key("VIEW_3D", workflow_index, workflow_name),
                 "space_type": "VIEW_3D",
+                "window_layouts": [],
                 "source_label": SPACE_LABELS.get("VIEW_3D", "VIEW_3D"),
                 "preset_archive_path": payload.get("preset_archive_path", ""),
                 "workflow_index": workflow_index,
@@ -6116,6 +6878,7 @@ def current_workflow_preset_payload_from_entry(entry):
             "schema_version": SCHEMA_VERSION,
             "preset_kind": CURRENT_WORKFLOW_PRESET_KIND,
             "exported_at": datetime.utcnow().isoformat() + "Z",
+            "window_layouts": entry.get("window_layouts", []),
             "space_type": entry.get("space_type", "VIEW_3D"),
             "space_label": entry.get("source_label", ""),
             "preset_archive_path": entry.get("preset_archive_path", ""),
@@ -6225,6 +6988,27 @@ def import_single_preset_entry(context, state, entry):
     return workflow
 
 
+def import_preset_entry_across_spaces(context, entry):
+    """Import one preset entry into its recorded editor-space state."""
+    scene = getattr(context, "scene", None)
+    if scene is None or not isinstance(entry, dict):
+        return []
+    imported = []
+    target_space = str(entry.get("space_type", "") or "").strip()
+    if target_space not in SUPPORTED_SPACE_TYPES:
+        target_space = current_space_type(context=context)
+    target_state = get_state(scene=scene, space_type=target_space)
+    if target_state is None:
+        return imported
+    ensure_minimum_setup(scene, restore_global=False, save_state=False)
+    workflow = import_single_preset_entry(context, target_state, entry)
+    if workflow is not None:
+        finish_current_space_preset_import(context, target_state, [workflow])
+        imported.append((target_space, workflow.name))
+    tag_redraw_all()
+    return imported
+
+
 def preset_import_cache_key(state):
     if state is None:
         return ""
@@ -6232,35 +7016,57 @@ def preset_import_cache_key(state):
 
 
 def set_preset_import_cache(state, filepath, entries, selected_index=0):
-    key = preset_import_cache_key(state)
-    if not key:
+    if state is None:
         return
     entries = list(entries or [])
     selected_index = clamp_index(int(selected_index or 0), len(entries)) if entries else 0
-    PRESET_IMPORT_ENTRY_CACHE[key] = {
-        "filepath": str(filepath or ""),
-        "entries": entries,
-        "selected_index": selected_index,
-    }
-    try:
-        state.preset_filepath = str(filepath or "")
-        state.preset_workflow_index = selected_index
-        clear_collection(state.preset_workflows)
-    except Exception:
-        pass
+    target_scene = safe_context_scene()
+    for target_space in iter_supported_space_types():
+        key = str(target_space)
+        PRESET_IMPORT_ENTRY_CACHE[key] = {
+            "filepath": str(filepath or ""),
+            "entries": entries,
+            "selected_index": selected_index,
+        }
+        target_state = (
+            get_state(scene=target_scene, space_type=target_space)
+            if target_scene is not None
+            else None
+        )
+        if target_state is None:
+            continue
+        try:
+            target_state.preset_filepath = str(filepath or "")
+            target_state.preset_workflow_index = selected_index
+            clear_collection(target_state.preset_workflows)
+            populate_preset_workflow_list(
+                target_state,
+                entries,
+                preferred_space_type=target_space,
+                sync_cache=False,
+            )
+        except Exception:
+            traceback.print_exc()
 
 
 def clear_preset_import_cache(state):
-    key = preset_import_cache_key(state)
-    if key:
-        PRESET_IMPORT_ENTRY_CACHE.pop(key, None)
-    try:
-        state.preset_filepath = ""
-        state.preset_status = ""
-        state.preset_workflow_index = 0
-        clear_collection(state.preset_workflows)
-    except Exception:
-        pass
+    PRESET_IMPORT_ENTRY_CACHE.clear()
+    target_scene = safe_context_scene()
+    for target_space in iter_supported_space_types():
+        target_state = (
+            get_state(scene=target_scene, space_type=target_space)
+            if target_scene is not None
+            else None
+        )
+        if target_state is None:
+            continue
+        try:
+            target_state.preset_filepath = ""
+            target_state.preset_status = ""
+            target_state.preset_workflow_index = 0
+            clear_collection(target_state.preset_workflows)
+        except Exception:
+            traceback.print_exc()
 
 
 def get_preset_import_cache(state):
@@ -6303,7 +7109,7 @@ def set_preset_import_selected_index(state, index):
     return selected_index
 
 
-def populate_preset_workflow_list(state, entries, preferred_space_type=None):
+def populate_preset_workflow_list(state, entries, preferred_space_type=None, sync_cache=True):
     if state is None:
         return 0
     selectable_entries = [entry for entry in entries if not workflow_entry_is_default(entry)]
@@ -6327,7 +7133,13 @@ def populate_preset_workflow_list(state, entries, preferred_space_type=None):
         state.preset_workflow_index = selected_index
     except Exception:
         pass
-    set_preset_import_cache(state, get_preset_import_cache(state).get("filepath", ""), entries, selected_index=selected_index)
+    if sync_cache:
+        set_preset_import_cache(
+            state,
+            get_preset_import_cache(state).get("filepath", ""),
+            entries,
+            selected_index=selected_index,
+        )
     return len(entries)
 
 
@@ -10767,6 +11579,10 @@ class BWFLOW_PG_Workflow(PropertyGroup):
 
 
 class BWFLOW_PG_Settings(PropertyGroup):
+    runtime_initialized: BoolProperty(
+        name="Go工作流已初始化",
+        default=False,
+    )
     auto_sync_registry: BoolProperty(
         name="刷新时同步面板库",
         default=True,
@@ -11037,7 +11853,11 @@ class BWFLOW_OT_initialize_defaults(Operator):
 
     def execute(self, context):
         space_type = current_space_type(context)
+        extend_pre_go_workflow_order_snapshot(space_type=space_type)
         created = ensure_minimum_setup(context.scene, restore_global=False, save_state=False)
+        state = get_state(context=context, space_type=space_type)
+        if state is not None and state.settings is not None:
+            state.settings.runtime_initialized = True
         try:
             rebuild_panel_cache(scene=context.scene, space_type=space_type)
         except Exception:
@@ -11086,28 +11906,47 @@ class BWFLOW_OT_reset_all_settings(Operator):
     def execute(self, context):
         clear_panel_filter()
         uninstall_panel_poll_overrides()
+        _cancel_tracked_one_shot_timers()
 
         scenes = list(iter_available_scenes())
         for scene in scenes:
+            restore_default_n_panel_state(
+                scene=scene,
+                disable_filters=True,
+                switch_workflow=True,
+                sync_registry_after_restore=False,
+            )
             clear_scene_go_workflow_runtime(scene)
             for space_type in iter_supported_space_types():
                 state = get_state(scene=scene, space_type=space_type)
                 if state is not None:
                     reset_space_state(state)
+            prune_unreferenced_imported_preset_assets(scene=scene, max_delete=100000)
 
         filepath = global_workflow_state_path()
-        if os.path.isfile(filepath):
-            try:
-                os.remove(filepath)
-            except Exception:
-                traceback.print_exc()
+        for candidate in (filepath, filepath + ".bak"):
+            if os.path.isfile(candidate):
+                try:
+                    os.remove(candidate)
+                except Exception:
+                    traceback.print_exc()
 
-        for scene in scenes:
-            ensure_minimum_setup(scene)
-            rebuild_panel_cache(scene=scene)
-            rebuild_runtime_panels(scene=scene, rebuild_cache=False)
-
-        save_global_workflow_state(context.scene)
+        PRESET_IMPORT_ENTRY_CACHE.clear()
+        IMPORTED_PRESET_ASSET_PATH_CACHE.clear()
+        PANEL_CLASS_CACHE_BY_SPACE.clear()
+        PANEL_GROUP_ICON_CACHE_BY_SPACE.clear()
+        PANEL_GROUP_INDEX_CACHE_BY_SPACE.clear()
+        PANEL_DRAWER_ROOT_CACHE_BY_SPACE.clear()
+        PANEL_LIBRARY_GROUPS_CACHE_BY_SPACE.clear()
+        PANEL_LIBRARY_GROUP_ENTRY_CACHE_BY_SPACE.clear()
+        SELECTED_PANEL_GROUPS_CACHE_BY_SPACE.clear()
+        SELECTED_PANEL_GROUP_SUMMARY_CACHE_BY_SPACE.clear()
+        PANEL_VISIBILITY_DATA_CACHE_BY_SPACE.clear()
+        PANEL_FILTER_SIGNATURE_BY_SPACE.clear()
+        PANEL_ORDER_SIGNATURE_BY_SPACE.clear()
+        ACTIVE_ALLOWED_PANEL_IDS_BY_SPACE.clear()
+        RUNTIME_HIDDEN_PANEL_IDS_CACHE_BY_SPACE.clear()
+        clear_pre_go_workflow_state()
         tag_redraw_all()
         self.report({"INFO"}, "已清除所有设置并恢复默认状态")
         return {"FINISHED"}
@@ -12373,13 +13212,13 @@ class BWFLOW_OT_panel_toggle_for_workflow(Operator):
         if has_any:
             kept_ids = [item.panel_id for item in workflow.panels if item.panel_id not in workflow_panel_ids]
             replace_workflow_panels(workflow, kept_ids)
-            mark_panel_visibility_pending(state, scene=context.scene, context=context)
+            queue_panel_visibility_pending(state, scene=context.scene, context=context)
             clear_panel_library_click_state(state)
             self.report({"INFO"}, f"已移出当前抽屉面板，共 {len(workflow_panel_ids)} 个。")
             return {"FINISHED"}
 
         added = append_panel_ids_to_workflow(workflow, workflow_panel_ids)
-        mark_panel_visibility_pending(state, scene=context.scene, context=context)
+        queue_panel_visibility_pending(state, scene=context.scene, context=context)
         clear_panel_library_click_state(state)
         self.report({"INFO"}, f"已加入当前抽屉面板，共 {added} 个。")
         return {"FINISHED"}
@@ -12395,16 +13234,15 @@ def toggle_panel_group_for_workflow(context, state, workflow, group_key="", pane
         index = clamp_index(panel_index, len(state.panel_registry))
         state.panel_registry_index = index
         record = state.panel_registry[index]
-        target_key = workflow_group_key_for_panel(state, record.panel_id)
+        target_key = panel_library_group_key_for_panel(state, record.panel_id)
         target_group = next((group for group in groups if group.get("key") == target_key), None)
 
     if target_group is None:
         return {"CANCELLED"}, ""
 
-    entries = panel_library_group_entries(state, workflow, target_group)
     drawer_ids = workflow_toggleable_panel_ids(
         state,
-        (entry.get("panel_id", "") for entry in entries),
+        target_group.get("drawer_ids", ()) or (),
     )
     if not drawer_ids:
         return {"CANCELLED"}, ""
@@ -12420,7 +13258,7 @@ def toggle_panel_group_for_workflow(context, state, workflow, group_key="", pane
 
     set_active_workflow_panel_by_id(workflow, drawer_ids[0])
     scene = getattr(context, "scene", None)
-    mark_panel_visibility_pending(state, scene=scene, context=context)
+    queue_panel_visibility_pending(state, scene=scene, context=context)
     clear_panel_library_click_state(state)
     return {"FINISHED"}, message
 
@@ -12526,7 +13364,7 @@ class BWFLOW_OT_panel_add_all_to_workflow(Operator):
             workflow,
             drawer_ids,
         )
-        mark_panel_visibility_pending(state, scene=context.scene, context=context)
+        queue_panel_visibility_pending(state, scene=context.scene, context=context)
         self.report({"INFO"}, f"已按默认 N 面板顺序加入 {added} 个面板组")
         return {"FINISHED"}
 
@@ -12553,7 +13391,7 @@ class BWFLOW_OT_panel_add_current_plugin_to_workflow(Operator):
         record = state.panel_registry[index]
         panel_ids = panel_drawer_workflow_ids(state, record.panel_id)
         added = append_panel_ids_to_workflow(workflow, panel_ids)
-        mark_panel_visibility_pending(state, scene=context.scene, context=context)
+        queue_panel_visibility_pending(state, scene=context.scene, context=context)
         self.report({"INFO"}, f"已添加当前抽屉面板，共 {added} 个。")
         return {"FINISHED"}
 
@@ -12589,13 +13427,13 @@ class BWFLOW_OT_panel_toggle_single_for_workflow(Operator):
         if panel_id in selected_ids:
             kept_ids = [item.panel_id for item in workflow.panels if item.panel_id != panel_id]
             replace_workflow_panels(workflow, kept_ids)
-            mark_panel_visibility_pending(state, scene=context.scene, context=context)
+            queue_panel_visibility_pending(state, scene=context.scene, context=context)
             clear_panel_library_click_state(state)
             self.report({"INFO"}, "已移出当前面板。")
             return {"FINISHED"}
 
         added = append_panel_ids_to_workflow(workflow, [panel_id])
-        mark_panel_visibility_pending(state, scene=context.scene, context=context)
+        queue_panel_visibility_pending(state, scene=context.scene, context=context)
         clear_panel_library_click_state(state)
         self.report({"INFO"}, f"已加入当前面板，共 {added} 个。")
         return {"FINISHED"}
@@ -12694,12 +13532,39 @@ class BWFLOW_OT_panel_group_page(Operator):
         return {"FINISHED"}
 
 
+class BWFLOW_OT_clear_panel_group_filter(Operator):
+    bl_idname = "bworkflow.clear_panel_group_filter"
+    bl_label = "清除面板组搜索"
+    bl_description = "清空当前面板组搜索文本"
+
+    target: StringProperty(default="LIBRARY")
+
+    def execute(self, context):
+        state = get_state(context=context)
+        if state is None:
+            return {"CANCELLED"}
+        if self.target == "SELECTED":
+            state.selected_panel_group_filter_text = ""
+            state.selected_panel_group_page = 0
+        else:
+            state.panel_group_filter_text = ""
+            state.panel_group_page = 0
+        if not tag_redraw_context_area(context):
+            tag_redraw_all()
+        return {"FINISHED"}
+
+
 class BWFLOW_OT_select_workflow_panel(Operator):
     bl_idname = "bworkflow.select_workflow_panel"
     bl_label = "选择工作流面板"
     bl_description = "单击选中，双击切换当前工作流中的这个面板"
 
     panel_id: StringProperty(default="")
+    tooltip_text: StringProperty(default="")
+
+    @classmethod
+    def description(cls, _context, properties):
+        return getattr(properties, "tooltip_text", "") or cls.bl_description
 
     @classmethod
     def poll(cls, context):
@@ -12750,6 +13615,11 @@ class BWFLOW_OT_panel_group_click(Operator):
     group_key: StringProperty(default="")
     panel_index: IntProperty(default=-1)
     target: StringProperty(default="LIBRARY")
+    tooltip_text: StringProperty(default="")
+
+    @classmethod
+    def description(cls, _context, properties):
+        return getattr(properties, "tooltip_text", "") or cls.bl_description
 
     def execute(self, context):
         return self._handle(context, event=None)
@@ -13437,25 +14307,20 @@ def import_preset_file_direct(context, filepath):
     ensure_minimum_setup(context.scene, restore_global=False, save_state=False)
     preferred_space_type = current_space_type(context=context)
     entries = prepare_safe_preset_entries(workflow_preset_entries_from_payload(payload, preferred_space_type=preferred_space_type))
-    entries = direct_import_workflow_entries(entries, preferred_space_type=preferred_space_type)[:1]
+    non_default_entries = [
+        entry for entry in entries if not workflow_entry_is_default(entry)
+    ]
+    entries = non_default_entries or direct_import_workflow_entries(
+        entries,
+        preferred_space_type=preferred_space_type,
+    )
     imported = []
-    imported_workflows = []
     for entry in entries:
-        workflow = import_single_preset_entry(context, state, entry)
-        if workflow is None:
-            continue
-        imported.append(workflow.name)
-        imported_workflows.append(workflow)
+        imported.extend(import_preset_entry_across_spaces(context, entry))
     if not imported:
         print("[Go Workflow] No workflow imported.")
         return False
-    missing_count, missing_suffix, low_version_count, low_version_suffix = finish_current_space_preset_import(context, state, imported_workflows)
-    if missing_count:
-        print(f"[Go Workflow] Imported {len(imported)} workflow(s); missing panels {missing_count}{missing_suffix}{low_version_suffix}.")
-    elif low_version_count:
-        print(f"[Go Workflow] Imported {len(imported)} workflow(s){low_version_suffix}.")
-    else:
-        print(f"[Go Workflow] Imported {len(imported)} workflow(s).")
+    print(f"[Go Workflow] Imported {len(imported)} workflow(s) across editor spaces.")
     return True
 
 
@@ -13698,25 +14563,14 @@ class BWFLOW_OT_preset_import_selected(Operator):
 
         ensure_minimum_setup(context.scene, restore_global=False, save_state=False)
         imported = []
-        imported_workflows = []
         for entry in selected_entries:
-            workflow = import_single_preset_entry(context, state, entry)
-            if workflow is None:
-                continue
-            imported.append(workflow.name)
-            imported_workflows.append(workflow)
+            imported.extend(import_preset_entry_across_spaces(context, entry))
 
         if not imported:
             print("[Go Workflow] No workflow imported.")
             return {"CANCELLED"}
 
-        missing_count, missing_suffix, low_version_count, low_version_suffix = finish_current_space_preset_import(context, state, imported_workflows)
-        if missing_count:
-            print(f"[Go Workflow] Imported {len(imported)} workflow(s); missing panels {missing_count}{missing_suffix}{low_version_suffix}.")
-        elif low_version_count:
-            print(f"[Go Workflow] Imported {len(imported)} workflow(s){low_version_suffix}.")
-        else:
-            print(f"[Go Workflow] Imported {len(imported)} workflow(s).")
+        print(f"[Go Workflow] Imported {len(imported)} workflow(s) across editor spaces.")
         return {"FINISHED"}
 
 
@@ -13774,6 +14628,12 @@ def draw_workflow_runtime(layout, state):
     workflow = get_active_workflow(state)
     if workflow is None:
         layout.label(text="当前没有可用 Go工作流", icon="INFO")
+        return
+
+    if not workflow_runtime_initialized(state):
+        box = layout.box()
+        box.label(text="Go工作流尚未初始化，当前未修改第三方 N 面板", icon="INFO")
+        box.operator("bworkflow.initialize_defaults", icon="ADD")
         return
 
     preview_lines = state.settings.runtime_preview_lines
@@ -13945,9 +14805,6 @@ def draw_workflow_settings(layout, state):
     detail.label(text="当前工作流设置", icon="SETTINGS")
     detail.prop(workflow, "name", text="名称")
     detail.prop(workflow, "description", text="说明")
-    row = detail.row(align=True)
-    row.operator("bworkflow.workflow_set_default", text="设为默认", icon="HOME")
-    row.operator("bworkflow.workflow_clear_description", text="清空说明", icon="TRASH")
     if workflow.is_default:
         detail.label(text="当前 Go工作流就是默认 Go工作流。", icon="CHECKMARK")
         return
@@ -14027,7 +14884,8 @@ def draw_panel_library_editor(layout, state):
     tool_row.operator("bworkflow.refresh_registry", text="刷新面板库")
     tool_row.operator("bworkflow.panel_add_all_to_workflow", text="按默认 N 面板加入")
     if getattr(state, "panel_group_filter_text", ""):
-        tool_row.prop(state, "panel_group_filter_text", text="", icon="X")
+        clear_filter = tool_row.operator("bworkflow.clear_panel_group_filter", text="", icon="X")
+        clear_filter.target = "LIBRARY"
 
     visible_groups, library_page, library_page_count = paged_panel_groups(
         state, filtered_groups, "panel_group_page", PANEL_GROUP_DRAW_LIMIT
@@ -14062,15 +14920,41 @@ def draw_panel_library_editor(layout, state):
             )
             expand_op.group_key = group["key"]
             expand_op.target = "LIBRARY"
+            group_icon = panel_group_icon_data(state, group)
+            icon_kwargs = {
+                "text": group_icon["text"],
+                "emboss": False,
+                "translate": False,
+            }
+            if group_icon["icon_value"]:
+                icon_kwargs["icon_value"] = group_icon["icon_value"]
+            else:
+                icon_kwargs["icon"] = group_icon["icon"]
+            icon_cell = header_row.row(align=True)
+            icon_cell.scale_x = 0.9 if group_icon["icon_value"] or group_icon["icon"] != "NONE" else 0.68
+            group_icon_op = icon_cell.operator(
+                "bworkflow.panel_group_click",
+                **icon_kwargs,
+            )
+            group_icon_op.group_key = group["key"]
+            group_icon_op.panel_index = group.get("first_panel_index", -1)
+            group_icon_op.target = "LIBRARY"
+            group_icon_op.tooltip_text = (
+                f"\u539f\u63d2\u4ef6\u540d\u79f0\uff1a{group.get('original_title', group['title'])}"
+            )
             group_op = header_row.operator(
                 "bworkflow.panel_group_click",
                 text=group["title"],
-                icon="OUTLINER_COLLECTION",
+                icon="NONE",
                 emboss=False,
+                translate=False,
             )
             group_op.group_key = group["key"]
             group_op.panel_index = group.get("first_panel_index", -1)
             group_op.target = "LIBRARY"
+            group_op.tooltip_text = (
+                f"\u539f\u63d2\u4ef6\u540d\u79f0\uff1a{group.get('original_title', group['title'])}"
+            )
             header_row.label(text="", icon=status_icon)
             header_row.label(text=panel_count_label(group.get("panel_count", 0)), icon="MENU_PANEL")
             if expanded:
@@ -14124,7 +15008,11 @@ def draw_panel_library_editor(layout, state):
         row.operator("bworkflow.panel_clear_workflow", text="清空全部")
 
         selected_groups = build_selected_panel_groups(state, workflow)
-        selected.prop(state, "selected_panel_group_filter_text", text="搜索")
+        selected_filter_row = selected.row(align=True)
+        selected_filter_row.prop(state, "selected_panel_group_filter_text", text="搜索")
+        if getattr(state, "selected_panel_group_filter_text", ""):
+            clear_filter = selected_filter_row.operator("bworkflow.clear_panel_group_filter", text="", icon="X")
+            clear_filter.target = "SELECTED"
         filtered_selected_groups = filtered_panel_groups(
             selected_groups,
             getattr(state, "selected_panel_group_filter_text", ""),
@@ -14157,13 +15045,39 @@ def draw_panel_library_editor(layout, state):
             )
             group_toggle.group_key = group["key"]
             group_toggle.target = "SELECTED"
+            group_icon = panel_group_icon_data(state, group)
+            icon_kwargs = {
+                "text": group_icon["text"],
+                "emboss": False,
+                "translate": False,
+            }
+            if group_icon["icon_value"]:
+                icon_kwargs["icon_value"] = group_icon["icon_value"]
+            else:
+                icon_kwargs["icon"] = group_icon["icon"]
+            icon_cell = header_row.row(align=True)
+            icon_cell.scale_x = 0.9 if group_icon["icon_value"] or group_icon["icon"] != "NONE" else 0.68
+            group_icon_op = icon_cell.operator(
+                "bworkflow.select_workflow_panel",
+                **icon_kwargs,
+            )
+            group_icon_op.panel_id = group.get("panel_id", "")
+            group_icon_op.tooltip_text = (
+                f"\u4e2d\u6587\u540d\u79f0\uff1a{group.get('title', '')}\n"
+                f"\u539f\u63d2\u4ef6\u540d\uff1a{group.get('original_title', group.get('title', ''))}"
+            )
             group_select = header_row.operator(
                 "bworkflow.select_workflow_panel",
                 text=group["title"],
-                icon="LAYER_ACTIVE" if group.get("is_active") else "OUTLINER_COLLECTION",
+                icon="NONE",
                 emboss=False,
+                translate=False,
             )
             group_select.panel_id = group.get("panel_id", "")
+            group_select.tooltip_text = (
+                f"\u4e2d\u6587\u540d\u79f0\uff1a{group.get('title', '')}\n"
+                f"\u539f\u63d2\u4ef6\u540d\uff1a{group.get('original_title', group.get('title', ''))}"
+            )
             header_row.label(text=panel_count_label(group.get("panel_count", 0)), icon="DOT")
             group_up = header_row.operator(
                 "bworkflow.panel_move_in_workflow",
@@ -14194,6 +15108,10 @@ def draw_panel_library_editor(layout, state):
                         emboss=False,
                     )
                     select_op.panel_id = entry["panel_id"]
+                    select_op.tooltip_text = (
+                        f"\u4e2d\u6587\u540d\u79f0\uff1a{entry.get('title', '')}\n"
+                        f"\u539f\u63d2\u4ef6\u540d\uff1a{panel_group_original_title(state, entry.get('panel_id', ''), entry.get('title', ''))}"
+                    )
                     child_up = row.operator(
                         "bworkflow.panel_move_child_in_group",
                         text="",
@@ -14498,6 +15416,16 @@ def draw_global_settings(layout, state):
     box.prop(state.settings, "runtime_preview_lines")
     box.operator("bworkflow.clear_missing_panel_warnings", text="清除缺失面板提示", icon="HIDE_ON")
 
+    if tuple(getattr(bpy.app, "version", ()) or ()) >= (5, 2, 0):
+        icon_box = box.box()
+        icon_box.label(text="Blender 5.2 N 面板", icon="MENU_PANEL")
+        icon_box.prop(
+            bpy.context.preferences.system,
+            "show_panel_tabs_compact",
+            text="Compact Tabs",
+            toggle=True,
+        )
+
     mem_box = box.box()
     mem_box.label(text="内存管理", icon="MEMORY")
     mem_box.operator("bworkflow.release_memory", text="现在释放内存", icon="TRASH")
@@ -14625,9 +15553,22 @@ def bworkflow_load_post(_dummy):
             for scene in scenes:
                 ensure_minimum_setup(scene, restore_global=True, save_state=False)
             scene = safe_context_scene() or (scenes[0] if scenes else None)
-            rebuild_panel_cache(scene=scene)
-            refresh_runtime_overrides(scene=scene, include_script_panels=True)
-            schedule_deferred_runtime_refresh(scene=scene, intervals=(0.25,))
+            for target_scene in scenes:
+                for target_space in iter_supported_space_types():
+                    target_state = get_state(scene=target_scene, space_type=target_space)
+                    if not workflow_runtime_initialized(target_state):
+                        continue
+                    rebuild_panel_cache(scene=target_scene, space_type=target_space)
+                    refresh_runtime_overrides(
+                        scene=target_scene,
+                        space_type=target_space,
+                        include_script_panels=True,
+                    )
+                    schedule_deferred_runtime_refresh(
+                        scene=target_scene,
+                        intervals=(0.25,),
+                        space_type=target_space,
+                    )
         except Exception:
             traceback.print_exc()
         finally:
@@ -14762,6 +15703,7 @@ CLASSES = [
     BWFLOW_OT_group_expand_toggle,
     BWFLOW_OT_panel_match_imported_by_name,
     BWFLOW_OT_panel_group_page,
+    BWFLOW_OT_clear_panel_group_filter,
     BWFLOW_OT_select_workflow_panel,
     BWFLOW_OT_panel_group_click,
     BWFLOW_OT_panel_add_tagged_to_workflow,
@@ -15072,9 +16014,8 @@ def register():
     IS_INITIALIZING_ADDON = True
 
     try:
+        capture_pre_go_workflow_state()
         apply_operator_tooltip_overrides()
-        repair_problematic_panel_draw_callbacks()
-
         for cls in CLASSES:
             bpy.utils.register_class(cls)
 
@@ -15093,9 +16034,22 @@ def register():
             LOAD_HANDLER_REGISTERED = True
 
         scene = safe_context_scene() or (scenes[0] if scenes else None)
-        rebuild_panel_cache(scene=scene)
-        refresh_runtime_overrides(scene=scene, include_script_panels=True)
-        schedule_deferred_runtime_refresh(scene=scene, intervals=(0.25,))
+        for target_scene in scenes:
+            for target_space in iter_supported_space_types():
+                target_state = get_state(scene=target_scene, space_type=target_space)
+                if not workflow_runtime_initialized(target_state):
+                    continue
+                rebuild_panel_cache(scene=target_scene, space_type=target_space)
+                refresh_runtime_overrides(
+                    scene=target_scene,
+                    space_type=target_space,
+                    include_script_panels=True,
+                )
+                schedule_deferred_runtime_refresh(
+                    scene=target_scene,
+                    intervals=(0.25,),
+                    space_type=target_space,
+                )
     finally:
         IS_INITIALIZING_ADDON = False
 
@@ -15103,7 +16057,7 @@ def register():
 
 
 def unregister():
-    global LOAD_HANDLER_REGISTERED, MODULE_RUNTIME_FIELD_SYNC_TIMER_ACTIVE
+    global LOAD_HANDLER_REGISTERED, MODULE_RUNTIME_FIELD_SYNC_TIMER_ACTIVE, PANEL_CUSTOM_ICON_PREVIEWS
 
     try:
         quarantine_broken_panel_polls()
@@ -15116,6 +16070,14 @@ def unregister():
         _cancel_tracked_one_shot_timers()
     except Exception:
         traceback.print_exc()
+    if PANEL_CUSTOM_ICON_PREVIEWS is not None:
+        try:
+            bpy.utils.previews.remove(PANEL_CUSTOM_ICON_PREVIEWS)
+        except Exception:
+            pass
+        PANEL_CUSTOM_ICON_PREVIEWS = None
+        PANEL_CUSTOM_ICON_CACHE.clear()
+    PANEL_GROUP_ICON_CACHE_BY_SPACE.clear()
     try:
         drain_validation_timer_callbacks()
     except Exception:
@@ -15187,7 +16149,6 @@ def unregister():
     BUILTIN_SCRIPT_LIBRARY_PAYLOAD_CACHE["signature"] = None
     BUILTIN_SCRIPT_LIBRARY_PAYLOAD_CACHE["payloads"] = []
     MODULE_RUNTIME_CLEANUP_CACHE.clear()
-
     try:
         if LOAD_HANDLER_REGISTERED and bworkflow_load_post in bpy.app.handlers.load_post:
             bpy.app.handlers.load_post.remove(bworkflow_load_post)
@@ -15215,6 +16176,7 @@ def unregister():
             pass
         except Exception:
             traceback.print_exc()
+    clear_pre_go_workflow_state()
 
 
 if __name__ == "__main__":

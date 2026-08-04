@@ -6,15 +6,23 @@ def _registered_panel_classes_list():
 
 
 def iter_panel_subclasses(base_cls):
+    """Yield panel classes in Python's class creation order.
+
+    ``dir(bpy.types)`` is alphabetical and cannot represent Blender's native
+    panel order.  The subclass list is the only stable order available before
+    GoWorkflow starts changing panel registration.
+    """
     seen = set()
-    stack = list(base_cls.__subclasses__())
-    while stack:
-        cls = stack.pop()
-        if cls in seen:
-            continue
-        seen.add(cls)
-        stack.extend(cls.__subclasses__())
-        yield cls
+
+    def walk(parent_cls):
+        for cls in parent_cls.__subclasses__():
+            if cls in seen:
+                continue
+            seen.add(cls)
+            yield cls
+            yield from walk(cls)
+
+    yield from walk(base_cls)
 
 
 def iter_registered_panel_classes():
@@ -23,13 +31,7 @@ def iter_registered_panel_classes():
     if panel_base is None:
         return
 
-    for attr_name in dir(bpy.types):
-        if attr_name.startswith("__"):
-            continue
-        try:
-            cls = getattr(bpy.types, attr_name)
-        except Exception:
-            continue
+    for cls in iter_panel_subclasses(panel_base):
         if cls in seen or not isinstance(cls, type):
             continue
         try:
@@ -79,6 +81,17 @@ def _panel_registration_order_map(registered_classes, space_type=None):
     return order
 
 
+def _panel_bl_order(cls):
+    try:
+        value = getattr(cls, "bl_order", 0)
+    except Exception:
+        return 0
+    try:
+        return int(value)
+    except Exception:
+        return 0
+
+
 def discover_sidebar_panels(
     space_type="VIEW_3D",
     *,
@@ -89,6 +102,15 @@ def discover_sidebar_panels(
     registry = {}
     registered_classes = _registered_panel_classes_list()
     registration_order = _panel_registration_order_map(registered_classes, space_type=space_type)
+    category_order = {}
+    for cls in registered_classes:
+        if getattr(cls, "bl_space_type", None) != space_type:
+            continue
+        if getattr(cls, "bl_region_type", None) != "UI":
+            continue
+        category = getattr(cls, "bl_category", "") or ""
+        if category not in category_order:
+            category_order[category] = len(category_order)
 
     for cls in iter_panel_subclasses(bpy.types.Panel):
         if not is_registered_panel_class(cls):
@@ -126,6 +148,8 @@ def discover_sidebar_panels(
         sorted(
             registry.items(),
             key=lambda item: (
+                category_order.get(getattr(item[1], "bl_category", "") or "", 999999),
+                _panel_bl_order(item[1]),
                 registration_order.get(item[0], 999999),
                 getattr(item[1], "bl_category", ""),
                 clean_panel_title_fn(getattr(item[1], "bl_label", item[0]), item[0]),
