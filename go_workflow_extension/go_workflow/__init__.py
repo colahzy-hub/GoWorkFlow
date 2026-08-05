@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Go工作流 / Go Workflow",
     "author": "OpenAI Codex",
-    "version": (1, 1, 1),
+    "version": (1, 1, 10),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Go工作流",
     "description": "基于工作流的 N 面板筛选与自定义脚本模块工具 / Workflow panel filter and script module manager",
@@ -9,7 +9,7 @@ bl_info = {
 }
 
 # AI定位：插件升版本时同步更新这里的 bl_info["version"]、__version__ 和 blender_manifest.toml。
-__version__ = (1, 1, 1)
+__version__ = (1, 1, 10)
 
 import json
 import csv
@@ -170,6 +170,7 @@ BROKEN_PANEL_POLL_IDS = {
 DEFERRED_REFRESH_INTERVALS = (0.25,)
 DEFERRED_REFRESH_TOKENS = {}
 DEFERRED_REFRESH_PENDING_KEYS = set()
+DEFERRED_REFRESH_REBUILD_CACHE_BY_KEY = {}
 DEFERRED_WORKFLOW_SWITCH_PENDING_KEYS = set()
 DEFERRED_SAVE_INTERVAL = 0.35
 DEFERRED_SAVE_PENDING_SCENES = set()
@@ -887,19 +888,42 @@ def _panel_group_icon_data_uncached(state, group):
     panel_ids = []
     if isinstance(group, dict):
         panel_ids.extend(group.get("drawer_ids", ()) or ())
+        panel_ids.extend(group.get("panel_ids", ()) or ())
         panel_ids.append(group.get("panel_id", ""))
+        panel_ids.extend(group.get("record_ids", ()) or ())
 
     seen = set()
+    valid_icons = panel_icon_identifiers()
     category_label = ""
-    for panel_id in panel_ids:
-        panel_id = str(panel_id or "").strip()
+    for raw_panel_id in panel_ids:
+        panel_id = str(raw_panel_id or "").strip()
         if not panel_id or panel_id in seen:
             continue
         seen.add(panel_id)
-        panel_id = panel_drawer_root_id(panel_id, space_type=space_type) or panel_id
+        drawer_id = panel_drawer_root_id(panel_id, space_type=space_type) or panel_id
         category_label = category_label or panel_drawer_category_label(
-            state, panel_id, space_type=space_type
+            state, drawer_id, space_type=space_type
         )
+
+        candidate_ids = unique_panel_ids((panel_id, drawer_id))
+        for candidate_id in candidate_ids:
+            cls = get_panel_registry(space_type).get(candidate_id) or get_panel_cache(space_type).get(candidate_id)
+            if cls is None:
+                cls = resolve_panel_class_anywhere(candidate_id, space_type=space_type)
+            if cls is None:
+                continue
+
+            icon_value = int(getattr(cls, "bl_icon_value", 0) or 0)
+            if icon_value > 0:
+                return {"icon_value": icon_value, "icon": "", "text": ""}
+
+            icon_id = str(getattr(cls, "bl_icon", "") or "").strip().upper()
+            if icon_id in valid_icons and icon_id != "NONE":
+                return {"icon_value": 0, "icon": icon_id, "text": ""}
+
+    workspace_icon_value = workspace_tool_icon_for_group(state, group)
+    if workspace_icon_value:
+        return {"icon_value": workspace_icon_value, "icon": "", "text": ""}
 
     return {
         "icon_value": 0,
@@ -922,6 +946,7 @@ def panel_group_icon_data(state, group):
         str(group.get("original_title", "") or ""),
         tuple(group.get("drawer_ids", ()) or ()),
         tuple(group.get("panel_ids", ()) or ()),
+        tuple(group.get("record_ids", ()) or ()),
         len(getattr(state, "panel_registry", [])),
     )
     cache = PANEL_GROUP_ICON_CACHE_BY_SPACE.setdefault(space_type, {})
@@ -2672,8 +2697,11 @@ def panel_group_matches_filter(group, filter_text):
         str(value or "")
         for value in (
             group.get("title", ""),
+            group.get("original_title", ""),
             group.get("key", ""),
             " ".join(group.get("drawer_ids", []) or []),
+            " ".join(group.get("panel_ids", []) or []),
+            " ".join(group.get("record_ids", []) or []),
             group.get("panel_id", ""),
         )
     ).casefold()
@@ -2688,9 +2716,11 @@ def panel_groups_filter_signature(groups, filter_text):
             (
                 group.get("key", ""),
                 group.get("title", ""),
+                group.get("original_title", ""),
                 group.get("panel_id", ""),
                 tuple(group.get("drawer_ids", ()) or ()),
                 tuple(group.get("panel_ids", ()) or ()),
+                tuple(group.get("record_ids", ()) or ()),
                 int(group.get("panel_count", 0) or 0),
                 int(group.get("selected_count", 0) or 0),
             )
@@ -2870,7 +2900,9 @@ def build_selected_panel_groups(state, workflow):
                 "panel_count": panel_count,
                 "plugin_title": panel_count_label(panel_count),
                 "entries": [],
+                "drawer_ids": tuple(group.get("drawer_ids", ())),
                 "panel_ids": tuple(group.get("panel_ids", ())),
+                "record_ids": tuple(group.get("panel_ids", ())),
                 "workflow_indexes": tuple(group.get("workflow_indexes", ())),
                 "first_index": group["first_index"],
                 "is_active": group["is_active"],
@@ -2910,10 +2942,14 @@ def selected_panel_group_entries(state, workflow, group):
         active_panel_id = workflow.panels[active_index].panel_id
 
     space_type = getattr(state, "space_type", "VIEW_3D")
+    active_drawer_id = (
+        panel_drawer_root_id(active_panel_id, space_type=space_type) or active_panel_id
+    )
     selected_ids = {item.panel_id for item in workflow.panels}
     selected_drawer_ids = {
-        panel_drawer_root_id(panel_id, space_type=space_type)
+        panel_drawer_root_id(panel_id, space_type=space_type) or panel_id
         for panel_id in selected_ids
+        if panel_id
     }
     selected_lookup_ids = selected_ids.union(selected_drawer_ids)
     entries = []
@@ -2935,23 +2971,82 @@ def selected_panel_group_entries(state, workflow, group):
             panel_ids.append(panel_id)
             workflow_indexes.append(index)
 
-    for fallback_pos, panel_id in enumerate(panel_ids):
+    workflow_item_by_drawer = {}
+    for index, item in enumerate(getattr(workflow, "panels", [])):
+        panel_id = getattr(item, "panel_id", "")
         if not panel_id or panel_id == "BWFLOW_PT_workflow":
             continue
         if is_builtin_default_panel_id(panel_id, space_type=space_type):
             continue
-        workflow_index = workflow_indexes[fallback_pos] if fallback_pos < len(workflow_indexes) else workflow_panel_registry_index(state, workflow, panel_id)
+        drawer_id = panel_drawer_root_id(panel_id, space_type=space_type) or panel_id
+        workflow_item_by_drawer.setdefault(drawer_id, (panel_id, index))
+
+    drawer_ids = list(group.get("drawer_ids", ()) or ())
+    if not drawer_ids:
+        drawer_ids = unique_panel_ids(
+            panel_drawer_root_id(panel_id, space_type=space_type) or panel_id
+            for panel_id in panel_ids
+            if panel_id
+        )
+    if not drawer_ids:
+        drawer_ids = unique_panel_ids(
+            panel_drawer_root_id(panel_id, space_type=space_type) or panel_id
+            for panel_id in selected_ids
+            if workflow_group_key_for_panel(state, panel_id) == group_key
+        )
+
+    fallback_index_by_drawer = {}
+    for fallback_pos, panel_id in enumerate(panel_ids):
+        if not panel_id:
+            continue
+        drawer_id = panel_drawer_root_id(panel_id, space_type=space_type) or panel_id
+        fallback_index_by_drawer.setdefault(
+            drawer_id,
+            workflow_indexes[fallback_pos]
+            if fallback_pos < len(workflow_indexes)
+            else workflow_panel_registry_index(state, workflow, panel_id),
+        )
+
+    for drawer_id in drawer_ids:
+        if not drawer_id or drawer_id == "BWFLOW_PT_workflow":
+            continue
+        selected_item = workflow_item_by_drawer.get(drawer_id)
+        panel_id = selected_item[0] if selected_item else drawer_id
+        workflow_index = (
+            selected_item[1]
+            if selected_item
+            else fallback_index_by_drawer.get(
+                drawer_id,
+                workflow_panel_registry_index(state, workflow, drawer_id),
+            )
+        )
         entry = panel_drawer_entry_for_id(
             state,
-            panel_id,
+            drawer_id,
             selected_ids=selected_lookup_ids,
             active_panel_id=active_panel_id,
             fallback_index=workflow_index,
         )
+        entry["panel_id"] = panel_id
+        entry["drawer_id"] = drawer_id
+        entry["index"] = workflow_panel_registry_index(state, workflow, drawer_id)
+        entry["selected"] = drawer_id in selected_drawer_ids or panel_id in selected_ids
+        entry["is_active"] = panel_id == active_panel_id or drawer_id == active_drawer_id
         entry["workflow_index"] = workflow_index
         entries.append(entry)
 
-    entries.sort(key=lambda entry: (entry["workflow_index"], entry["title"].casefold(), entry["panel_id"]))
+    entries.sort(
+        key=lambda entry: (
+            panel_drawer_default_order_index(
+                state,
+                entry["drawer_id"],
+                space_type=space_type,
+            ),
+            entry["index"],
+            entry["title"].casefold(),
+            entry["drawer_id"],
+        )
+    )
     group_cache[group_key] = {"signature": signature, "entries": tuple(dict(entry) for entry in entries)}
     return entries
 
@@ -3045,7 +3140,7 @@ def workflow_family_drawer_ids(state, workflow, group_key):
     return workflow_toggleable_panel_ids(state, drawer_ids)
 
 
-def workflow_family_order_groups(state, workflow):
+def workflow_family_order_groups(state, workflow, force_refresh=False):
     if state is None or workflow is None:
         return []
     space_type = getattr(state, "space_type", "VIEW_3D")
@@ -3055,7 +3150,7 @@ def workflow_family_order_groups(state, workflow):
         panel_registry_lookup_signature(state),
     )
     cached = WORKFLOW_FAMILY_ORDER_GROUPS_CACHE_BY_SPACE.get(cache_key)
-    if cached is not None and cached.get("signature") == signature:
+    if not force_refresh and cached is not None and cached.get("signature") == signature:
         return [
             {
                 "key": group.get("key", ""),
@@ -3655,8 +3750,16 @@ def mark_panel_order_pending(state, scene=None, context=None):
     if not workflow_runtime_initialized(state):
         return
     space_type = getattr(state, "space_type", "VIEW_3D")
+    previous_order_signature = PANEL_ORDER_SIGNATURE_BY_SPACE.get(space_type)
+    # An order edit must invalidate both the visible-panel filter and the
+    # selected drawer row caches. Otherwise a later N-panel refresh can reuse
+    # the previous runtime signature and skip the second reorder.
+    PANEL_ORDER_SIGNATURE_BY_SPACE.pop(space_type, None)
+    PANEL_FILTER_SIGNATURE_BY_SPACE.pop(space_type, None)
     PANEL_VISIBILITY_DATA_CACHE_BY_SPACE.pop(space_type, None)
     PANEL_LIBRARY_GROUPS_CACHE_BY_SPACE.pop(space_type, None)
+    PANEL_LIBRARY_GROUP_ENTRY_CACHE_BY_SPACE.pop(space_type, None)
+    PANEL_GROUP_INDEX_CACHE_BY_SPACE.pop(space_type, None)
     PANEL_GROUP_FILTER_CACHE_BY_SPACE.pop(f"{space_type}:library", None)
     PANEL_GROUP_FILTER_CACHE_BY_SPACE.pop(f"{space_type}:selected", None)
     clear_space_prefixed_cache(WORKFLOW_MISSING_PANEL_IDS_CACHE_BY_SPACE, space_type)
@@ -3664,12 +3767,21 @@ def mark_panel_order_pending(state, scene=None, context=None):
     SELECTED_PANEL_GROUPS_CACHE_BY_SPACE.pop(space_type, None)
     SELECTED_PANEL_GROUP_SUMMARY_CACHE_BY_SPACE.pop(space_type, None)
     clear_space_prefixed_cache(WORKFLOW_FAMILY_ORDER_GROUPS_CACHE_BY_SPACE, space_type)
-    PANEL_FILTER_SIGNATURE_BY_SPACE.pop(space_type, None)
     state.panel_order_pending_apply = False
     workflow = get_active_workflow(state)
     if workflow is not None and not workflow.is_default:
+        # A panel that was hidden by the previous workflow is still part of
+        # the new order, but Blender cannot reorder it while unregistered.
+        restore_unregistered_panels(space_type=space_type)
         ordered_ids = workflow_ordered_panel_ids(state, workflow)
         apply_panel_order_overrides(ordered_ids, space_type=space_type)
+        if previous_order_signature != PANEL_ORDER_SIGNATURE_BY_SPACE.get(space_type):
+            schedule_deferred_runtime_refresh(
+                scene=scene or safe_context_scene(),
+                intervals=(0.01,),
+                space_type=space_type,
+                rebuild_cache=False,
+            )
     if scene is not None:
         save_global_workflow_state(scene)
     if not tag_redraw_context_area(context):
@@ -3725,8 +3837,9 @@ def queue_panel_visibility_pending(state, scene=None, context=None):
     clear_space_prefixed_cache(WORKFLOW_FAMILY_ORDER_GROUPS_CACHE_BY_SPACE, space_type)
     schedule_deferred_runtime_refresh(
         scene=scene or safe_context_scene(),
-        intervals=(0.05,),
+        intervals=(0.01,),
         space_type=space_type,
+        rebuild_cache=False,
     )
     schedule_global_workflow_state_save(scene=scene or safe_context_scene())
     if not tag_redraw_context_area(context):
@@ -3867,11 +3980,44 @@ def workflow_visibility_data(state, workflow):
     if cached is not None and cached.get("signature") == signature:
         return cached["data"]
 
-    explicit_workflow_ids = [
+    raw_explicit_workflow_ids = [
         panel_id
         for panel_id in workflow_panel_order_ids(workflow)
         if panel_id != "BWFLOW_PT_workflow" and not is_builtin_default_panel_id(panel_id, space_type=space_type)
     ]
+    explicit_workflow_ids = []
+    seen_explicit_ids = set()
+    for group in workflow_family_order_groups(state, workflow, force_refresh=True):
+        group_ids = list(group.get("ids", ()) or ())
+        group_ids.sort(
+            key=lambda panel_id: (
+                panel_drawer_default_order_index(
+                    state,
+                    panel_drawer_root_id(panel_id, space_type=space_type) or panel_id,
+                    space_type=space_type,
+                ),
+                workflow_panel_registry_index(
+                    state,
+                    workflow,
+                    panel_drawer_root_id(panel_id, space_type=space_type) or panel_id,
+                ),
+                panel_drawer_title(
+                    state,
+                    panel_drawer_root_id(panel_id, space_type=space_type) or panel_id,
+                ).casefold(),
+                panel_id,
+            )
+        )
+        for panel_id in group_ids:
+            if panel_id in seen_explicit_ids:
+                continue
+            seen_explicit_ids.add(panel_id)
+            explicit_workflow_ids.append(panel_id)
+    for panel_id in raw_explicit_workflow_ids:
+        if panel_id in seen_explicit_ids:
+            continue
+        seen_explicit_ids.add(panel_id)
+        explicit_workflow_ids.append(panel_id)
     panel_order_ids = unique_panel_ids(
         panel_drawer_root_id(panel_id, space_type=space_type)
         for panel_id in explicit_workflow_ids
@@ -3889,7 +4035,7 @@ def workflow_visibility_data(state, workflow):
     }
     allowed_ids = allowed_for_order.union(builtin_ids)
 
-    preferred_by_drawer = {}
+    explicit_member_order = []
     for panel_id in explicit_workflow_ids:
         drawer_id = panel_drawer_root_id(panel_id, space_type=space_type)
         if drawer_id not in visible_set:
@@ -3900,32 +4046,48 @@ def workflow_visibility_data(state, workflow):
         elif drawer_id in allowed_for_order and drawer_id in registry:
             member_id = drawer_id
         if member_id:
-            preferred_by_drawer.setdefault(drawer_id, []).append(member_id)
+            explicit_member_order.append(member_id)
 
     lookup = get_panel_registry_lookup(state)
-    ordered_drawer_member_ids = []
+    # The workflow collection is the user's explicit order.  Do not prepend
+    # registry records here: a registry is discovery data and commonly keeps
+    # the add-on's original registration order instead of the edited order.
+    ordered_drawer_member_ids = list(unique_panel_ids(explicit_member_order))
+    ordered_member_set = set(ordered_drawer_member_ids)
     for drawer_id in visible_ids:
-        preferred_members = preferred_by_drawer.get(drawer_id, [])
         drawer_records = lookup["records_by_drawer"].get(drawer_id, [])
-        members = [
+        discovered_members = [
             record.panel_id
             for record in drawer_records
-            if record.panel_id in allowed_for_order and record.panel_id in registry
+            if (
+                record.panel_id in allowed_for_order
+                and record.panel_id in registry
+                and record.panel_id not in ordered_member_set
+            )
         ]
-        if not members and drawer_id in allowed_for_order and drawer_id in registry:
-            members = [drawer_id]
-        members = unique_panel_ids(preferred_members + members)
-        if drawer_id in registry and drawer_id not in members:
-            members.insert(0, drawer_id)
-        ordered_drawer_member_ids.extend(members)
+        if (
+            drawer_id in allowed_for_order
+            and drawer_id in registry
+            and drawer_id not in ordered_member_set
+        ):
+            discovered_members.insert(0, drawer_id)
+        for panel_id in unique_panel_ids(discovered_members):
+            if panel_id in ordered_member_set:
+                continue
+            ordered_drawer_member_ids.append(panel_id)
+            ordered_member_set.add(panel_id)
 
     trailing_ids = [
         panel_id
         for panel_id in registry.keys()
-        if panel_id in allowed_for_order and panel_id not in visible_set
+        if panel_id in allowed_for_order and panel_id not in ordered_member_set
     ]
-    preferred_ids = [panel_id for panel_id in ordered_drawer_member_ids if panel_id in registry]
-    preferred_ids.extend(panel_id for panel_id in trailing_ids if panel_id not in preferred_ids)
+    preferred_ids = [
+        panel_id for panel_id in ordered_drawer_member_ids if panel_id in registry
+    ]
+    preferred_ids.extend(
+        panel_id for panel_id in trailing_ids if panel_id not in preferred_ids
+    )
     ordered_ids = ordered_panel_ids_for_register(preferred_ids, space_type=space_type)
 
     data = {
@@ -4066,10 +4228,11 @@ def is_dynamic_multi_panel_class(cls):
     if cls is None:
         return False
     module_name = str(getattr(cls, "__module__", "") or "").casefold()
-    class_name = str(getattr(cls, "__name__", "") or "")
-    if "uvpackmaster4" in module_name:
-        return True
-    return bool(getattr(cls, "PARENT_M_PANEL_ID", ""))
+    # Only the known UVPackmaster host uses generated multi-panels that must
+    # stay out of the normal unregister/register ordering pass.  Other
+    # add-ons sometimes reuse PARENT_M_PANEL_ID as metadata on ordinary
+    # panels; excluding those panels makes workflow child ordering ineffective.
+    return "uvpackmaster4" in module_name
 
 
 def is_dynamic_multi_panel_id(panel_id, space_type=None):
@@ -4457,6 +4620,10 @@ def apply_panel_order_overrides(ordered_panel_ids, space_type=None):
         ordered_map = {panel_id: index for index, panel_id in enumerate(ordered_signature)}
         if not ordered_signature:
             continue
+        ordered_set = set(ordered_signature)
+        current_registry_signature = tuple(
+            panel_id for panel_id in registry.keys() if panel_id in ordered_set
+        )
         for panel_id in ordered_signature:
             cls = registry.get(panel_id)
             if cls is None:
@@ -4464,8 +4631,24 @@ def apply_panel_order_overrides(ordered_panel_ids, space_type=None):
             if panel_id not in PANEL_BL_ORDER_ORIGINALS:
                 PANEL_BL_ORDER_ORIGINALS[panel_id] = cls.__dict__.get("bl_order", PANEL_BL_ORDER_MISSING)
             cls.bl_order = ordered_map[panel_id] + 100
-        if previous_signature != ordered_signature:
+        if (
+            previous_signature != ordered_signature
+            or current_registry_signature != ordered_signature
+        ):
             reorder_registered_panels(ordered_signature, space_type=target_space)
+        if previous_signature != ordered_signature:
+            PANEL_FILTER_SIGNATURE_BY_SPACE.pop(target_space, None)
+        # Blender may rebuild RNA class metadata during unregister/register.
+        # Reapply the runtime order after that pass so the visible N-panel
+        # follows the workflow order instead of the previous class order.
+        for panel_id in ordered_signature:
+            cls = resolve_panel_class(panel_id, space_type=target_space)
+            if cls is None:
+                continue
+            try:
+                cls.bl_order = ordered_map[panel_id] + 100
+            except Exception:
+                pass
         PANEL_ORDER_SIGNATURE_BY_SPACE[target_space] = ordered_signature
     enforce_go_workflow_panel_order()
 
@@ -4754,26 +4937,38 @@ def reorder_registered_panels(panel_ids, space_type=None):
         except Exception:
             pass
 
-    for panel_id in ids_to_reorder:
+    for order_index, panel_id in enumerate(ids_to_reorder):
         cls = resolve_panel_class(panel_id, space_type=space_type)
         if cls is None:
             continue
         try:
+            # Set bl_order after unregister and immediately before register.
+            # Blender reads this value while rebuilding the panel RNA class.
+            cls.bl_order = order_index + 100
             _safe_register_panel_class(cls)
         except Exception:
             pass
     target_spaces = (space_type,) if space_type else iter_supported_space_types()
     for target_space in target_spaces:
         registry = dict(get_panel_registry(target_space))
+        cache = dict(get_panel_cache(target_space))
         reordered_registry = {}
+        reordered_cache = {}
         for panel_id in ids_to_reorder:
             cls = registry.get(panel_id)
             if cls is not None:
                 reordered_registry[panel_id] = cls
+            cls = cache.get(panel_id)
+            if cls is not None:
+                reordered_cache[panel_id] = cls
         for panel_id, cls in registry.items():
             if panel_id not in reordered_registry:
                 reordered_registry[panel_id] = cls
+        for panel_id, cls in cache.items():
+            if panel_id not in reordered_cache:
+                reordered_cache[panel_id] = cls
         PANEL_CLASS_REGISTRY_BY_SPACE[target_space] = reordered_registry
+        PANEL_CLASS_CACHE_BY_SPACE[target_space] = reordered_cache
     enforce_go_workflow_panel_order()
 
 
@@ -5012,7 +5207,7 @@ def refresh_runtime(scene=None):
     rebuild_runtime_panels(scene=target_scene, rebuild_cache=False)
 
 
-def schedule_deferred_runtime_refresh(scene=None, intervals=None, space_type=None):
+def schedule_deferred_runtime_refresh(scene=None, intervals=None, space_type=None, rebuild_cache=True):
     target_scene = scene or safe_context_scene()
     if target_scene is None:
         return
@@ -5024,28 +5219,41 @@ def schedule_deferred_runtime_refresh(scene=None, intervals=None, space_type=Non
     refresh_key = f"{scene_name}:{space_type or '*'}"
     DEFERRED_REFRESH_TOKENS[refresh_key] = time.time()
     if refresh_key in DEFERRED_REFRESH_PENDING_KEYS:
+        DEFERRED_REFRESH_REBUILD_CACHE_BY_KEY[refresh_key] = (
+            DEFERRED_REFRESH_REBUILD_CACHE_BY_KEY.get(refresh_key, False)
+            or bool(rebuild_cache)
+        )
         return
 
     DEFERRED_REFRESH_PENDING_KEYS.add(refresh_key)
+    DEFERRED_REFRESH_REBUILD_CACHE_BY_KEY[refresh_key] = bool(rebuild_cache)
     delays = intervals or DEFERRED_REFRESH_INTERVALS
     delay = min(max(0.01, float(item)) for item in delays)
 
     def _refresh_once(scene_name=scene_name, target_space_type=space_type, pending_key=refresh_key):
         DEFERRED_REFRESH_PENDING_KEYS.discard(pending_key)
+        refresh_rebuild_cache = DEFERRED_REFRESH_REBUILD_CACHE_BY_KEY.pop(pending_key, False)
         scene_ref = bpy.data.scenes.get(scene_name)
         if scene_ref is None:
             DEFERRED_REFRESH_TOKENS.pop(pending_key, None)
             return None
         try:
-            rebuild_runtime_panels(scene=scene_ref, space_type=target_space_type)
+            rebuild_runtime_panels(
+                scene=scene_ref,
+                space_type=target_space_type,
+                rebuild_cache=refresh_rebuild_cache,
+            )
         except Exception:
             traceback.print_exc()
+        finally:
+            DEFERRED_REFRESH_TOKENS.pop(pending_key, None)
         return None
 
     try:
         _register_one_shot_timer(_refresh_once, first_interval=delay)
     except Exception:
         DEFERRED_REFRESH_PENDING_KEYS.discard(refresh_key)
+        DEFERRED_REFRESH_REBUILD_CACHE_BY_KEY.pop(refresh_key, None)
         traceback.print_exc()
 
 
@@ -13913,7 +14121,7 @@ class BWFLOW_OT_panel_reset_workflow_order(Operator):
         workflow = get_active_workflow(state)
         active_index = clamp_index(workflow.active_panel_index, len(workflow.panels))
         active_panel_id = workflow.panels[active_index].panel_id if workflow.panels else ""
-        groups = workflow_family_order_groups(state, workflow)
+        groups = workflow_family_order_groups(state, workflow, force_refresh=True)
         groups.sort(key=lambda group: (group["title"].casefold(), group["key"]))
         replace_workflow_groups(workflow, groups, active_panel_id=active_panel_id)
         mark_panel_order_pending(state, scene=context.scene, context=context)
@@ -13938,7 +14146,7 @@ class BWFLOW_OT_panel_jump_in_workflow(Operator):
     def execute(self, context):
         state = get_state(context=context)
         workflow = get_active_workflow(state)
-        groups = workflow_family_order_groups(state, workflow)
+        groups = workflow_family_order_groups(state, workflow, force_refresh=True)
         if len(groups) <= 1:
             return {"CANCELLED"}
         active_key = self.group_key or active_workflow_family_group_key(state, workflow)
@@ -13974,7 +14182,7 @@ class BWFLOW_OT_panel_reverse_workflow_order(Operator):
         workflow = get_active_workflow(state)
         active_index = clamp_index(workflow.active_panel_index, len(workflow.panels))
         active_panel_id = workflow.panels[active_index].panel_id if workflow.panels else ""
-        groups = list(reversed(workflow_family_order_groups(state, workflow)))
+        groups = list(reversed(workflow_family_order_groups(state, workflow, force_refresh=True)))
         replace_workflow_groups(workflow, groups, active_panel_id=active_panel_id)
         mark_panel_order_pending(state, scene=context.scene, context=context)
         self.report({"INFO"}, "当前工作流面板组顺序已反转")
@@ -13998,7 +14206,7 @@ class BWFLOW_OT_panel_move_in_workflow(Operator):
     def execute(self, context):
         state = get_state(context=context)
         workflow = get_active_workflow(state)
-        groups = workflow_family_order_groups(state, workflow)
+        groups = workflow_family_order_groups(state, workflow, force_refresh=True)
         if len(groups) <= 1:
             return {"CANCELLED"}
         active_key = self.group_key or active_workflow_family_group_key(state, workflow)
@@ -14012,125 +14220,6 @@ class BWFLOW_OT_panel_move_in_workflow(Operator):
         groups.insert(new_pos, group)
         replace_workflow_groups(workflow, groups, active_panel_id=group["ids"][0] if group["ids"] else "")
         mark_panel_order_pending(state, scene=context.scene, context=context)
-        return {"FINISHED"}
-
-
-class BWFLOW_OT_panel_move_child_in_group(Operator):
-    bl_idname = "bworkflow.panel_move_child_in_group"
-    bl_label = "移动组内子面板"
-    bl_description = "调整当前面板大组内部抽屉面板的顺序"
-
-    direction: StringProperty()
-    group_key: StringProperty(default="")
-    panel_id: StringProperty(default="")
-
-    @classmethod
-    def poll(cls, context):
-        state = get_state(context=context)
-        workflow = get_active_workflow(state)
-        return workflow is not None and not workflow.is_default and bool(workflow.panels)
-
-    def execute(self, context):
-        state = get_state(context=context)
-        workflow = get_active_workflow(state)
-        groups = workflow_family_order_groups(state, workflow)
-        active_group_key = self.group_key or workflow_group_key_for_panel(state, self.panel_id)
-        group = next((item for item in groups if item.get("key") == active_group_key), None)
-        if (group is None or len(group.get("ids", [])) <= 1) and self.panel_id:
-            fallback_key = workflow_group_key_for_panel(state, self.panel_id)
-            if fallback_key and fallback_key != active_group_key:
-                active_group_key = fallback_key
-                group = next((item for item in groups if item.get("key") == active_group_key), None)
-        if group is None or len(group.get("ids", [])) <= 1:
-            return {"CANCELLED"}
-
-        ids = list(group["ids"])
-        space_type = getattr(state, "space_type", "VIEW_3D")
-        target_id = self.panel_id
-        drawer_id = panel_drawer_root_id(target_id, space_type=space_type) or target_id
-        old_pos = ids.index(target_id) if target_id in ids else -1
-        if old_pos < 0:
-            for group_pos, panel_id in enumerate(ids):
-                if panel_drawer_root_id(panel_id, space_type=space_type) == drawer_id:
-                    old_pos = group_pos
-                    target_id = panel_id
-                    break
-        if old_pos < 0:
-            return {"CANCELLED"}
-
-        new_pos = clamp_index(old_pos + (-1 if self.direction == "UP" else 1), len(ids))
-        if new_pos == old_pos:
-            return {"CANCELLED"}
-
-        moved_id = ids.pop(old_pos)
-        ids.insert(new_pos, moved_id)
-        group["ids"] = ids
-        replace_workflow_groups(workflow, groups, active_panel_id=moved_id)
-        mark_panel_order_pending(state, scene=context.scene, context=context)
-        return {"FINISHED"}
-
-
-class BWFLOW_OT_panel_sort_children_by_default_order(Operator):
-    bl_idname = "bworkflow.panel_sort_children_by_default_order"
-    bl_label = "子抽屉默认排序"
-    bl_description = "按插件默认扫描顺序重排当前勾选列表内每个大组的子抽屉"
-
-    group_key: StringProperty(default="")
-
-    @classmethod
-    def poll(cls, context):
-        state = get_state(context=context)
-        workflow = get_active_workflow(state)
-        return workflow is not None and not workflow.is_default and len(workflow.panels) > 1
-
-    def execute(self, context):
-        state = get_state(context=context)
-        workflow = get_active_workflow(state)
-        if state is None or workflow is None or workflow.is_default:
-            return {"CANCELLED"}
-
-        space_type = getattr(state, "space_type", "VIEW_3D")
-        quarantine_broken_panel_polls(space_type=space_type)
-        repair_missing_panel_poll_callbacks(space_type=space_type)
-        groups = workflow_family_order_groups(state, workflow)
-        if not groups:
-            return {"CANCELLED"}
-
-        active_index = clamp_index(workflow.active_panel_index, len(workflow.panels))
-        active_panel_id = workflow.panels[active_index].panel_id if workflow.panels else ""
-        changed_count = 0
-
-        for group in groups:
-            if self.group_key and group.get("key") != self.group_key:
-                continue
-            ids = list(group.get("ids", []))
-            if len(ids) <= 1:
-                continue
-            sorted_ids = [
-                panel_id
-                for _order_index, _old_index, panel_id in sorted(
-                    (
-                        (
-                            panel_drawer_default_order_index(state, panel_id, space_type=space_type),
-                            old_index,
-                            panel_id,
-                        )
-                        for old_index, panel_id in enumerate(ids)
-                    )
-                )
-            ]
-            if sorted_ids != ids:
-                group["ids"] = sorted_ids
-                changed_count += 1
-
-        if not changed_count:
-            self.report({"INFO"}, "子抽屉已经是插件默认顺序")
-            return {"FINISHED"}
-
-        replace_workflow_groups(workflow, groups, active_panel_id=active_panel_id)
-        mark_panel_order_pending(state, scene=context.scene, context=context)
-        quarantine_broken_panel_polls(space_type=space_type)
-        self.report({"INFO"}, f"已按插件默认顺序整理 {changed_count} 个面板组")
         return {"FINISHED"}
 
 
@@ -14150,10 +14239,14 @@ class BWFLOW_OT_panel_apply_workflow_order(Operator):
         if state is None:
             return {"CANCELLED"}
         space_type = getattr(state, "space_type", "VIEW_3D")
+        restore_unregistered_panels(space_type=space_type)
         PANEL_VISIBILITY_DATA_CACHE_BY_SPACE.pop(space_type, None)
         state.panel_order_pending_apply = False
-        changed = rebuild_runtime_panels(scene=context.scene, space_type=space_type)
-        schedule_deferred_runtime_refresh(scene=context.scene, intervals=(0.5,), space_type=space_type)
+        changed = rebuild_runtime_panels(
+            scene=context.scene,
+            space_type=space_type,
+            rebuild_cache=False,
+        )
         state.panel_visibility_pending_apply = False
         state.panel_order_pending_apply = False
         save_global_workflow_state(context.scene)
@@ -14992,18 +15085,25 @@ def draw_panel_library_editor(layout, state):
         )
         order_box = selected.box()
         order_box.label(text="抽屉顺序操作", icon="SORTALPHA")
+        active_group_key = (
+            workflow_group_key_for_panel(state, active_panel_id)
+            if active_panel_id
+            else ""
+        )
         jump_row = order_box.row(align=True)
         top = jump_row.operator("bworkflow.panel_jump_in_workflow", text="置顶当前组", icon="TRIA_UP_BAR")
         top.target = "TOP"
+        top.group_key = active_group_key
         bottom = jump_row.operator("bworkflow.panel_jump_in_workflow", text="置底当前组", icon="TRIA_DOWN_BAR")
         bottom.target = "BOTTOM"
+        bottom.group_key = active_group_key
         move_row = order_box.row(align=True)
         up = move_row.operator("bworkflow.panel_move_in_workflow", text="上移当前组")
         up.direction = "UP"
+        up.group_key = active_group_key
         down = move_row.operator("bworkflow.panel_move_in_workflow", text="下移当前组")
         down.direction = "DOWN"
-        row = order_box.row(align=True)
-        row.operator("bworkflow.panel_sort_children_by_default_order", text="子抽屉默认排序", icon="SORTALPHA")
+        down.group_key = active_group_key
         row = order_box.row(align=True)
         row.operator("bworkflow.panel_clear_workflow", text="清空全部")
 
@@ -15112,24 +15212,6 @@ def draw_panel_library_editor(layout, state):
                         f"\u4e2d\u6587\u540d\u79f0\uff1a{entry.get('title', '')}\n"
                         f"\u539f\u63d2\u4ef6\u540d\uff1a{panel_group_original_title(state, entry.get('panel_id', ''), entry.get('title', ''))}"
                     )
-                    child_up = row.operator(
-                        "bworkflow.panel_move_child_in_group",
-                        text="",
-                        icon="TRIA_UP",
-                        emboss=False,
-                    )
-                    child_up.direction = "UP"
-                    child_up.group_key = group["key"]
-                    child_up.panel_id = entry["panel_id"]
-                    child_down = row.operator(
-                        "bworkflow.panel_move_child_in_group",
-                        text="",
-                        icon="TRIA_DOWN",
-                        emboss=False,
-                    )
-                    child_down.direction = "DOWN"
-                    child_down.group_key = group["key"]
-                    child_down.panel_id = entry["panel_id"]
     else:
         selected.label(text="当前 Go工作流还没有勾选任何面板。", icon="INFO")
         row = selected.row(align=True)
@@ -15716,8 +15798,6 @@ CLASSES = [
     BWFLOW_OT_panel_jump_in_workflow,
     BWFLOW_OT_panel_reverse_workflow_order,
     BWFLOW_OT_panel_move_in_workflow,
-    BWFLOW_OT_panel_move_child_in_group,
-    BWFLOW_OT_panel_sort_children_by_default_order,
     BWFLOW_OT_debug_dump_panels,
     BWFLOW_OT_preset_export,
     BWFLOW_OT_preset_import,

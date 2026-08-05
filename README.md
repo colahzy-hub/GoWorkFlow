@@ -1,8 +1,8 @@
 # GoWorkFlow
 
-Blender 的 N 面板工作流、脚本模块和预设管理插件。
+Blender 的 N 面板工作流、脚本模块、形态键工具与预设管理扩展。
 
-GoWorkFlow 适合把常用的 Blender 面板、批处理脚本、形态键工具和测试预设整理成可切换的工作流。它不会替换 Blender 原生面板，而是在工作流中控制哪些面板显示、显示顺序以及模块脚本如何运行。
+GoWorkFlow 适合把常用的 Blender 面板、批处理脚本和形态键工具整理成可切换的工作流。它不会替换 Blender 原生面板，而是在工作流中控制哪些面板显示、显示顺序以及模块脚本如何运行。
 
 [![Latest Release](https://img.shields.io/github/v/release/colahzy-hub/GoWorkFlow?display_name=tag&sort=semver)](https://github.com/colahzy-hub/GoWorkFlow/releases)
 [![Blender](https://img.shields.io/badge/Blender-3.6%2B-orange)](https://www.blender.org/)
@@ -10,12 +10,11 @@ GoWorkFlow 适合把常用的 Blender 面板、批处理脚本、形态键工具
 
 ## 当前版本
 
-当前发布版本：**1.0.8**
+当前发布版本：**1.1.10**
 
-- 下载：进入 [Releases](https://github.com/colahzy-hub/GoWorkFlow/releases) 下载 `go_workflow_v1.0.8.zip`。
-- 当前重点测试版本：Blender 4.2.9。
-- Blender 4.5：已加入状态恢复、预设导入和失效面板访问的兼容保护，建议使用最新 Release 后再按实际日志验证。
-- Blender 5.x：暂不承诺完整兼容。
+- 下载：进入 [Releases](https://github.com/colahzy-hub/GoWorkFlow/releases) 下载 `go_workflow_v1.1.10.zip`。
+- 当前开发验证版本：Blender 5.2.0。
+- 扩展清单最低 Blender 版本：3.6.0。
 
 ## 功能概览
 
@@ -93,7 +92,7 @@ GoWorkFlow/
 └─ LICENSE                     # GPL-3.0-or-later
 ```
 
-`00_工作区`、`02_版本迭代区` 和本地测试资源不属于 Release 安装包。发布包以 GitHub Release 附件为准。
+`00_工作区`、`02_版本迭代区` 和本地测试资源不属于 Release 安装包。发布包以 GitHub Release 附件为准；发布包不会包含本地导入脚本缓存和开发用工作流模块。
 
 ## 兼容性与排错
 
@@ -114,7 +113,7 @@ python -m py_compile go_workflow_extension\go_workflow\__init__.py
 git diff --check
 ```
 
-Blender 相关改动建议使用 Blender 4.2.9 后台模式做最小加载和预设导入回归。
+Blender 相关改动建议使用 Blender 5.2.0 后台模式做最小加载和预设导入回归。
 
 ## 许可
 

@@ -10,6 +10,7 @@ REALTIME_TIMER_INTERVAL = 0.24
 _REALTIME_STATE = {"running": False, "token": 0}
 _REALTIME_TIMER_STATE = {"callback": None}
 _REALTIME_TIMER_REGISTRY_KEY = "go_workflow.realtime_diff_callbacks"
+_REALTIME_CONTROL_REGISTRY_KEY = "go_workflow.realtime_diff_control"
 
 
 def _get_config(module):
@@ -111,20 +112,44 @@ def _release_realtime_timer(callback):
 
 
 def _cancel_realtime_timer():
+    callbacks = []
     callback = _REALTIME_TIMER_STATE.get("callback")
-    if callback is None:
-        return False
+    if callback is not None:
+        callbacks.append(callback)
     try:
-        bpy.app.timers.unregister(callback)
+        registry = bpy.app.driver_namespace.get(_REALTIME_TIMER_REGISTRY_KEY)
+        for registered_callback in list(registry or ()):
+            if registered_callback not in callbacks:
+                callbacks.append(registered_callback)
     except Exception:
         pass
-    _release_realtime_timer(callback)
-    return True
+    for registered_callback in callbacks:
+        try:
+            bpy.app.timers.unregister(registered_callback)
+        except Exception:
+            pass
+        _release_realtime_timer(registered_callback)
+    return bool(callbacks)
+
+
+def _realtime_control_state():
+    try:
+        control = bpy.app.driver_namespace.get(_REALTIME_CONTROL_REGISTRY_KEY)
+        if not isinstance(control, dict):
+            control = {"running": False, "token": 0}
+            bpy.app.driver_namespace[_REALTIME_CONTROL_REGISTRY_KEY] = control
+        return control
+    except Exception:
+        return None
 
 
 def _stop_realtime_diff(module_state, panel_api=None):
     _REALTIME_STATE["running"] = False
     _REALTIME_STATE["token"] += 1
+    control = _realtime_control_state()
+    if control is not None:
+        control["running"] = False
+        control["token"] = int(control.get("token", 0) or 0) + 1
     _cancel_realtime_timer()
     if panel_api is not None:
         try:
@@ -257,13 +282,15 @@ def _apply_active_difference_selection(context, panel_api, module_state, obj):
     if module_state is not None:
         module_state.set("active_summary", summary)
         module_state.set("last_result", summary)
-        module_state.set("realtime_last_key_index", int(getattr(obj, "active_shape_key_index", 0) or 0))
     if getattr(obj, "mode", "") == "EDIT":
         _select_difference_vertices_in_edit_mode(context, obj, indices)
         if panel_api is not None:
             panel_api.set_status(f"已在编辑模式选中 {moved_count} 个差异顶点", level="OK")
     elif panel_api is not None:
         panel_api.set_status(f"{summary}；进入编辑模式后再点可直接选中这些顶点", level="WARNING")
+    if module_state is not None:
+        # A failed timer update must remain retryable on the next tick.
+        module_state.set("realtime_last_key_index", int(getattr(obj, "active_shape_key_index", 0) or 0))
     return key_block, reference, moved_count, max_delta, indices
 
 
@@ -274,13 +301,19 @@ def _realtime_enabled(panel_api, module_state):
 
 
 def _start_realtime_diff(context, panel_api, module_state, obj):
+    _stop_realtime_diff(module_state, panel_api=panel_api)
     if getattr(obj, "mode", "") != "EDIT":
         raise Exception("实时检查差异点需要先进入编辑模式")
-    _stop_realtime_diff(module_state)
     _REALTIME_STATE["running"] = True
     _REALTIME_STATE["token"] += 1
     token = int(_REALTIME_STATE["token"])
-    object_name = obj.name_full
+    control = _realtime_control_state()
+    control_token = token
+    if control is not None:
+        control["running"] = True
+        control["token"] = int(control.get("token", 0) or 0) + 1
+        control_token = int(control["token"])
+    object_name = str(getattr(obj, "name", "") or getattr(obj, "name_full", ""))
     if panel_api is not None:
         panel_api.set_bool("realtime_diff_enabled", True)
         panel_api.set_status("已开启实时检查差异点：切换活动形态键后会自动刷新顶点选择", level="OK")
@@ -298,18 +331,30 @@ def _start_realtime_diff(context, panel_api, module_state, obj):
         except Exception as exc:
             if module_state is not None:
                 module_state.set("active_summary", f"实时检查启动失败：{exc}")
+            _stop_realtime_diff(module_state, panel_api=panel_api)
             raise
     elif module_state is not None:
         module_state.set("realtime_last_key_index", 0)
         module_state.set("active_summary", "当前是 Basis，切换到非 Basis 形态键后会自动选择差异顶点")
 
     def _tick():
-        if not _REALTIME_STATE["running"] or token != _REALTIME_STATE["token"]:
+        control = _realtime_control_state()
+        if (
+            not _REALTIME_STATE["running"]
+            or token != _REALTIME_STATE["token"]
+            or (
+                control is not None
+                and (
+                    not bool(control.get("running", False))
+                    or int(control.get("token", -1) or -1) != control_token
+                )
+            )
+        ):
             _release_realtime_timer(_tick)
             return None
         current_obj = bpy.data.objects.get(object_name)
         if current_obj is None or getattr(current_obj, "type", "") != "MESH":
-            _stop_realtime_diff(module_state)
+            _stop_realtime_diff(module_state, panel_api=panel_api)
             _release_realtime_timer(_tick)
             return None
         if getattr(current_obj, "mode", "") != "EDIT":
@@ -340,15 +385,21 @@ def _start_realtime_diff(context, panel_api, module_state, obj):
         if key_index == last_index:
             return REALTIME_TIMER_INTERVAL
         try:
-            _apply_active_difference_selection(bpy.context, panel_api, module_state, current_obj)
+            _apply_active_difference_selection(context, panel_api, module_state, current_obj)
         except Exception as _e:
             if module_state is not None:
                 module_state.set("active_summary", f"实时检查出错：{_e}")
             return REALTIME_TIMER_INTERVAL
         return REALTIME_TIMER_INTERVAL
 
-    _register_realtime_timer(_tick)
-    bpy.app.timers.register(_tick, first_interval=0.02)
+    try:
+        _register_realtime_timer(_tick)
+        bpy.app.timers.register(_tick, first_interval=0.02)
+    except Exception as exc:
+        _stop_realtime_diff(module_state, panel_api=panel_api)
+        if module_state is not None:
+            module_state.set("active_summary", f"实时检查启动失败：{exc}")
+        raise
 
 
 def _scan_object(obj, threshold):
@@ -496,14 +547,15 @@ def on_panel_action(action, context, scene, workflow, module, panel_api, module_
         elif field == "threshold":
             config["threshold"] = float(panel_api.get_float("threshold", DEFAULT_THRESHOLD) or DEFAULT_THRESHOLD)
         elif field == "realtime_diff_enabled":
-            obj = _active_or_config_object(context, panel_api, config)
-            if _realtime_enabled(panel_api, module_state):
-                _start_realtime_diff(context, panel_api, module_state, obj)
-            else:
+            enabled = _realtime_enabled(panel_api, module_state)
+            if not enabled:
                 _stop_realtime_diff(module_state, panel_api=panel_api)
                 panel_api.set_status("已关闭实时检查差异点", level="OK")
                 if module_state is not None:
                     module_state.set("last_result", "已关闭实时检查差异点")
+            else:
+                obj = _active_or_config_object(context, panel_api, config)
+                _start_realtime_diff(context, panel_api, module_state, obj)
             return {"FINISHED"}
         _set_config(module, config)
         return {"FINISHED"}
