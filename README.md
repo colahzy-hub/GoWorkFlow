@@ -8,6 +8,8 @@ GoWorkFlow 适合把常用的 Blender 面板、批处理脚本和形态键工具
 [![Blender](https://img.shields.io/badge/Blender-3.6%2B-orange)](https://www.blender.org/)
 [![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE)
 
+参考链接：[腾讯文档脚本库](https://docs.qq.com/sheet/DRUNEZ0RFUXdtU2FS) · [ARKit 制作参考图片](https://hinzka.hatenablog.com/entry/2020/06/15/072929)
+
 ## 当前版本
 
 当前发布版本：**1.1.10**
